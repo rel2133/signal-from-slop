@@ -55,6 +55,7 @@ load_dotenv()
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_PATH = ROOT / "data" / "fake_reddit_data.json"
 DEFAULT_TICKER_PATH = ROOT / "data" / "tickers.csv"
+DEFAULT_SOURCES_PATH = ROOT / "data" / "default_sources.json"
 DEFAULT_DB_PATH = ROOT / os.getenv("SQLITE_PATH", "signal_from_the_slop.db")
 SCHEMA_PATH = ROOT / "schema.sql"
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
@@ -105,7 +106,27 @@ def seed_fake_subreddit_sources(db_path: Path, data_path: Path) -> int:
     return len(subreddits)
 
 
-def ensure_seed_sources(db_path: Path, data_path: Path) -> None:
+def seed_sources_from_file(db_path: Path, sources_path: Path) -> int:
+    sources = json.loads(sources_path.read_text(encoding="utf-8"))
+    for source in sources:
+        add_source(
+            db_path,
+            source_key=source["source_key"],
+            source_type=source["source_type"],
+            display_name=source["display_name"],
+            normalized_value=source["normalized_value"],
+            url=source["url"],
+            notes=source.get("notes", ""),
+            active=bool(source.get("active", True)),
+        )
+    return len(sources)
+
+
+def ensure_seed_sources(db_path: Path, data_path: Path, sources_path: Path) -> None:
+    if sources_path.exists():
+        seed_sources_from_file(db_path, sources_path)
+        return
+
     sources = load_sources(db_path)
     if sources.empty:
         seed_fake_subreddit_sources(db_path, data_path)
@@ -756,7 +777,7 @@ def render_settings_page(db_path: Path, data_path: Path, ticker_path: Path) -> N
 
 
 init_db(DEFAULT_DB_PATH, SCHEMA_PATH)
-ensure_seed_sources(DEFAULT_DB_PATH, DEFAULT_DATA_PATH)
+ensure_seed_sources(DEFAULT_DB_PATH, DEFAULT_DATA_PATH, DEFAULT_SOURCES_PATH)
 page, selected_run_id, _, _ = build_sidebar_state(DEFAULT_DB_PATH, DEFAULT_DATA_PATH)
 
 if page == "Sources":

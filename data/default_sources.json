@@ -1,0 +1,47 @@
+[
+  {
+    "source_key": "subreddit:valueinvesting",
+    "source_type": "subreddit",
+    "display_name": "r/ValueInvesting",
+    "normalized_value": "valueinvesting",
+    "url": "https://www.reddit.com/r/valueinvesting/",
+    "notes": "",
+    "active": true
+  },
+  {
+    "source_key": "subreddit:investing",
+    "source_type": "subreddit",
+    "display_name": "r/investing",
+    "normalized_value": "investing",
+    "url": "https://www.reddit.com/r/investing/",
+    "notes": "",
+    "active": true
+  },
+  {
+    "source_key": "subreddit:stocks",
+    "source_type": "subreddit",
+    "display_name": "r/stocks",
+    "normalized_value": "stocks",
+    "url": "https://www.reddit.com/r/stocks/",
+    "notes": "",
+    "active": true
+  },
+  {
+    "source_key": "subreddit:wallstreetbets",
+    "source_type": "subreddit",
+    "display_name": "r/wallstreetbets",
+    "normalized_value": "wallstreetbets",
+    "url": "https://www.reddit.com/r/wallstreetbets/",
+    "notes": "",
+    "active": true
+  },
+  {
+    "source_key": "subreddit:queenstreetbets",
+    "source_type": "subreddit",
+    "display_name": "r/queenstreetbets",
+    "normalized_value": "queenstreetbets",
+    "url": "https://www.reddit.com/r/queenstreetbets/",
+    "notes": "",
+    "active": true
+  }
+]

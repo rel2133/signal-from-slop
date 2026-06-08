@@ -26,6 +26,7 @@ The Reddit ingestion layer is kept modular so live Reddit collection can be swap
 ├── schema.sql
 ├── .env.example
 ├── data
+│   ├── default_sources.json
 │   ├── fake_reddit_data.json
 │   └── tickers.csv
 └── signal_from_the_slop
@@ -139,3 +140,4 @@ REDDIT_USER_AGENT=signal-from-the-slop/0.1
 - The classifier prompt forces strict JSON output and uses `temperature: 0`.
 - The app does not invent tickers. Unknown references remain empty unless the extractor finds a catalog match.
 - The live Reddit API path is intentionally stubbed for now. The fake dataset is the supported MVP input.
+- Local source edits are stored in SQLite. A fresh Streamlit Community Cloud deployment starts from [data/default_sources.json](/Users/rowanellis/Documents/Signal from the Slop/data/default_sources.json), not from your local `signal_from_the_slop.db`.
