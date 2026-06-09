@@ -87,6 +87,7 @@ After `streamlit run app.py` opens the app:
 6. When it finishes, the app moves to `Results Dashboard` and shows the saved run.
 
 The Streamlit `Deploy` button is only for publishing the app online. It does not start scraping.
+Completed runs in the sidebar are shown with a readable label: date, time, source set, and item count.
 
 1. Create and activate a virtual environment:
 
@@ -163,4 +164,5 @@ That command exercises the same `collect_live_items(...)` path the Streamlit app
 - The classifier prompt forces strict JSON output and uses `temperature: 0`.
 - The app does not invent tickers. Unknown references remain empty unless the extractor finds a catalog match.
 - Live Reddit scraping uses public Reddit RSS feeds. It does not need Reddit API keys, but it can be rate-limited and may only expose recent public posts/comments.
+- `Ticker Trends` now includes both within-run weekly buckets and across-run history for the same completed source set.
 - Local source edits are stored in SQLite. A fresh Streamlit Community Cloud deployment starts from [data/default_sources.json](/Users/rowanellis/Documents/Signal from the Slop/data/default_sources.json), not from your local `signal_from_the_slop.db`.

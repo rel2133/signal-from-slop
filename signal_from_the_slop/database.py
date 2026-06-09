@@ -544,6 +544,34 @@ def load_run_ticker_summaries(db_path: str | Path, analysis_run_id: str) -> pd.D
     )
 
 
+def load_historical_ticker_summaries(
+    db_path: str | Path,
+    *,
+    data_mode: str,
+    selected_source_ids_json: str,
+) -> pd.DataFrame:
+    return _load_table(
+        db_path,
+        """
+        SELECT
+            ts.*,
+            ar.started_at,
+            ar.completed_at,
+            ar.data_mode,
+            ar.selected_source_ids,
+            ar.summary_json
+        FROM ticker_summaries ts
+        JOIN analysis_runs ar
+            ON ar.analysis_run_id = ts.analysis_run_id
+        WHERE ar.status = 'completed'
+          AND ar.data_mode = ?
+          AND ar.selected_source_ids = ?
+        ORDER BY ar.completed_at, ts.ticker
+        """,
+        (data_mode, selected_source_ids_json),
+    )
+
+
 def load_run_time_buckets(db_path: str | Path, analysis_run_id: str) -> pd.DataFrame:
     return _load_table(
         db_path,

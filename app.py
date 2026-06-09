@@ -33,6 +33,7 @@ from signal_from_the_slop.database import (
     latest_analysis_run_id,
     load_analysis_runs,
     load_full_results_records,
+    load_historical_ticker_summaries,
     load_run_mentions,
     load_run_summary,
     load_run_ticker_summaries,
@@ -173,6 +174,21 @@ def save_run_artifacts(
     mentions_df.to_csv(run_dir / "mentions.csv", index=False)
     ticker_summary_df.to_csv(run_dir / "ticker_summary.csv", index=False)
     time_bucket_df.to_csv(run_dir / "ticker_time_buckets.csv", index=False)
+
+
+def build_run_display_label(run_record: dict[str, Any], source_lookup: dict[int, str]) -> str:
+    timestamp = str(run_record.get("completed_at") or run_record.get("started_at") or "")[:19].replace("T", " ")
+    source_ids = [int(source_id) for source_id in run_record.get("selected_source_ids", [])]
+    source_names = [source_lookup.get(source_id, f"source:{source_id}") for source_id in source_ids]
+    if len(source_names) == 1:
+        source_label = source_names[0]
+    elif source_names:
+        source_label = f"{source_names[0]} +{len(source_names) - 1}"
+    else:
+        source_label = "No sources"
+    summary = run_record.get("summary_json", {}) or {}
+    items_analyzed = int(summary.get("items_analyzed", 0))
+    return f"{timestamp} | {source_label} | {items_analyzed} items"
 
 
 def seed_fake_subreddit_sources(db_path: Path, data_path: Path) -> int:
@@ -439,15 +455,35 @@ def build_sidebar_state(db_path: Path, data_path: Path) -> tuple[str, str | None
     pending_run_id = st.session_state.pop("pending_selected_run_id", None)
     if pending_run_id and not runs.empty and pending_run_id in runs["analysis_run_id"].tolist():
         st.session_state["selected_run_id"] = pending_run_id
+    completed_runs = runs[runs["status"] == "completed"].copy() if not runs.empty else runs
+    selectable_runs = completed_runs if not completed_runs.empty else runs
+    source_lookup = {
+        int(row["source_id"]): str(row["display_name"])
+        for row in sources.to_dict(orient="records")
+    } if not sources.empty else {}
+    run_label_lookup = {
+        str(row["analysis_run_id"]): build_run_display_label(row, source_lookup)
+        for row in selectable_runs.to_dict(orient="records")
+    }
 
     with st.sidebar:
         page = st.radio("Navigate", PAGES, key="page")
         run_id = None
-        if not runs.empty:
-            run_options = runs["analysis_run_id"].tolist()
-            default_run_id = st.session_state.get("selected_run_id") or latest_analysis_run_id(db_path)
+        if not selectable_runs.empty:
+            run_options = selectable_runs["analysis_run_id"].tolist()
+            default_run_id = st.session_state.get("selected_run_id")
+            if default_run_id not in run_options:
+                default_run_id = str(run_options[0])
             run_index = run_options.index(default_run_id) if default_run_id in run_options else 0
-            run_id = st.selectbox("Analysis run", run_options, index=run_index, key="selected_run_id")
+            run_id = st.selectbox(
+                "Analysis run",
+                run_options,
+                index=run_index,
+                key="selected_run_id",
+                format_func=lambda value: run_label_lookup.get(str(value), str(value)),
+            )
+            if not completed_runs.empty and len(completed_runs) != len(runs):
+                st.caption("Only completed runs are shown here.")
         else:
             st.info("No analysis runs saved yet.")
 
@@ -817,7 +853,10 @@ def render_results_dashboard_page(db_path: Path, run_id: str | None) -> None:
 
     long_df = load_run_mentions(db_path, run_id)
     if long_df.empty:
-        st.info("No item-level mention data saved for this run.")
+        if summary and int(summary.get("items_analyzed", 0)) == 0:
+            st.warning("This run completed, but no Reddit items matched the selected sources and time window.")
+        else:
+            st.info("No item-level mention data saved for this run.")
         return
 
     filtered = filter_results_dataframe(long_df)
@@ -880,6 +919,12 @@ def render_ticker_trends_page(db_path: Path, run_id: str | None) -> None:
         st.info("Run an analysis first.")
         return
 
+    runs = load_analysis_runs(db_path)
+    run_rows = runs[runs["analysis_run_id"] == run_id]
+    if run_rows.empty:
+        st.info("Selected run was not found.")
+        return
+    run_record = run_rows.iloc[0].to_dict()
     summary_df = load_run_ticker_summaries(db_path, run_id)
     bucket_df = load_run_time_buckets(db_path, run_id)
     long_df = load_run_mentions(db_path, run_id)
@@ -921,6 +966,58 @@ def render_ticker_trends_page(db_path: Path, run_id: str | None) -> None:
         st.line_chart(mention_chart)
         st.write("Average sentiment over time")
         st.line_chart(sentiment_chart)
+
+    st.subheader("Across-run history for this source set")
+    historical_summary_df = load_historical_ticker_summaries(
+        db_path,
+        data_mode=str(run_record["data_mode"]),
+        selected_source_ids_json=json.dumps(run_record.get("selected_source_ids", []), ensure_ascii=True),
+    )
+    if not historical_summary_df.empty:
+        historical_summary_df = historical_summary_df.copy()
+        historical_summary_df["run_completed_at"] = historical_summary_df["completed_at"].fillna(
+            historical_summary_df["started_at"]
+        ).astype(str).str[:19]
+        available_tickers = summary_df["ticker"].tolist()
+        historical_ticker_selection = st.multiselect(
+            "Tickers for run-over-run history",
+            available_tickers,
+            default=available_tickers[: min(3, len(available_tickers))],
+            key=f"historical_tickers_{run_id}",
+        )
+        if historical_ticker_selection:
+            history_slice = historical_summary_df[historical_summary_df["ticker"].isin(historical_ticker_selection)]
+            mention_history = history_slice.pivot(
+                index="run_completed_at",
+                columns="ticker",
+                values="total_mentions",
+            ).fillna(0)
+            acceleration_history = history_slice.pivot(
+                index="run_completed_at",
+                columns="ticker",
+                values="acceleration_score",
+            ).fillna(0)
+            st.write("Mentions per completed run")
+            st.line_chart(mention_history)
+            st.write("Acceleration per completed run")
+            st.line_chart(acceleration_history)
+            st.dataframe(
+                history_slice[
+                    [
+                        "run_completed_at",
+                        "ticker",
+                        "total_mentions",
+                        "mentions_this_period",
+                        "mentions_previous_period",
+                        "acceleration_score",
+                        "emerging_ticker_score",
+                    ]
+                ].sort_values(["run_completed_at", "ticker"], ascending=[False, True]),
+                use_container_width=True,
+                hide_index=True,
+            )
+    else:
+        st.caption("No earlier completed runs exist for this same source selection yet.")
 
     viz_cols = st.columns(3)
     with viz_cols[0]:
