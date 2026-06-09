@@ -38,7 +38,6 @@ from signal_from_the_slop.database import (
     load_full_results_records,
     load_run_classification_quality,
     load_historical_ticker_summaries,
-    load_previously_analyzed_item_ids,
     load_run_mentions,
     load_run_summary,
     load_run_source_activity,
@@ -57,6 +56,29 @@ try:
 except ImportError:
     def fail_analysis_run(db_path: Path, analysis_run_id: str, summary: dict[str, Any]) -> None:
         complete_analysis_run(db_path, analysis_run_id, summary)
+
+try:
+    from signal_from_the_slop.database import load_previously_analyzed_item_ids
+except ImportError:
+    def load_previously_analyzed_item_ids(db_path: Path, *, data_mode: str = "live") -> set[str]:
+        import sqlite3
+
+        try:
+            with sqlite3.connect(db_path) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT DISTINCT c.item_id
+                    FROM classifications c
+                    JOIN analysis_runs ar
+                        ON ar.analysis_run_id = c.analysis_run_id
+                    WHERE ar.status = 'completed'
+                      AND ar.data_mode = ?
+                    """,
+                    (data_mode,),
+                ).fetchall()
+        except sqlite3.Error:
+            return set()
+        return {str(row[0]) for row in rows}
 
 from signal_from_the_slop.ollama_classifier import OllamaClassifier
 from signal_from_the_slop.reddit_client import RedditClient, build_subreddit_source, parse_source_input
