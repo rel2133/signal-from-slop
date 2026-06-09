@@ -218,6 +218,22 @@ def latest_analysis_run_id(db_path: str | Path) -> str | None:
     return str(runs.iloc[0]["analysis_run_id"])
 
 
+def load_previously_analyzed_item_ids(db_path: str | Path, *, data_mode: str = "live") -> set[str]:
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT c.item_id
+            FROM classifications c
+            JOIN analysis_runs ar
+                ON ar.analysis_run_id = c.analysis_run_id
+            WHERE ar.status = 'completed'
+              AND ar.data_mode = ?
+            """,
+            (data_mode,),
+        ).fetchall()
+    return {str(row[0]) for row in rows}
+
+
 def upsert_reddit_items(db_path: str | Path, items: list[dict[str, Any]]) -> None:
     payload = [
         (

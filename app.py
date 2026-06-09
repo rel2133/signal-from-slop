@@ -38,6 +38,7 @@ from signal_from_the_slop.database import (
     load_full_results_records,
     load_run_classification_quality,
     load_historical_ticker_summaries,
+    load_previously_analyzed_item_ids,
     load_run_mentions,
     load_run_summary,
     load_run_source_activity,
@@ -859,6 +860,8 @@ def render_latest_run_status(runs: pd.DataFrame, source_lookup: dict[int, str]) 
     status = str(latest.get("status", "unknown")).lower()
     items_analyzed = int(summary.get("items_analyzed", 0))
     items_collected = int(summary.get("items_collected", items_analyzed) or 0)
+    items_scraped = int(summary.get("items_scraped", items_collected) or 0)
+    items_skipped_existing = int(summary.get("items_skipped_existing", 0) or 0)
     run_label = f"`{latest.get('analysis_run_id')}`"
     source_label = format_source_names(latest, source_lookup)
 
@@ -870,7 +873,10 @@ def render_latest_run_status(runs: pd.DataFrame, source_lookup: dict[int, str]) 
         st.error(f"Latest run failed: {run_label}.")
     else:
         st.info(f"Latest run status: {status} for {run_label}.")
-    st.caption(f"Sources: {source_label}. Collected: {items_collected}. Completed: `{run_completed_label(latest)}`.")
+    st.caption(
+        f"Sources: {source_label}. Scraped: {items_scraped}. Skipped existing: {items_skipped_existing}. "
+        f"Analysed: {items_analyzed}. Completed: `{run_completed_label(latest)}`."
+    )
 
 
 def render_recent_run_statuses(runs: pd.DataFrame, source_lookup: dict[int, str]) -> None:
@@ -883,10 +889,12 @@ def render_recent_run_statuses(runs: pd.DataFrame, source_lookup: dict[int, str]
             run_id = str(row.get("analysis_run_id", ""))
             items_analyzed = int(summary.get("items_analyzed", 0))
             items_collected = int(summary.get("items_collected", items_analyzed) or 0)
+            items_scraped = int(summary.get("items_scraped", items_collected) or 0)
+            items_skipped_existing = int(summary.get("items_skipped_existing", 0) or 0)
             st.markdown(f"**{status}** `{run_id}`")
             st.caption(
                 f"{format_source_names(row, source_lookup)} | started `{str(row.get('started_at', ''))[:19].replace('T', ' ')}` | "
-                f"collected {items_collected} | analysed {items_analyzed}"
+                f"scraped {items_scraped} | skipped {items_skipped_existing} | analysed {items_analyzed}"
             )
             error_message = str(summary.get("error_message", "") or "")
             if error_message:
@@ -1040,6 +1048,7 @@ def run_analysis_pipeline(
     max_posts_per_source: int,
     max_comments_per_thread: int,
     include_comments: bool,
+    skip_previously_analyzed: bool,
     run_deeper_analysis: bool,
     progress_bar: st.delta_generator.DeltaGenerator,
     status_box: st.delta_generator.DeltaGenerator,
@@ -1065,6 +1074,7 @@ def run_analysis_pipeline(
         "max_posts_per_source": max_posts_per_source,
         "max_comments_per_thread": max_comments_per_thread,
         "include_comments": include_comments,
+        "skip_previously_analyzed": skip_previously_analyzed,
         "run_deeper_analysis": run_deeper_analysis,
         "ollama_model": model_name,
         "ollama_url": ollama_url,
@@ -1076,11 +1086,15 @@ def run_analysis_pipeline(
     item_lookup: dict[str, dict[str, Any]] = {}
     classification_rows: dict[str, dict[str, Any]] = {}
     items: list[dict[str, Any]] = []
+    scraped_items_count = 0
+    skipped_existing_count = 0
     fallback_count = 0
     run_completed = False
 
     def failure_summary(stage: str, error: Exception | str) -> dict[str, Any]:
         return {
+            "items_scraped": scraped_items_count,
+            "items_skipped_existing": skipped_existing_count,
             "items_collected": len(items),
             "items_analyzed": len(classification_rows),
             "ticker_mentions": 0,
@@ -1120,6 +1134,21 @@ def run_analysis_pipeline(
                 "The run was saved as failed so it remains visible in Run health. "
                 f"Sources: {source_names}. Window: {time_window_start.date().isoformat()} to {time_window_end.date().isoformat()}."
             )
+        scraped_items_count = len(items)
+        if skip_previously_analyzed:
+            previously_analyzed = load_previously_analyzed_item_ids(db_path, data_mode="live")
+            items = [item for item in items if str(item["item_id"]) not in previously_analyzed]
+            skipped_existing_count = scraped_items_count - len(items)
+            if not items:
+                raise RuntimeError(
+                    "The scrape returned items, but every item has already been analysed in a completed run. "
+                    "Turn off 'Skip already analysed items' if you want to re-analyse this full window."
+                )
+
+        status_box.info(
+            f"Scraped {scraped_items_count} item(s), skipped {skipped_existing_count} already analysed item(s), "
+            f"classifying {len(items)} new item(s)."
+        )
 
         total_items = max(len(items), 1)
         for index, item in enumerate(items, start=1):
@@ -1200,6 +1229,8 @@ def run_analysis_pipeline(
         time_bucket_df = build_time_bucket_summary(long_df) if not long_df.empty else pd.DataFrame()
         summary = build_run_summary(long_df, ticker_summary_df)
         item_sentiments = [row["sentiment"] for row in classification_rows.values()]
+        summary["items_scraped"] = scraped_items_count
+        summary["items_skipped_existing"] = skipped_existing_count
         summary["items_collected"] = len(items)
         summary["items_analyzed"] = len(classification_rows)
         summary["bullish_items"] = item_sentiments.count("bullish")
@@ -1477,6 +1508,14 @@ def render_run_analysis_page(
     max_comments_per_thread = st.slider("Max comments per thread", min_value=0, max_value=20, value=4)
     item_scope = st.radio("Analyse scope", ["Posts + comments", "Posts only"], horizontal=True)
     include_comments = item_scope == "Posts + comments"
+    skip_previously_analyzed = st.toggle(
+        "Skip already analysed Reddit items",
+        value=True,
+        help=(
+            "When enabled, items that already have a completed classification in an earlier run are not classified again. "
+            "Turn this off when you intentionally want a full overlapping-window re-analysis."
+        ),
+    )
     run_deeper_analysis = st.toggle("Run deeper analysis for qualifying items", value=True)
     ollama_url = st.text_input("Ollama URL", DEFAULT_OLLAMA_URL)
     if is_localhost_url(ollama_url):
@@ -1534,6 +1573,7 @@ def render_run_analysis_page(
                 max_posts_per_source=max_posts_per_source,
                 max_comments_per_thread=max_comments_per_thread,
                 include_comments=include_comments,
+                skip_previously_analyzed=skip_previously_analyzed,
                 run_deeper_analysis=run_deeper_analysis,
                 progress_bar=progress_bar,
                 status_box=status_box,
@@ -1552,12 +1592,12 @@ def render_run_analysis_page(
 
 def render_run_summary_cards(summary: dict[str, Any]) -> None:
     metrics = st.columns(6)
-    metrics[0].metric("Items analysed", summary.get("items_analyzed", 0))
-    metrics[1].metric("Ticker mentions", summary.get("ticker_mentions", 0))
-    metrics[2].metric("Bullish items", summary.get("bullish_items", 0))
-    metrics[3].metric("Bearish items", summary.get("bearish_items", 0))
-    metrics[4].metric("High-depth posts", summary.get("high_depth_posts_found", 0))
-    metrics[5].metric("Fallback items", summary.get("fallback_count", 0))
+    metrics[0].metric("Items scraped", summary.get("items_scraped", summary.get("items_collected", 0)))
+    metrics[1].metric("Skipped existing", summary.get("items_skipped_existing", 0))
+    metrics[2].metric("Items analysed", summary.get("items_analyzed", 0))
+    metrics[3].metric("Ticker mentions", summary.get("ticker_mentions", 0))
+    metrics[4].metric("Bullish items", summary.get("bullish_items", 0))
+    metrics[5].metric("Bearish items", summary.get("bearish_items", 0))
 
     extra = st.columns(4)
     extra[0].metric("Neutral items", summary.get("neutral_items", 0))
@@ -2937,6 +2977,8 @@ def render_settings_page(db_path: Path, ticker_path: Path, artifacts_dir: Path) 
             st.info("No runs have been saved yet.")
         else:
             run_health = runs.copy()
+            run_health["items_scraped"] = run_health["summary_json"].map(lambda value: int((value or {}).get("items_scraped", (value or {}).get("items_collected", (value or {}).get("items_analyzed", 0))) or 0))
+            run_health["items_skipped_existing"] = run_health["summary_json"].map(lambda value: int((value or {}).get("items_skipped_existing", 0) or 0))
             run_health["items_collected"] = run_health["summary_json"].map(lambda value: int((value or {}).get("items_collected", (value or {}).get("items_analyzed", 0)) or 0))
             run_health["items_analyzed"] = run_health["summary_json"].map(lambda value: int((value or {}).get("items_analyzed", 0)))
             run_health["ticker_mentions"] = run_health["summary_json"].map(lambda value: int((value or {}).get("ticker_mentions", 0)))
@@ -2964,6 +3006,8 @@ def render_settings_page(db_path: Path, ticker_path: Path, artifacts_dir: Path) 
                             {
                                 "items_collected": int(row.get("items_collected", 0)),
                                 "items_analyzed": int(row.get("items_analyzed", 0)),
+                                "items_scraped": int(row.get("items_scraped", row.get("items_collected", 0))),
+                                "items_skipped_existing": int(row.get("items_skipped_existing", 0)),
                                 "ticker_mentions": int(row.get("ticker_mentions", 0)),
                                 "tickers_found": int(row.get("tickers_found", 0)),
                                 "bullish_items": 0,
@@ -2990,6 +3034,8 @@ def render_settings_page(db_path: Path, ticker_path: Path, artifacts_dir: Path) 
                         "completed_at",
                         "elapsed",
                         "time_window_label",
+                        "items_scraped",
+                        "items_skipped_existing",
                         "items_collected",
                         "items_analyzed",
                         "ticker_mentions",
@@ -3002,6 +3048,8 @@ def render_settings_page(db_path: Path, ticker_path: Path, artifacts_dir: Path) 
                 hide_index=True,
                 column_config={
                     "analysis_run_id": st.column_config.TextColumn("Run"),
+                    "items_scraped": st.column_config.NumberColumn("Scraped", format="%d"),
+                    "items_skipped_existing": st.column_config.NumberColumn("Skipped existing", format="%d"),
                     "items_collected": st.column_config.NumberColumn("Collected", format="%d"),
                     "items_analyzed": st.column_config.NumberColumn("Analysed", format="%d"),
                     "ticker_mentions": st.column_config.NumberColumn("Mentions", format="%d"),
