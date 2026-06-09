@@ -32,7 +32,6 @@ from signal_from_the_slop.database import (
     create_analysis_run,
     db_overview,
     delete_sources,
-    fail_analysis_run,
     init_db,
     latest_analysis_run_id,
     load_analysis_runs,
@@ -52,6 +51,12 @@ from signal_from_the_slop.database import (
     update_sources,
     upsert_reddit_items,
 )
+try:
+    from signal_from_the_slop.database import fail_analysis_run
+except ImportError:
+    def fail_analysis_run(db_path: Path, analysis_run_id: str, summary: dict[str, Any]) -> None:
+        complete_analysis_run(db_path, analysis_run_id, summary)
+
 from signal_from_the_slop.ollama_classifier import OllamaClassifier
 from signal_from_the_slop.reddit_client import RedditClient, build_subreddit_source, parse_source_input
 from signal_from_the_slop.ticker_extractor import TickerExtractor
