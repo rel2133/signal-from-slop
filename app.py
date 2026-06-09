@@ -121,7 +121,7 @@ def is_localhost_url(value: str) -> bool:
 def queue_completed_run_navigation(run_id: str) -> None:
     st.session_state["pending_selected_run_id"] = run_id
     st.session_state["completed_run_notice"] = f"Run `{run_id}` completed."
-    st.session_state["page"] = "Results Dashboard"
+    st.session_state["pending_page"] = "Results Dashboard"
 
 
 def latest_matching_run(
@@ -433,6 +433,9 @@ def run_analysis_pipeline(
 def build_sidebar_state(db_path: Path, data_path: Path) -> tuple[str, str | None, pd.DataFrame, pd.DataFrame]:
     sources = load_sources(db_path)
     runs = load_analysis_runs(db_path)
+    pending_page = st.session_state.pop("pending_page", None)
+    if pending_page in PAGES:
+        st.session_state["page"] = pending_page
     pending_run_id = st.session_state.pop("pending_selected_run_id", None)
     if pending_run_id and not runs.empty and pending_run_id in runs["analysis_run_id"].tolist():
         st.session_state["selected_run_id"] = pending_run_id
@@ -458,6 +461,11 @@ def build_sidebar_state(db_path: Path, data_path: Path) -> tuple[str, str | None
 def render_sources_page(db_path: Path, data_path: Path) -> None:
     st.header("Sources")
     st.write("Add subreddit sources or Reddit thread URLs. Inputs are normalized before saving.")
+    st.caption("Sources are the watchlist. To scrape Reddit and analyse posts, open `Run Analysis` from the sidebar.")
+
+    if st.button("Go to Run Analysis", type="primary"):
+        st.session_state["pending_page"] = "Run Analysis"
+        st.rerun()
 
     with st.form("add_source_form", clear_on_submit=True):
         source_input = st.text_input("Paste a subreddit name or Reddit thread URL")
@@ -652,7 +660,7 @@ def render_run_analysis_page(
         )
 
     run_disabled = False
-    if st.button("Run Analysis", type="primary", use_container_width=True, disabled=run_disabled):
+    if st.button("Scrape Reddit and Run Analysis", type="primary", use_container_width=True, disabled=run_disabled):
         if not selected_source_ids:
             st.error("Select at least one source.")
             return

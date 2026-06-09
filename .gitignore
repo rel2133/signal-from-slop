@@ -7,3 +7,4 @@ __pycache__/
 .streamlit/secrets.toml
 npm-debug.log*
 package-lock.json
+artifacts/

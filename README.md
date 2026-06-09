@@ -75,6 +75,19 @@ ollama pull llama3.1:8b
 
 If `llama3.1:8b` is not installed locally, the app will let you choose any installed Ollama model from the sidebar.
 
+### Run A Live Scrape In The App
+
+After `streamlit run app.py` opens the app:
+
+1. Use the left sidebar and select `Run Analysis`.
+2. Leave `Collection mode` set to `Live Reddit scrape`.
+3. Pick the active sources and date window you want.
+4. Set small limits first, for example `Max posts per source = 2` and `Max comments per thread = 1`.
+5. Press `Scrape Reddit and Run Analysis`.
+6. When it finishes, the app moves to `Results Dashboard` and shows the saved run.
+
+The Streamlit `Deploy` button is only for publishing the app online. It does not start scraping.
+
 1. Create and activate a virtual environment:
 
 ```bash
