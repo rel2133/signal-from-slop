@@ -13,6 +13,7 @@ import altair as alt
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
 from signal_from_the_slop.analytics import (
@@ -153,6 +154,68 @@ DEFAULT_UI_PREFERENCES = {
     "watchlist": [],
     "evidence_checks": {},
 }
+METRIC_GUIDE = [
+    {
+        "metric": "Mentions",
+        "plain_english": "How many item/ticker rows matched this ticker in the selected run or bucket.",
+        "how_it_is_determined": "Each classified Reddit post/comment can produce one row per detected ticker.",
+    },
+    {
+        "metric": "Thread mentions",
+        "plain_english": "How many matching ticker mentions came from the same Reddit thread.",
+        "how_it_is_determined": "Results are grouped by thread so multi-comment discussions do not look like unrelated posts.",
+    },
+    {
+        "metric": "Confidence",
+        "plain_english": "How confident the classifier was about the sentiment/ticker interpretation.",
+        "how_it_is_determined": "Returned by the model or fallback classifier as a 0 to 1 score.",
+    },
+    {
+        "metric": "Alpha signal",
+        "plain_english": "A quality score for potentially useful, researchable information.",
+        "how_it_is_determined": "Combines evidence quality, specificity, depth, confidence, and Reddit context in the scoring module.",
+    },
+    {
+        "metric": "Max alpha",
+        "plain_english": "The strongest single alpha signal found inside a grouped thread.",
+        "how_it_is_determined": "Highest alpha_signal_score among the mentions in that thread group.",
+    },
+    {
+        "metric": "Hype",
+        "plain_english": "How meme-like, repetitive, or promotional the text looks.",
+        "how_it_is_determined": "Classifier score plus repetition/promotional language cues. Lower is generally cleaner.",
+    },
+    {
+        "metric": "Hype-adjusted signal",
+        "plain_english": "Signal after penalizing hype and repetition.",
+        "how_it_is_determined": "Alpha signal minus hype/repetition penalties, capped to 0 to 100.",
+    },
+    {
+        "metric": "Acceleration",
+        "plain_english": "Whether mentions are rising compared with the previous bucket or scrape.",
+        "how_it_is_determined": "Uses mention change, growth rate, unique author/thread growth, and hype penalties.",
+    },
+    {
+        "metric": "Emerging ticker score",
+        "plain_english": "A lead-ranking score for tickers that may deserve follow-up.",
+        "how_it_is_determined": "Combines acceleration, source diversity, alpha score, evidence quality, low-volume bonus, and mega-cap penalty.",
+    },
+    {
+        "metric": "Source diversity",
+        "plain_english": "Whether discussion is coming from more than one source/subreddit.",
+        "how_it_is_determined": "Scores unique source/subreddit count on a 0 to 10 scale.",
+    },
+    {
+        "metric": "Controversy",
+        "plain_english": "How split bullish and bearish mentions are.",
+        "how_it_is_determined": "Higher when bullish and bearish counts are balanced; zero when all decisive mentions are one-sided.",
+    },
+    {
+        "metric": "Trust",
+        "plain_english": "A quick label for how much attention to give the row before reading it.",
+        "how_it_is_determined": "Strong, Standard, Review, or Fallback based on confidence, evidence quality, hype, and classifier mode.",
+    },
+]
 
 
 def resolve_config_path(env_name: str, default_name: str, *, base_dir: Path) -> Path:
@@ -393,6 +456,156 @@ def render_status_chips(labels: list[str]) -> None:
     chips = "".join(f'<span class="status-chip">{escape(label)}</span>' for label in labels if label)
     if chips:
         st.markdown(chips, unsafe_allow_html=True)
+
+
+def render_copyable_ticker_chips(
+    tickers: list[str],
+    *,
+    label: str = "Tickers",
+    help_text: str = "Click a ticker to copy it.",
+    max_items: int = 24,
+) -> None:
+    cleaned = [normalize_ticker(ticker) for ticker in tickers if normalize_ticker(ticker)]
+    cleaned = list(dict.fromkeys(cleaned))[:max_items]
+    if not cleaned:
+        st.caption("No tickers to show.")
+        return
+
+    payload = json.dumps(cleaned)
+    component_height = min(260, 62 + ((len(cleaned) + 7) // 8) * 34)
+    html = f"""
+    <div class="ticker-copy-shell">
+      <div class="ticker-copy-head">
+        <strong>{escape(label)}</strong>
+        <span id="ticker-copy-status">{escape(help_text)}</span>
+      </div>
+      <div class="ticker-copy-grid" id="ticker-copy-grid"></div>
+    </div>
+    <style>
+      .ticker-copy-shell {{
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        margin: 0.15rem 0 0.5rem;
+      }}
+      .ticker-copy-head {{
+        align-items: center;
+        display: flex;
+        gap: 0.75rem;
+        justify-content: space-between;
+        margin-bottom: 0.45rem;
+      }}
+      .ticker-copy-head span {{
+        color: rgba(127, 127, 127, 0.92);
+        font-size: 0.82rem;
+      }}
+      .ticker-copy-grid {{
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.38rem;
+      }}
+      .ticker-copy-button {{
+        appearance: none;
+        background: rgba(128, 128, 128, 0.10);
+        border: 1px solid rgba(128, 128, 128, 0.30);
+        border-radius: 999px;
+        color: inherit;
+        cursor: pointer;
+        font: 700 0.86rem -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        padding: 0.34rem 0.62rem;
+        transition: background 120ms ease, border-color 120ms ease, transform 120ms ease;
+      }}
+      .ticker-copy-button:hover {{
+        background: rgba(57, 132, 255, 0.16);
+        border-color: rgba(57, 132, 255, 0.55);
+        transform: translateY(-1px);
+      }}
+      .ticker-copy-button.copied {{
+        background: rgba(52, 199, 89, 0.18);
+        border-color: rgba(52, 199, 89, 0.70);
+      }}
+    </style>
+    <script>
+      const tickers = {payload};
+      const grid = document.getElementById("ticker-copy-grid");
+      const status = document.getElementById("ticker-copy-status");
+      tickers.forEach((ticker) => {{
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "ticker-copy-button";
+        button.textContent = ticker;
+        button.title = `Copy ${{ticker}}`;
+        button.addEventListener("click", async () => {{
+          try {{
+            await navigator.clipboard.writeText(ticker);
+            status.textContent = `Copied ${{ticker}}`;
+            button.classList.add("copied");
+            setTimeout(() => button.classList.remove("copied"), 900);
+          }} catch (error) {{
+            status.textContent = `Select and copy ${{ticker}}`;
+          }}
+        }});
+        grid.appendChild(button);
+      }});
+    </script>
+    """
+    components.html(html, height=component_height, scrolling=False)
+
+
+def render_metric_guide(title: str = "How to read these metrics", *, expanded: bool = False) -> None:
+    with st.expander(title, expanded=expanded):
+        st.dataframe(
+            pd.DataFrame(METRIC_GUIDE),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "metric": st.column_config.TextColumn("Metric", width="medium"),
+                "plain_english": st.column_config.TextColumn("Plain English", width="large"),
+                "how_it_is_determined": st.column_config.TextColumn("How it is determined", width="large"),
+            },
+        )
+
+
+def render_all_tickers_panel(summary_df: pd.DataFrame, mentions_df: pd.DataFrame) -> None:
+    if summary_df.empty and mentions_df.empty:
+        return
+    tickers = []
+    if not summary_df.empty:
+        tickers.extend(summary_df["ticker"].dropna().astype(str).tolist())
+    if not mentions_df.empty:
+        tickers.extend(mentions_df["ticker"].dropna().astype(str).tolist())
+    tickers = [ticker for ticker in dict.fromkeys(tickers) if ticker != "UNKNOWN"]
+    if not tickers:
+        return
+
+    with st.expander(f"All mentioned tickers ({len(tickers)})", expanded=True):
+        render_copyable_ticker_chips(
+            tickers,
+            label="All mentioned tickers",
+            help_text="Click any ticker to copy it.",
+            max_items=80,
+        )
+        if not summary_df.empty:
+            compact_columns = [
+                "ticker",
+                "company_name",
+                "total_mentions",
+                "acceleration_score",
+                "emerging_ticker_score",
+                "average_alpha_signal_score",
+                "average_hype_score",
+            ]
+            compact = summary_df[[column for column in compact_columns if column in summary_df.columns]].copy()
+            st.dataframe(
+                compact,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "total_mentions": st.column_config.NumberColumn("Mentions", format="%d"),
+                    "acceleration_score": st.column_config.NumberColumn("Acceleration", format="%.1f"),
+                    "emerging_ticker_score": st.column_config.NumberColumn("Emerging", format="%.1f"),
+                    "average_alpha_signal_score": st.column_config.NumberColumn("Alpha", format="%.1f"),
+                    "average_hype_score": st.column_config.NumberColumn("Hype", format="%.1f"),
+                },
+            )
 
 
 def classifier_trust_label(row: pd.Series) -> str:
@@ -1314,15 +1527,23 @@ def render_run_summary_cards(summary: dict[str, Any]) -> None:
             row for row in summary.get("top_mentioned_tickers", [])
             if row.get("ticker") != "UNKNOWN"
         ]
-        st.write("Top mentioned tickers")
-        st.dataframe(pd.DataFrame(top_mentioned), use_container_width=True, hide_index=True)
+        render_copyable_ticker_chips(
+            [str(row.get("ticker", "")) for row in top_mentioned],
+            label="Top mentioned tickers",
+            help_text="Click to copy ticker.",
+            max_items=8,
+        )
     with top_cols[1]:
         top_accelerating = [
             row for row in summary.get("top_accelerating_tickers", [])
             if row.get("ticker") != "UNKNOWN"
         ]
-        st.write("Top accelerating tickers")
-        st.dataframe(pd.DataFrame(top_accelerating), use_container_width=True, hide_index=True)
+        render_copyable_ticker_chips(
+            [str(row.get("ticker", "")) for row in top_accelerating],
+            label="Top accelerating tickers",
+            help_text="Click to copy ticker.",
+            max_items=8,
+        )
 
     if summary.get("fallback_count", 0):
         st.warning(
@@ -1483,17 +1704,21 @@ def build_thread_summary(filtered_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     records: list[dict[str, Any]] = []
-    group_columns = ["ticker", "thread_id", "thread_title", "source_name"]
+    group_columns = ["thread_id", "thread_title", "source_name"]
     for keys, group in filtered_df.groupby(group_columns, dropna=False):
-        ticker, thread_id, thread_title, source_name = keys
+        thread_id, thread_title, source_name = keys
         group = group.sort_values(["alpha_signal_score", "confidence"], ascending=False)
         top = group.iloc[0]
+        tickers = sorted(str(ticker) for ticker in group["ticker"].dropna().unique() if str(ticker) != "UNKNOWN")
+        companies = sorted(str(company) for company in group["company_name"].dropna().unique() if str(company))
         records.append(
             {
-                "ticker": ticker,
+                "tickers": ", ".join(tickers),
+                "companies": ", ".join(companies[:4]),
                 "source": source_name,
                 "thread_title": thread_title,
                 "mentions": int(len(group)),
+                "ticker_count": len(tickers),
                 "unique_authors": int(group["author_hash"].nunique()),
                 "sentiment": mode_value(group["sentiment"]),
                 "trust": mode_value(group["trust_status"]) if "trust_status" in group.columns else "",
@@ -1513,6 +1738,10 @@ def build_thread_summary(filtered_df: pd.DataFrame) -> pd.DataFrame:
 
 def render_mention_details(filtered_df: pd.DataFrame) -> None:
     st.subheader("Details")
+    thread_tickers = {
+        thread_id: sorted(str(ticker) for ticker in group["ticker"].dropna().unique() if str(ticker) != "UNKNOWN")
+        for thread_id, group in filtered_df.groupby("thread_id", dropna=False)
+    }
     for row in filtered_df.head(12).to_dict(orient="records"):
         expander_title = f"{row['created_time'][:10]} · {row['ticker']} · {row['source_name']} · {row['sentiment']}"
         with st.expander(expander_title):
@@ -1528,6 +1757,12 @@ def render_mention_details(filtered_df: pd.DataFrame) -> None:
                     f"evidence: {row.get('evidence_quality', 'unknown')}",
                     "needs verification" if row.get("needs_deeper_analysis") else "",
                 ]
+            )
+            render_copyable_ticker_chips(
+                thread_tickers.get(row.get("thread_id"), [row["ticker"]]),
+                label="Tickers in this thread",
+                help_text="Click to copy.",
+                max_items=12,
             )
             st.write("Original text")
             st.code(row["body_text"])
@@ -2146,6 +2381,7 @@ def render_ticker_summary_table(summary_df: pd.DataFrame) -> None:
 
 def render_results_dashboard_page(db_path: Path, run_id: str | None) -> None:
     st.header("Results Dashboard")
+    st.caption("Use this page to review the actual Reddit evidence: which threads mentioned which tickers, how strong the signal looks, and what needs verification.")
     if not run_id:
         st.info("Run an analysis first.")
         return
@@ -2187,6 +2423,9 @@ def render_results_dashboard_page(db_path: Path, run_id: str | None) -> None:
         return
 
     long_df = attach_quality_columns(long_df, load_run_classification_quality(db_path, run_id))
+    summary_df = load_run_ticker_summaries(db_path, run_id)
+    render_all_tickers_panel(summary_df, long_df)
+    render_metric_guide("Metric guide for Results", expanded=False)
     filtered = filter_results_dataframe(long_df, run_id)
     st.write(f"{len(filtered)} mention rows matched the current filters.")
     if filtered.empty:
@@ -2227,6 +2466,9 @@ def render_results_dashboard_page(db_path: Path, run_id: str | None) -> None:
                 hide_index=True,
                 column_config={
                     "permalink": st.column_config.LinkColumn("permalink"),
+                    "tickers": st.column_config.TextColumn("Tickers", width="medium"),
+                    "companies": st.column_config.TextColumn("Companies", width="medium"),
+                    "ticker_count": st.column_config.NumberColumn("# tickers", format="%d"),
                     "thread_title": st.column_config.TextColumn("Thread", width="large"),
                     "top_summary": st.column_config.TextColumn("Top summary", width="large"),
                     "max_alpha": st.column_config.NumberColumn("Max alpha", format="%.1f"),
@@ -2254,6 +2496,7 @@ def render_results_dashboard_page(db_path: Path, run_id: str | None) -> None:
 
 def render_ticker_trends_page(db_path: Path, run_id: str | None) -> None:
     st.header("Ticker Trends")
+    st.caption("Use this page to answer what changed between scrapes, which tickers are accelerating, and which leads deserve a closer read.")
     if not run_id:
         st.info("Run an analysis first.")
         return
@@ -2292,6 +2535,8 @@ def render_ticker_trends_page(db_path: Path, run_id: str | None) -> None:
     metric_cols[2].metric("Top emerging", str(summary_df.iloc[0]["ticker"]))
     metric_cols[3].metric("Best acceleration", f"{float(summary_df['acceleration_score'].max()):.1f}")
     metric_cols[4].metric("Low-hype leads", int(summary_df["low_mentions_high_signal"].sum()))
+    render_all_tickers_panel(summary_df, long_df)
+    render_metric_guide("Metric guide for Trends", expanded=False)
 
     historical_summary_df = load_historical_ticker_summaries(
         db_path,
@@ -2600,25 +2845,95 @@ def render_settings_page(db_path: Path, data_path: Path, ticker_path: Path, arti
     overview_cols[2].metric("Reddit items", overview["reddit_items"])
     overview_cols[3].metric("Mention rows", overview["item_ticker_mentions"])
 
-    st.write("Paths and environment")
-    st.code(
-        "\n".join(
-            [
-                f"db_path = {db_path}",
-                f"artifacts_dir = {artifacts_dir}",
-                f"storage_root = {DEFAULT_STORAGE_ROOT}",
-                f"fake_data_path = {data_path}",
-                f"ticker_catalog_path = {ticker_path}",
-                f"ollama_url = {DEFAULT_OLLAMA_URL}",
-                f"default_model = {DEFAULT_MODEL}",
-                f"reddit_user_agent = {os.getenv('REDDIT_USER_AGENT', 'script:signal-from-the-slop:0.1')}",
-            ]
-        )
-    )
+    settings_tab, guide_tab, runs_tab, prefs_tab = st.tabs(["Diagnostics", "Metric Guide", "Runs", "Preferences"])
 
-    latest_fake_item = RedditClient(data_path).latest_available_timestamp()
-    st.write(f"Latest bundled fake item: `{latest_fake_item.date().isoformat()}`")
-    st.write("Live collection uses the no-key Reddit RSS scraper. Bundled fake data is still available for offline testing.")
+    with settings_tab:
+        st.subheader("Environment")
+        env_cols = st.columns(4)
+        env_cols[0].metric("Streamlit", st.__version__)
+        env_cols[1].metric("Altair", alt.__version__)
+        env_cols[2].metric("Pandas", pd.__version__)
+        env_cols[3].metric("Requests", requests.__version__)
+
+        latest_fake_item = RedditClient(data_path).latest_available_timestamp()
+        st.write(f"Latest bundled fake item: `{latest_fake_item.date().isoformat()}`")
+        st.write("Live collection uses public Reddit RSS feeds. Bundled fake data remains available for offline testing.")
+
+        st.subheader("Paths")
+        st.code(
+            "\n".join(
+                [
+                    f"db_path = {db_path}",
+                    f"artifacts_dir = {artifacts_dir}",
+                    f"ui_preferences = {DEFAULT_UI_PREFS_PATH}",
+                    f"storage_root = {DEFAULT_STORAGE_ROOT}",
+                    f"fake_data_path = {data_path}",
+                    f"ticker_catalog_path = {ticker_path}",
+                    f"ollama_url = {DEFAULT_OLLAMA_URL}",
+                    f"default_model = {DEFAULT_MODEL}",
+                    f"reddit_user_agent = {os.getenv('REDDIT_USER_AGENT', 'script:signal-from-the-slop:0.1')}",
+                ]
+            )
+        )
+
+    with guide_tab:
+        st.subheader("Scoring and table glossary")
+        st.dataframe(
+            pd.DataFrame(METRIC_GUIDE),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "metric": st.column_config.TextColumn("Metric", width="medium"),
+                "plain_english": st.column_config.TextColumn("Plain English", width="large"),
+                "how_it_is_determined": st.column_config.TextColumn("How it is determined", width="large"),
+            },
+        )
+
+    with runs_tab:
+        st.subheader("Run health")
+        runs = load_analysis_runs(db_path)
+        if runs.empty:
+            st.info("No runs have been saved yet.")
+        else:
+            run_health = runs.copy()
+            run_health["items_analyzed"] = run_health["summary_json"].map(lambda value: int((value or {}).get("items_analyzed", 0)))
+            run_health["ticker_mentions"] = run_health["summary_json"].map(lambda value: int((value or {}).get("ticker_mentions", 0)))
+            run_health["tickers_found"] = run_health["summary_json"].map(lambda value: int((value or {}).get("tickers_found", 0)))
+            run_health["fallback_count"] = run_health["summary_json"].map(lambda value: int((value or {}).get("fallback_count", 0)))
+            st.dataframe(
+                run_health[
+                    [
+                        "analysis_run_id",
+                        "status",
+                        "data_mode",
+                        "started_at",
+                        "completed_at",
+                        "time_window_label",
+                        "items_analyzed",
+                        "ticker_mentions",
+                        "tickers_found",
+                        "fallback_count",
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    with prefs_tab:
+        st.subheader("Local preferences")
+        prefs = load_ui_preferences()
+        render_copyable_ticker_chips(
+            prefs.get("watchlist", []),
+            label="Watchlist",
+            help_text="Click to copy ticker.",
+            max_items=80,
+        )
+        st.json(prefs)
+        if st.button("Clear watchlist", type="secondary"):
+            prefs["watchlist"] = []
+            save_ui_preferences(prefs)
+            st.success("Watchlist cleared.")
+            st.rerun()
 
 
 init_db(DEFAULT_DB_PATH, SCHEMA_PATH)
