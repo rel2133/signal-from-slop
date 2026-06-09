@@ -121,6 +121,7 @@ PAGE_CONTEXT = {step["page"]: step["context"] for step in PAGE_STEPS}
 ACTIVE_RUN_STATUSES = {"running", "pausing", "paused", "cancelling"}
 RUN_CONTROL_POLL_SECONDS = 0.5
 RUN_HEARTBEAT_STALE_SECONDS = 45
+RUN_ORPHANED_CANCEL_SECONDS = 90
 RUN_WORKERS: dict[str, threading.Thread] = {}
 RUN_WORKERS_LOCK = threading.Lock()
 
@@ -975,6 +976,68 @@ def cancel_analysis_run_local(db_path: Path, analysis_run_id: str, summary: dict
         conn.commit()
 
 
+def build_cancelled_summary(run_state: dict[str, Any], reason: str) -> dict[str, Any]:
+    summary = dict(run_state.get("summary_json", {}) or {})
+    runtime = dict(summary.get("runtime", {})) if isinstance(summary.get("runtime", {}), dict) else {}
+    control = dict(summary.get("control", {})) if isinstance(summary.get("control", {}), dict) else {}
+    now = analysis_run_now_iso()
+
+    runtime.update(
+        {
+            "stage": "cancelled",
+            "message": reason,
+            "progress_fraction": float(runtime.get("progress_fraction", 0.0) or 0.0),
+            "progress_current": int(runtime.get("progress_current", 0) or 0),
+            "progress_total": int(runtime.get("progress_total", 0) or 0),
+            "progress_unit": str(runtime.get("progress_unit", "items") or "items"),
+            "heartbeat_at": now,
+        }
+    )
+    control.update(
+        {
+            "pause_requested": False,
+            "cancel_requested": True,
+            "updated_at": now,
+        }
+    )
+    summary.update(
+        {
+            "items_scraped": int(summary.get("items_scraped", summary.get("items_collected", 0)) or 0),
+            "items_skipped_existing": int(summary.get("items_skipped_existing", 0) or 0),
+            "items_collected": int(summary.get("items_collected", summary.get("items_analyzed", 0)) or 0),
+            "items_analyzed": int(summary.get("items_analyzed", 0) or 0),
+            "ticker_mentions": int(summary.get("ticker_mentions", 0) or 0),
+            "tickers_found": int(summary.get("tickers_found", 0) or 0),
+            "bullish_items": int(summary.get("bullish_items", 0) or 0),
+            "bearish_items": int(summary.get("bearish_items", 0) or 0),
+            "neutral_items": int(summary.get("neutral_items", 0) or 0),
+            "irrelevant_items": int(summary.get("irrelevant_items", 0) or 0),
+            "top_mentioned_tickers": summary.get("top_mentioned_tickers", []),
+            "top_accelerating_tickers": summary.get("top_accelerating_tickers", []),
+            "high_depth_posts_found": int(summary.get("high_depth_posts_found", 0) or 0),
+            "low_mentions_high_signal_count": int(summary.get("low_mentions_high_signal_count", 0) or 0),
+            "newly_detected_tickers_count": int(summary.get("newly_detected_tickers_count", 0) or 0),
+            "fallback_count": int(summary.get("fallback_count", 0) or 0),
+            "cancelled": True,
+            "failed_stage": "cancelled",
+            "error_message": reason,
+            "runtime": runtime,
+            "control": control,
+        }
+    )
+    return summary
+
+
+def force_cancel_analysis_run(db_path: Path, analysis_run_id: str, reason: str) -> None:
+    run_state = read_analysis_run_state(db_path, analysis_run_id)
+    if not run_state:
+        return
+    current_status = str(run_state.get("status", "")).lower()
+    if current_status in {"completed", "failed", "cancelled"}:
+        return
+    cancel_analysis_run_local(db_path, analysis_run_id, build_cancelled_summary(run_state, reason))
+
+
 def build_run_config(
     *,
     model_name: str,
@@ -1402,6 +1465,18 @@ def run_heartbeat_age_seconds(run_record: dict[str, Any]) -> int | None:
     return max(int((datetime.now(UTC) - heartbeat).total_seconds()), 0)
 
 
+def is_orphaned_active_run(run_record: dict[str, Any], *, worker_attached: bool = False) -> bool:
+    status = str(run_record.get("status", "")).lower()
+    if status not in ACTIVE_RUN_STATUSES:
+        return False
+    if worker_attached:
+        return False
+    heartbeat_age = run_heartbeat_age_seconds(run_record)
+    if heartbeat_age is None:
+        return True
+    return heartbeat_age >= RUN_ORPHANED_CANCEL_SECONDS
+
+
 @st.fragment(run_every=1)
 def render_background_run_banner(db_path: Path, source_lookup: dict[int, str]) -> None:
     sync_tracked_background_run(db_path)
@@ -1427,7 +1502,9 @@ def render_background_run_banner(db_path: Path, source_lookup: dict[int, str]) -
     status_message = str(runtime.get("message", "") or f"{stage_label} in progress.")
     heartbeat_age = run_heartbeat_age_seconds(active_run)
     worker_attached = has_live_run_worker(run_id)
-    live_signal = heartbeat_age is not None and heartbeat_age <= RUN_HEARTBEAT_STALE_SECONDS and worker_attached
+    heartbeat_fresh = heartbeat_age is not None and heartbeat_age <= RUN_HEARTBEAT_STALE_SECONDS
+    live_signal = heartbeat_fresh or worker_attached
+    orphaned_run = is_orphaned_active_run(active_run, worker_attached=worker_attached)
 
     if status == "paused":
         pulse_label = "Paused"
@@ -1475,16 +1552,35 @@ def render_background_run_banner(db_path: Path, source_lookup: dict[int, str]) -
     else:
         info_cols[4].empty()
 
-    cancel_disabled = status == "cancelling"
-    if info_cols[5].button("Cancel", key=f"cancel_run_{run_id}", use_container_width=True, disabled=cancel_disabled):
-        request_run_cancel(db_path, run_id)
+    if status == "cancelling" and orphaned_run:
+        cancel_label = "Clear"
+    elif status == "cancelling":
+        cancel_label = "Canceling"
+    else:
+        cancel_label = "Cancel"
+    cancel_disabled = status == "cancelling" and not orphaned_run
+    if info_cols[5].button(cancel_label, key=f"cancel_run_{run_id}", use_container_width=True, disabled=cancel_disabled):
+        if orphaned_run:
+            force_cancel_analysis_run(
+                db_path,
+                run_id,
+                "Cancelled after the run became orphaned with no live worker heartbeat.",
+            )
+        else:
+            request_run_cancel(db_path, run_id)
         st.rerun()
 
     if not live_signal and status in {"running", "pausing", "cancelling"}:
-        st.warning(
-            "This run is marked active, but its heartbeat is stale. Wait a few seconds for the current request to finish, "
-            "or open Settings -> Run health if it remains stuck."
-        )
+        if orphaned_run:
+            st.warning(
+                "This run is marked active, but no live worker heartbeat is attached. Use Clear to mark it cancelled "
+                "and unblock new scrapes."
+            )
+        else:
+            st.warning(
+                "This run is marked active, but its heartbeat is stale. Wait a few seconds for the current request to finish, "
+                "or open Settings -> Run health if it remains stuck."
+            )
 
 
 def render_watchlist_controls(db_path: Path, run_id: str | None) -> None:
@@ -3815,6 +3911,7 @@ def render_settings_page(db_path: Path, ticker_path: Path, artifacts_dir: Path) 
             run_health["fallback_count"] = run_health["summary_json"].map(lambda value: int((value or {}).get("fallback_count", 0)))
             run_health["error_message"] = run_health["summary_json"].map(lambda value: str((value or {}).get("error_message", "")))
             run_health["elapsed_minutes"] = run_health.apply(lambda row: run_elapsed_minutes(row.to_dict()) or 0, axis=1)
+            run_health["heartbeat_age_seconds"] = run_health.apply(lambda row: run_heartbeat_age_seconds(row.to_dict()), axis=1)
             run_health["elapsed"] = run_health.apply(
                 lambda row: run_elapsed_label(row.to_dict()) if str(row.get("status", "")).lower() in ACTIVE_RUN_STATUSES else "",
                 axis=1,
@@ -3826,37 +3923,17 @@ def render_settings_page(db_path: Path, ticker_path: Path, artifacts_dir: Path) 
             health_cols[1].metric("Active", active_count)
             health_cols[2].metric("Failed", int(status_counts.get("failed", 0)))
             health_cols[3].metric("Cancelled", int(status_counts.get("cancelled", 0)))
-            stale_running = run_health[
-                (run_health["status"].astype(str).str.lower().isin({"running", "pausing", "cancelling"}))
-                & (run_health["elapsed_minutes"] >= 30)
+            orphaned_active = run_health[
+                run_health.apply(lambda row: is_orphaned_active_run(row.to_dict()), axis=1)
             ].copy()
-            if not stale_running.empty:
-                st.warning(f"{len(stale_running)} active run(s) have been marked active for 30+ minutes.")
-                if st.button("Mark stale active runs as failed", use_container_width=True):
-                    for row in stale_running.to_dict(orient="records"):
-                        fail_analysis_run(
+            if not orphaned_active.empty:
+                st.warning(f"{len(orphaned_active)} active run(s) have no live worker heartbeat.")
+                if st.button("Mark orphaned active runs as cancelled", use_container_width=True):
+                    for row in orphaned_active.to_dict(orient="records"):
+                        force_cancel_analysis_run(
                             db_path,
                             str(row["analysis_run_id"]),
-                            {
-                                "items_collected": int(row.get("items_collected", 0)),
-                                "items_analyzed": int(row.get("items_analyzed", 0)),
-                                "items_scraped": int(row.get("items_scraped", row.get("items_collected", 0))),
-                                "items_skipped_existing": int(row.get("items_skipped_existing", 0)),
-                                "ticker_mentions": int(row.get("ticker_mentions", 0)),
-                                "tickers_found": int(row.get("tickers_found", 0)),
-                                "bullish_items": 0,
-                                "bearish_items": 0,
-                                "neutral_items": 0,
-                                "irrelevant_items": 0,
-                                "top_mentioned_tickers": [],
-                                "top_accelerating_tickers": [],
-                                "high_depth_posts_found": 0,
-                                "low_mentions_high_signal_count": 0,
-                                "newly_detected_tickers_count": 0,
-                                "fallback_count": int(row.get("fallback_count", 0)),
-                                "failed_stage": "stale_running_cleanup",
-                                "error_message": "Marked failed from Run health after remaining in running status for 30+ minutes.",
-                            },
+                            "Cancelled from Run health because no live worker heartbeat was available.",
                         )
                     st.rerun()
             st.dataframe(
