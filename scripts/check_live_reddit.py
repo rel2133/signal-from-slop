@@ -26,7 +26,7 @@ def main() -> int:
     load_dotenv(ROOT / ".env")
     source = build_subreddit_source(args.subreddit)
     selected_sources = [{**asdict(source), "source_id": 1}]
-    client = RedditClient(ROOT / "data" / "fake_reddit_data.json")
+    client = RedditClient()
     window_end = datetime.now(UTC)
     window_start = window_end - timedelta(days=max(args.days, 1))
     items = client.collect_live_items(

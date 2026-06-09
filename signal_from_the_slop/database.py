@@ -126,7 +126,7 @@ def create_analysis_run(db_path: str | Path, config: dict[str, Any]) -> str:
         _now_iso(),
         None,
         "running",
-        config.get("data_mode", "fake"),
+        config.get("data_mode", "live"),
         json.dumps(config.get("selected_source_ids", []), ensure_ascii=True),
         config.get("time_window_label", ""),
         config.get("time_window_start", ""),
@@ -165,6 +165,19 @@ def complete_analysis_run(db_path: str | Path, analysis_run_id: str, summary: di
             WHERE analysis_run_id = ?
             """,
             (_now_iso(), "completed", json.dumps(summary, ensure_ascii=True), analysis_run_id),
+        )
+        conn.commit()
+
+
+def fail_analysis_run(db_path: str | Path, analysis_run_id: str, summary: dict[str, Any]) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE analysis_runs
+            SET completed_at = ?, status = ?, summary_json = ?
+            WHERE analysis_run_id = ?
+            """,
+            (_now_iso(), "failed", json.dumps(summary, ensure_ascii=True), analysis_run_id),
         )
         conn.commit()
 

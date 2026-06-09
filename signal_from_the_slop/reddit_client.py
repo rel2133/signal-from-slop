@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import re
 import time
@@ -8,7 +7,6 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from html import unescape
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -32,55 +30,7 @@ class SourceCandidate:
 
 
 class RedditClient:
-    """Fake Reddit data access layer with source-aware filtering."""
-
-    def __init__(self, fake_data_path: str | Path) -> None:
-        self.fake_data_path = Path(fake_data_path)
-
-    def load_fake_data(self) -> list[dict[str, Any]]:
-        payload = json.loads(self.fake_data_path.read_text(encoding="utf-8"))
-        if not isinstance(payload, list):
-            raise ValueError("Fake Reddit data must be a JSON list.")
-        return [self._normalize_item(item) for item in payload]
-
-    def latest_available_timestamp(self) -> datetime:
-        items = self.load_fake_data()
-        return max(self._parse_timestamp(item["created_time"]) for item in items)
-
-    def collect_fake_items(
-        self,
-        *,
-        selected_sources: list[dict[str, Any]],
-        window_start: datetime,
-        window_end: datetime,
-        max_posts_per_source: int,
-        max_comments_per_thread: int,
-        include_comments: bool,
-    ) -> list[dict[str, Any]]:
-        items = self.load_fake_data()
-        matched_items: list[dict[str, Any]] = []
-        for item in items:
-            matched_source = self._match_source(item, selected_sources)
-            if not matched_source:
-                continue
-            item_time = self._parse_timestamp(item["created_time"])
-            if item_time < window_start or item_time > window_end:
-                continue
-            if not include_comments and item["item_type"] == "comment":
-                continue
-            enriched = dict(item)
-            enriched["source_id"] = int(matched_source["source_id"])
-            enriched["source_type"] = str(matched_source["source_type"])
-            enriched["source_name"] = str(matched_source["display_name"])
-            matched_items.append(enriched)
-
-        matched_items.sort(key=lambda row: row["created_time"], reverse=True)
-        return self._apply_limits(
-            matched_items,
-            max_posts_per_source=max_posts_per_source,
-            max_comments_per_thread=max_comments_per_thread,
-            include_comments=include_comments,
-        )
+    """Reddit RSS collection layer with source-aware filtering."""
 
     def collect_live_items(
         self,

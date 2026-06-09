@@ -32,6 +32,7 @@ from signal_from_the_slop.database import (
     create_analysis_run,
     db_overview,
     delete_sources,
+    fail_analysis_run,
     init_db,
     latest_analysis_run_id,
     load_analysis_runs,
@@ -61,7 +62,6 @@ load_dotenv()
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_STORAGE_ROOT = Path(os.getenv("APP_STORAGE_DIR", "")).expanduser() if os.getenv("APP_STORAGE_DIR") else ROOT
-DEFAULT_DATA_PATH = ROOT / "data" / "fake_reddit_data.json"
 DEFAULT_TICKER_PATH = ROOT / "data" / "tickers.csv"
 DEFAULT_SOURCES_PATH = ROOT / "data" / "default_sources.json"
 SCHEMA_PATH = ROOT / "schema.sql"
@@ -89,10 +89,6 @@ PAGE_LABELS = {step["page"]: f"{step['step']} {step['label']}" for step in PAGE_
 PAGE_CONTEXT = {step["page"]: step["context"] for step in PAGE_STEPS}
 
 LOCALHOST_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
-DATA_MODE_LABELS = {
-    "live": "Live Reddit scrape",
-    "fake": "Bundled fake dataset",
-}
 FILTER_PRESETS = {
     "Balanced review": {
         "sentiment": ["bullish", "bearish", "neutral", "irrelevant"],
@@ -788,7 +784,9 @@ def build_run_display_label(run_record: dict[str, Any], source_lookup: dict[int,
         source_label = "No sources"
     summary = run_record.get("summary_json", {}) or {}
     items_analyzed = int(summary.get("items_analyzed", 0))
-    return f"{timestamp} | {source_label} | {items_analyzed} items"
+    status = str(run_record.get("status", "")).upper()
+    status_prefix = f"{status} | " if status and status != "COMPLETED" else ""
+    return f"{status_prefix}{timestamp} | {source_label} | {items_analyzed} items"
 
 
 def run_has_analysed_items(run_record: dict[str, Any]) -> bool:
@@ -822,6 +820,72 @@ def format_source_names(run_record: dict[str, Any], source_lookup: dict[int, str
         for source_id in run_record.get("selected_source_ids", [])
     ]
     return ", ".join(source_names) if source_names else "No sources"
+
+
+def run_elapsed_minutes(run_record: dict[str, Any]) -> int | None:
+    started_at = str(run_record.get("started_at") or "")
+    if not started_at:
+        return None
+    try:
+        started = parse_created_time(started_at)
+    except Exception:
+        return None
+    return max(int((datetime.now(UTC) - started).total_seconds() // 60), 0)
+
+
+def run_elapsed_label(run_record: dict[str, Any]) -> str:
+    minutes = run_elapsed_minutes(run_record)
+    if minutes is None:
+        started_at = str(run_record.get("started_at") or "")
+        if not started_at:
+            return "unknown age"
+        return started_at[:19].replace("T", " ")
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, remainder = divmod(minutes, 60)
+    return f"{hours}h {remainder}m"
+
+
+def render_latest_run_status(runs: pd.DataFrame, source_lookup: dict[int, str]) -> None:
+    if runs.empty:
+        return
+    latest = runs.iloc[0].to_dict()
+    summary = latest.get("summary_json", {}) or {}
+    status = str(latest.get("status", "unknown")).lower()
+    items_analyzed = int(summary.get("items_analyzed", 0))
+    items_collected = int(summary.get("items_collected", items_analyzed) or 0)
+    run_label = f"`{latest.get('analysis_run_id')}`"
+    source_label = format_source_names(latest, source_lookup)
+
+    if status == "completed":
+        st.success(f"Latest run complete: {run_label} with {items_analyzed} analysed item(s).")
+    elif status == "running":
+        st.warning(f"Latest run still running: {run_label} started {run_elapsed_label(latest)} ago.")
+    elif status == "failed":
+        st.error(f"Latest run failed: {run_label}.")
+    else:
+        st.info(f"Latest run status: {status} for {run_label}.")
+    st.caption(f"Sources: {source_label}. Collected: {items_collected}. Completed: `{run_completed_label(latest)}`.")
+
+
+def render_recent_run_statuses(runs: pd.DataFrame, source_lookup: dict[int, str]) -> None:
+    if runs.empty:
+        return
+    with st.expander("Recent run status", expanded=False):
+        for row in runs.head(6).to_dict(orient="records"):
+            summary = row.get("summary_json", {}) or {}
+            status = str(row.get("status", "unknown")).upper()
+            run_id = str(row.get("analysis_run_id", ""))
+            items_analyzed = int(summary.get("items_analyzed", 0))
+            items_collected = int(summary.get("items_collected", items_analyzed) or 0)
+            st.markdown(f"**{status}** `{run_id}`")
+            st.caption(
+                f"{format_source_names(row, source_lookup)} | started `{str(row.get('started_at', ''))[:19].replace('T', ' ')}` | "
+                f"collected {items_collected} | analysed {items_analyzed}"
+            )
+            error_message = str(summary.get("error_message", "") or "")
+            if error_message:
+                st.caption(f"Error: {error_message[:180]}")
 
 
 def render_watchlist_controls(db_path: Path, run_id: str | None) -> None:
@@ -906,22 +970,6 @@ def render_sidebar_quick_search(db_path: Path, run_id: str | None) -> None:
             st.caption(f"{row['ticker']} · {str(row['thread_title'])[:72]}")
 
 
-def seed_fake_subreddit_sources(db_path: Path, data_path: Path) -> int:
-    items = RedditClient(data_path).load_fake_data()
-    subreddits = sorted({item["subreddit"] for item in items if item.get("subreddit")})
-    for subreddit in subreddits:
-        source = build_subreddit_source(subreddit)
-        add_source(
-            db_path,
-            source_key=source.source_key,
-            source_type=source.source_type,
-            display_name=source.display_name,
-            normalized_value=source.normalized_value,
-            url=source.url,
-        )
-    return len(subreddits)
-
-
 def seed_sources_from_file(db_path: Path, sources_path: Path) -> int:
     sources = json.loads(sources_path.read_text(encoding="utf-8"))
     for source in sources:
@@ -938,14 +986,9 @@ def seed_sources_from_file(db_path: Path, sources_path: Path) -> int:
     return len(sources)
 
 
-def ensure_seed_sources(db_path: Path, data_path: Path, sources_path: Path) -> None:
+def ensure_seed_sources(db_path: Path, sources_path: Path) -> None:
     if sources_path.exists():
         seed_sources_from_file(db_path, sources_path)
-        return
-
-    sources = load_sources(db_path)
-    if sources.empty:
-        seed_fake_subreddit_sources(db_path, data_path)
 
 
 def resolve_time_window(
@@ -980,11 +1023,9 @@ def resolve_time_window(
 
 def run_analysis_pipeline(
     *,
-    data_path: Path,
     ticker_path: Path,
     db_path: Path,
     artifacts_dir: Path,
-    data_mode: str,
     model_name: str,
     ollama_url: str,
     selected_sources: list[dict[str, Any]],
@@ -998,37 +1039,11 @@ def run_analysis_pipeline(
     progress_bar: st.delta_generator.DeltaGenerator,
     status_box: st.delta_generator.DeltaGenerator,
 ) -> tuple[str, dict[str, Any]]:
-    reddit_client = RedditClient(data_path)
+    reddit_client = RedditClient()
     extractor = TickerExtractor(ticker_path)
     classifier = OllamaClassifier(model=model_name, endpoint=ollama_url)
-
-    if data_mode == "live":
-        items = reddit_client.collect_live_items(
-            selected_sources=selected_sources,
-            window_start=time_window_start,
-            window_end=time_window_end,
-            max_posts_per_source=max_posts_per_source,
-            max_comments_per_thread=max_comments_per_thread,
-            include_comments=include_comments,
-        )
-    else:
-        items = reddit_client.collect_fake_items(
-            selected_sources=selected_sources,
-            window_start=time_window_start,
-            window_end=time_window_end,
-            max_posts_per_source=max_posts_per_source,
-            max_comments_per_thread=max_comments_per_thread,
-            include_comments=include_comments,
-        )
-    if not items:
-        source_names = ", ".join(str(source.get("display_name", source.get("source_id"))) for source in selected_sources)
-        raise RuntimeError(
-            "No Reddit items matched this source selection and time window, so no run was saved. "
-            f"Sources: {source_names}. Window: {time_window_start.date().isoformat()} to {time_window_end.date().isoformat()}."
-        )
-
     run_config = {
-        "data_mode": data_mode,
+        "data_mode": "live",
         "selected_source_ids": [int(source["source_id"]) for source in selected_sources],
         "selected_sources": [
             {
@@ -1050,132 +1065,183 @@ def run_analysis_pipeline(
         "ollama_url": ollama_url,
     }
 
-    run_id = create_analysis_run(
-        db_path,
-        run_config,
-    )
+    run_id = create_analysis_run(db_path, run_config)
 
     item_rows: list[dict[str, Any]] = []
     item_lookup: dict[str, dict[str, Any]] = {}
     classification_rows: dict[str, dict[str, Any]] = {}
-    temp_mentions: list[dict[str, Any]] = []
+    items: list[dict[str, Any]] = []
     fallback_count = 0
+    run_completed = False
 
-    total_items = max(len(items), 1)
-    for index, item in enumerate(items, start=1):
-        status_box.info(f"Classifying {index}/{len(items)}: {item['thread_title']}")
-        progress_bar.progress(index / total_items, text=f"Analysed {index}/{len(items)} items")
-
-        normalized_item = dict(item)
-        normalized_item["author_hash"] = author_hash(item.get("author", ""))
-        item_rows.append(
-            {
-                "item_id": normalized_item["item_id"],
-                "source_id": normalized_item.get("source_id"),
-                "source_type": normalized_item.get("source_type", ""),
-                "source_name": normalized_item.get("source_name", ""),
-                "subreddit": normalized_item.get("subreddit", ""),
-                "thread_id": normalized_item.get("thread_id", normalized_item["item_id"]),
-                "thread_title": normalized_item.get("thread_title", ""),
-                "thread_url": normalized_item.get("thread_url", ""),
-                "comment_id": normalized_item.get("comment_id"),
-                "parent_id": normalized_item.get("parent_id"),
-                "item_type": normalized_item.get("item_type", "post"),
-                "body_text": normalized_item.get("body_text", ""),
-                "author": normalized_item.get("author", ""),
-                "author_hash": normalized_item["author_hash"],
-                "score": int(normalized_item.get("score", 0)),
-                "created_time": normalized_item.get("created_time", ""),
-                "permalink": normalized_item.get("permalink", ""),
-                "comment_depth": int(normalized_item.get("comment_depth", 0)),
-                "raw_json": normalized_item,
-            }
-        )
-        item_lookup[normalized_item["item_id"]] = normalized_item
-
-        extraction = extractor.extract(" ".join([normalized_item.get("thread_title", ""), normalized_item.get("body_text", "")]))
-        extracted = {"tickers": extraction.tickers, "company_names": extraction.company_names}
-        stage_one = classifier.classify(normalized_item, extracted)
-        if stage_one.mode == "fallback":
-            fallback_count += 1
-        classification_rows[normalized_item["item_id"]] = build_classification_record(
-            normalized_item,
-            stage_one.payload,
-            classifier_mode=stage_one.mode,
-            model_name=model_name,
-        )
-
-    temp_mentions = [
-        mention
-        for item_id, classification_record in classification_rows.items()
-        for mention in build_mention_records(item_lookup[item_id], classification_record)
-    ]
-    temp_long_df = pd.DataFrame(temp_mentions)
-    temp_summary_df = build_ticker_summaries(temp_long_df) if not temp_long_df.empty else pd.DataFrame()
-
-    if run_deeper_analysis and not temp_long_df.empty:
-        low_signal_tickers = set(
-            temp_summary_df.loc[temp_summary_df["low_mentions_high_signal"], "ticker"].tolist()
-        ) if not temp_summary_df.empty else set()
-        eligible_item_ids = {
-            item_id
-            for item_id, row in classification_rows.items()
-            if row["depth_score"] >= 7 or row["evidence_quality"] == "high" or row["needs_deeper_analysis"]
+    def failure_summary(stage: str, error: Exception | str) -> dict[str, Any]:
+        return {
+            "items_collected": len(items),
+            "items_analyzed": len(classification_rows),
+            "ticker_mentions": 0,
+            "tickers_found": 0,
+            "bullish_items": 0,
+            "bearish_items": 0,
+            "neutral_items": 0,
+            "irrelevant_items": 0,
+            "top_mentioned_tickers": [],
+            "top_accelerating_tickers": [],
+            "high_depth_posts_found": 0,
+            "low_mentions_high_signal_count": 0,
+            "newly_detected_tickers_count": 0,
+            "fallback_count": fallback_count,
+            "failed_stage": stage,
+            "error_message": str(error),
         }
-        if low_signal_tickers:
-            eligible_item_ids.update(temp_long_df.loc[temp_long_df["ticker"].isin(low_signal_tickers), "item_id"].tolist())
 
-        for item_id in sorted(eligible_item_ids):
-            deeper_result = classifier.deep_analyze(item_lookup[item_id], classification_rows[item_id])
-            classification_rows[item_id]["deeper_analysis_json"] = deeper_result.payload
+    try:
+        progress_bar.progress(0.02, text="Scraping Reddit sources...")
+        status_box.info(
+            f"Scraping {len(selected_sources)} source(s) from "
+            f"{time_window_start.date().isoformat()} to {time_window_end.date().isoformat()}."
+        )
+        items = reddit_client.collect_live_items(
+            selected_sources=selected_sources,
+            window_start=time_window_start,
+            window_end=time_window_end,
+            max_posts_per_source=max_posts_per_source,
+            max_comments_per_thread=max_comments_per_thread,
+            include_comments=include_comments,
+        )
+        if not items:
+            source_names = ", ".join(str(source.get("display_name", source.get("source_id"))) for source in selected_sources)
+            raise RuntimeError(
+                "No Reddit items matched this source selection and time window. "
+                "The run was saved as failed so it remains visible in Run health. "
+                f"Sources: {source_names}. Window: {time_window_start.date().isoformat()} to {time_window_end.date().isoformat()}."
+            )
 
-    final_mentions = [
-        mention
-        for item_id, classification_record in classification_rows.items()
-        for mention in build_mention_records(item_lookup[item_id], classification_record)
-    ]
-    long_df = pd.DataFrame(final_mentions)
-    ticker_summary_df = build_ticker_summaries(long_df) if not long_df.empty else pd.DataFrame()
-    long_df = apply_ticker_flags_to_mentions(long_df, ticker_summary_df) if not long_df.empty else long_df
-    time_bucket_df = build_time_bucket_summary(long_df) if not long_df.empty else pd.DataFrame()
-    summary = build_run_summary(long_df, ticker_summary_df)
-    item_sentiments = [row["sentiment"] for row in classification_rows.values()]
-    summary["items_analyzed"] = len(classification_rows)
-    summary["bullish_items"] = item_sentiments.count("bullish")
-    summary["bearish_items"] = item_sentiments.count("bearish")
-    summary["neutral_items"] = item_sentiments.count("neutral")
-    summary["irrelevant_items"] = item_sentiments.count("irrelevant")
-    summary["fallback_count"] = fallback_count
+        total_items = max(len(items), 1)
+        for index, item in enumerate(items, start=1):
+            status_box.info(f"Classifying {index}/{len(items)}: {item['thread_title']}")
+            progress_bar.progress(index / total_items, text=f"Analysed {index}/{len(items)} items")
 
-    replaceable_mentions = long_df.to_dict(orient="records") if not long_df.empty else []
-    replaceable_summaries = ticker_summary_df.to_dict(orient="records") if not ticker_summary_df.empty else []
-    replaceable_buckets = time_bucket_df.to_dict(orient="records") if not time_bucket_df.empty else []
-    upsert_reddit_items(db_path, item_rows)
-    replace_run_classifications(db_path, run_id, list(classification_rows.values()))
-    replace_run_mentions(db_path, run_id, replaceable_mentions)
-    replace_run_ticker_summaries(db_path, run_id, replaceable_summaries)
-    replace_run_time_buckets(db_path, run_id, replaceable_buckets)
-    complete_analysis_run(db_path, run_id, summary)
-    save_run_artifacts(
-        artifacts_dir=artifacts_dir,
-        run_id=run_id,
-        config=run_config,
-        summary=summary,
-        items=item_rows,
-        classifications=list(classification_rows.values()),
-        mentions_df=long_df,
-        ticker_summary_df=ticker_summary_df,
-        time_bucket_df=time_bucket_df,
-    )
+            normalized_item = dict(item)
+            normalized_item["author_hash"] = author_hash(item.get("author", ""))
+            item_rows.append(
+                {
+                    "item_id": normalized_item["item_id"],
+                    "source_id": normalized_item.get("source_id"),
+                    "source_type": normalized_item.get("source_type", ""),
+                    "source_name": normalized_item.get("source_name", ""),
+                    "subreddit": normalized_item.get("subreddit", ""),
+                    "thread_id": normalized_item.get("thread_id", normalized_item["item_id"]),
+                    "thread_title": normalized_item.get("thread_title", ""),
+                    "thread_url": normalized_item.get("thread_url", ""),
+                    "comment_id": normalized_item.get("comment_id"),
+                    "parent_id": normalized_item.get("parent_id"),
+                    "item_type": normalized_item.get("item_type", "post"),
+                    "body_text": normalized_item.get("body_text", ""),
+                    "author": normalized_item.get("author", ""),
+                    "author_hash": normalized_item["author_hash"],
+                    "score": int(normalized_item.get("score", 0)),
+                    "created_time": normalized_item.get("created_time", ""),
+                    "permalink": normalized_item.get("permalink", ""),
+                    "comment_depth": int(normalized_item.get("comment_depth", 0)),
+                    "raw_json": normalized_item,
+                }
+            )
+            item_lookup[normalized_item["item_id"]] = normalized_item
 
-    progress_bar.empty()
-    status_box.success("Analysis complete.")
-    return run_id, summary
+            extraction = extractor.extract(" ".join([normalized_item.get("thread_title", ""), normalized_item.get("body_text", "")]))
+            extracted = {"tickers": extraction.tickers, "company_names": extraction.company_names}
+            stage_one = classifier.classify(normalized_item, extracted)
+            if stage_one.mode == "fallback":
+                fallback_count += 1
+            classification_rows[normalized_item["item_id"]] = build_classification_record(
+                normalized_item,
+                stage_one.payload,
+                classifier_mode=stage_one.mode,
+                model_name=model_name,
+            )
+
+        temp_mentions = [
+            mention
+            for item_id, classification_record in classification_rows.items()
+            for mention in build_mention_records(item_lookup[item_id], classification_record)
+        ]
+        temp_long_df = pd.DataFrame(temp_mentions)
+        temp_summary_df = build_ticker_summaries(temp_long_df) if not temp_long_df.empty else pd.DataFrame()
+
+        if run_deeper_analysis and not temp_long_df.empty:
+            low_signal_tickers = set(
+                temp_summary_df.loc[temp_summary_df["low_mentions_high_signal"], "ticker"].tolist()
+            ) if not temp_summary_df.empty else set()
+            eligible_item_ids = {
+                item_id
+                for item_id, row in classification_rows.items()
+                if row["depth_score"] >= 7 or row["evidence_quality"] == "high" or row["needs_deeper_analysis"]
+            }
+            if low_signal_tickers:
+                eligible_item_ids.update(temp_long_df.loc[temp_long_df["ticker"].isin(low_signal_tickers), "item_id"].tolist())
+
+            for item_id in sorted(eligible_item_ids):
+                deeper_result = classifier.deep_analyze(item_lookup[item_id], classification_rows[item_id])
+                classification_rows[item_id]["deeper_analysis_json"] = deeper_result.payload
+
+        final_mentions = [
+            mention
+            for item_id, classification_record in classification_rows.items()
+            for mention in build_mention_records(item_lookup[item_id], classification_record)
+        ]
+        long_df = pd.DataFrame(final_mentions)
+        ticker_summary_df = build_ticker_summaries(long_df) if not long_df.empty else pd.DataFrame()
+        long_df = apply_ticker_flags_to_mentions(long_df, ticker_summary_df) if not long_df.empty else long_df
+        time_bucket_df = build_time_bucket_summary(long_df) if not long_df.empty else pd.DataFrame()
+        summary = build_run_summary(long_df, ticker_summary_df)
+        item_sentiments = [row["sentiment"] for row in classification_rows.values()]
+        summary["items_collected"] = len(items)
+        summary["items_analyzed"] = len(classification_rows)
+        summary["bullish_items"] = item_sentiments.count("bullish")
+        summary["bearish_items"] = item_sentiments.count("bearish")
+        summary["neutral_items"] = item_sentiments.count("neutral")
+        summary["irrelevant_items"] = item_sentiments.count("irrelevant")
+        summary["fallback_count"] = fallback_count
+
+        replaceable_mentions = long_df.to_dict(orient="records") if not long_df.empty else []
+        replaceable_summaries = ticker_summary_df.to_dict(orient="records") if not ticker_summary_df.empty else []
+        replaceable_buckets = time_bucket_df.to_dict(orient="records") if not time_bucket_df.empty else []
+        upsert_reddit_items(db_path, item_rows)
+        replace_run_classifications(db_path, run_id, list(classification_rows.values()))
+        replace_run_mentions(db_path, run_id, replaceable_mentions)
+        replace_run_ticker_summaries(db_path, run_id, replaceable_summaries)
+        replace_run_time_buckets(db_path, run_id, replaceable_buckets)
+        save_run_artifacts(
+            artifacts_dir=artifacts_dir,
+            run_id=run_id,
+            config=run_config,
+            summary=summary,
+            items=item_rows,
+            classifications=list(classification_rows.values()),
+            mentions_df=long_df,
+            ticker_summary_df=ticker_summary_df,
+            time_bucket_df=time_bucket_df,
+        )
+        complete_analysis_run(db_path, run_id, summary)
+        run_completed = True
+
+        progress_bar.empty()
+        status_box.success(f"Analysis complete. Run `{run_id}` saved with {len(classification_rows)} analysed item(s).")
+        return run_id, summary
+    except Exception as exc:
+        if not run_completed:
+            try:
+                fail_analysis_run(db_path, run_id, failure_summary("collection_or_analysis", exc))
+            except Exception:
+                logging.exception("Failed to mark analysis run %s as failed", run_id)
+        raise
 
 
-def build_sidebar_state(db_path: Path, data_path: Path) -> tuple[str, str | None, pd.DataFrame, pd.DataFrame]:
+def build_sidebar_state(db_path: Path) -> tuple[str, str | None, pd.DataFrame, pd.DataFrame]:
     sources = load_sources(db_path)
     runs = load_analysis_runs(db_path)
+    if not runs.empty:
+        runs = runs[runs["data_mode"] == "live"].copy()
     pending_page = st.session_state.pop("pending_page", None)
     if pending_page in PAGES:
         st.session_state["page"] = pending_page
@@ -1189,15 +1255,10 @@ def build_sidebar_state(db_path: Path, data_path: Path) -> tuple[str, str | None
         (runs["status"] == "completed")
         & (runs.apply(lambda row: run_has_analysed_items(row.to_dict()), axis=1))
     ].copy() if not runs.empty else runs
-    selectable_runs = completed_runs if not completed_runs.empty else runs
     source_lookup = {
         int(row["source_id"]): str(row["display_name"])
         for row in sources.to_dict(orient="records")
     } if not sources.empty else {}
-    run_label_lookup = {
-        str(row["analysis_run_id"]): build_run_display_label(row, source_lookup)
-        for row in selectable_runs.to_dict(orient="records")
-    }
 
     with st.sidebar:
         st.subheader("Run context")
@@ -1205,6 +1266,20 @@ def build_sidebar_state(db_path: Path, data_path: Path) -> tuple[str, str | None
             overview_cols = st.columns(2)
             overview_cols[0].metric("Completed", len(completed_runs))
             overview_cols[1].metric("All runs", len(runs))
+            render_latest_run_status(runs, source_lookup)
+            render_recent_run_statuses(runs, source_lookup)
+
+        show_all_runs = st.toggle(
+            "Show all runs",
+            value=False,
+            help="Includes running, failed, and zero-item runs that are hidden from the default results picker.",
+            disabled=runs.empty,
+        )
+        selectable_runs = runs if show_all_runs else (completed_runs if not completed_runs.empty else runs)
+        run_label_lookup = {
+            str(row["analysis_run_id"]): build_run_display_label(row, source_lookup)
+            for row in selectable_runs.to_dict(orient="records")
+        }
 
         run_id = None
         if not selectable_runs.empty:
@@ -1240,11 +1315,10 @@ def build_sidebar_state(db_path: Path, data_path: Path) -> tuple[str, str | None
             selected_rows = selectable_runs[selectable_runs["analysis_run_id"] == run_id]
             if not selected_rows.empty:
                 selected_record = selected_rows.iloc[0].to_dict()
-                st.caption(f"Mode: `{DATA_MODE_LABELS.get(str(selected_record['data_mode']), str(selected_record['data_mode']))}`")
                 st.caption(f"Sources: {format_source_names(selected_record, source_lookup)}")
                 st.caption(f"Completed: `{run_completed_label(selected_record)}`")
             if not completed_runs.empty and len(completed_runs) != len(runs):
-                st.caption("Only completed runs with analysed items are shown here.")
+                st.caption("Default view shows completed runs with analysed items. Turn on 'Show all runs' to inspect failed, running, or zero-item runs.")
         else:
             st.info("No analysis runs saved yet.")
 
@@ -1255,13 +1329,12 @@ def build_sidebar_state(db_path: Path, data_path: Path) -> tuple[str, str | None
         st.divider()
         st.caption(f"Current step: `{page}`")
         with st.expander("Storage paths", expanded=False):
-            st.caption(f"Fake data: `{data_path}`")
             st.caption(f"SQLite: `{db_path}`")
 
     return page, run_id, sources, runs
 
 
-def render_sources_page(db_path: Path, data_path: Path) -> None:
+def render_sources_page(db_path: Path) -> None:
     st.header("Sources")
     st.write("Add subreddit sources or Reddit thread URLs. Inputs are normalized before saving.")
     st.caption("Sources are the watchlist. To scrape Reddit and analyse posts, open `02 Scrape` in the workflow.")
@@ -1290,13 +1363,6 @@ def render_sources_page(db_path: Path, data_path: Path) -> None:
                 )
                 st.success(f"Saved source `{parsed.display_name}`.")
                 st.rerun()
-
-    seed_col, _ = st.columns([1, 3])
-    with seed_col:
-        if st.button("Seed fake subreddit sources"):
-            added = seed_fake_subreddit_sources(db_path, data_path)
-            st.success(f"Seeded {added} subreddit sources from the bundled fake dataset.")
-            st.rerun()
 
     sources = load_sources(db_path)
     if sources.empty:
@@ -1337,7 +1403,6 @@ def render_run_analysis_page(
     *,
     db_path: Path,
     artifacts_dir: Path,
-    data_path: Path,
     ticker_path: Path,
 ) -> None:
     st.header("Run Analysis")
@@ -1351,34 +1416,11 @@ def render_run_analysis_page(
         st.warning("No active sources are enabled.")
         return
 
-    client = RedditClient(data_path)
-    fake_subreddits = sorted(
-        {
-            build_subreddit_source(str(item["subreddit"])).display_name
-            for item in client.load_fake_data()
-            if item.get("subreddit")
-        }
+    data_mode = "live"
+    st.info(
+        "Reddit scraping uses public Reddit RSS feeds and stores the collected run locally. "
+        "No Reddit API keys are required, but large runs may be rate-limited."
     )
-
-    default_data_mode_index = 0
-    data_mode_label = st.radio(
-        "Collection mode",
-        [DATA_MODE_LABELS["live"], DATA_MODE_LABELS["fake"]],
-        index=default_data_mode_index,
-        horizontal=True,
-    )
-    data_mode = "live" if data_mode_label == DATA_MODE_LABELS["live"] else "fake"
-
-    if data_mode == "live":
-        st.info(
-            "Live Reddit scrape uses public Reddit RSS feeds and stores the collected run locally. "
-            "No Reddit API keys are required, but large runs may be rate-limited."
-        )
-    else:
-        st.info(
-            "Bundled fake dataset mode is active. "
-            f"The packaged dataset currently has rows for {', '.join(fake_subreddits)}."
-        )
 
     selected_source_ids = st.multiselect(
         "Active sources to include",
@@ -1386,7 +1428,7 @@ def render_run_analysis_page(
         default=active_sources["source_id"].tolist(),
         format_func=lambda source_id: active_sources.loc[active_sources["source_id"] == source_id, "display_name"].iloc[0],
     )
-    anchor = client.latest_available_timestamp() if data_mode == "fake" else datetime.now(UTC)
+    anchor = datetime.now(UTC)
     previous_run = latest_matching_run(
         db_path,
         source_ids=[int(source_id) for source_id in selected_source_ids],
@@ -1454,12 +1496,11 @@ def render_run_analysis_page(
         custom_range=custom_range,
         previous_run=previous_run,
     )
-    anchor_label = "latest bundled fake item" if data_mode == "fake" else "current time"
-    st.caption(f"Window resolved against {anchor_label}: `{start_dt.date().isoformat()}` to `{end_dt.date().isoformat()}`.")
+    st.caption(f"Window resolved against current time: `{start_dt.date().isoformat()}` to `{end_dt.date().isoformat()}`.")
     if use_last_run_window and previous_run:
         st.caption(
             f"Most recent matching completed run completed at `{str(previous_run.get('completed_at') or previous_run['time_window_end'])[:19]}` "
-            f"for `{DATA_MODE_LABELS.get(str(previous_run['data_mode']), str(previous_run['data_mode']))}` mode."
+            "for this source set."
         )
 
     run_disabled = False
@@ -1476,11 +1517,9 @@ def render_run_analysis_page(
         status_box = st.empty()
         try:
             run_id, _summary = run_analysis_pipeline(
-                data_path=data_path,
                 ticker_path=ticker_path,
                 db_path=db_path,
                 artifacts_dir=artifacts_dir,
-                data_mode=data_mode,
                 model_name=model_name,
                 ollama_url=ollama_url,
                 selected_sources=selected_sources,
@@ -1798,7 +1837,6 @@ def render_run_metadata(db_path: Path, run_id: str) -> None:
     ]
 
     with st.expander("Run metadata", expanded=False):
-        st.write(f"Collection mode: `{DATA_MODE_LABELS.get(str(run_record['data_mode']), str(run_record['data_mode']))}`")
         st.write(f"Collected window: `{run_record['time_window_start']}` to `{run_record['time_window_end']}`")
         st.write(f"Started at: `{run_record['started_at']}`")
         if run_record.get("completed_at"):
@@ -2526,7 +2564,6 @@ def render_ticker_trends_page(db_path: Path, run_id: str | None) -> None:
 
     st.caption(
         f"Selected scrape: `{run_completed_label(run_record)}` · "
-        f"{DATA_MODE_LABELS.get(str(run_record['data_mode']), str(run_record['data_mode']))} · "
         f"{format_source_names(run_record, source_lookup)}"
     )
     metric_cols = st.columns(5)
@@ -2836,7 +2873,7 @@ def render_export_page(db_path: Path, run_id: str | None) -> None:
     )
 
 
-def render_settings_page(db_path: Path, data_path: Path, ticker_path: Path, artifacts_dir: Path) -> None:
+def render_settings_page(db_path: Path, ticker_path: Path, artifacts_dir: Path) -> None:
     st.header("Settings")
     overview = db_overview(db_path)
     overview_cols = st.columns(4)
@@ -2855,9 +2892,7 @@ def render_settings_page(db_path: Path, data_path: Path, ticker_path: Path, arti
         env_cols[2].metric("Pandas", pd.__version__)
         env_cols[3].metric("Requests", requests.__version__)
 
-        latest_fake_item = RedditClient(data_path).latest_available_timestamp()
-        st.write(f"Latest bundled fake item: `{latest_fake_item.date().isoformat()}`")
-        st.write("Live collection uses public Reddit RSS feeds. Bundled fake data remains available for offline testing.")
+        st.write("Collection uses public Reddit RSS feeds and stores runs locally.")
 
         st.subheader("Paths")
         st.code(
@@ -2867,7 +2902,6 @@ def render_settings_page(db_path: Path, data_path: Path, ticker_path: Path, arti
                     f"artifacts_dir = {artifacts_dir}",
                     f"ui_preferences = {DEFAULT_UI_PREFS_PATH}",
                     f"storage_root = {DEFAULT_STORAGE_ROOT}",
-                    f"fake_data_path = {data_path}",
                     f"ticker_catalog_path = {ticker_path}",
                     f"ollama_url = {DEFAULT_OLLAMA_URL}",
                     f"default_model = {DEFAULT_MODEL}",
@@ -2892,31 +2926,84 @@ def render_settings_page(db_path: Path, data_path: Path, ticker_path: Path, arti
     with runs_tab:
         st.subheader("Run health")
         runs = load_analysis_runs(db_path)
+        if not runs.empty:
+            runs = runs[runs["data_mode"] == "live"].copy()
         if runs.empty:
             st.info("No runs have been saved yet.")
         else:
             run_health = runs.copy()
+            run_health["items_collected"] = run_health["summary_json"].map(lambda value: int((value or {}).get("items_collected", (value or {}).get("items_analyzed", 0)) or 0))
             run_health["items_analyzed"] = run_health["summary_json"].map(lambda value: int((value or {}).get("items_analyzed", 0)))
             run_health["ticker_mentions"] = run_health["summary_json"].map(lambda value: int((value or {}).get("ticker_mentions", 0)))
             run_health["tickers_found"] = run_health["summary_json"].map(lambda value: int((value or {}).get("tickers_found", 0)))
             run_health["fallback_count"] = run_health["summary_json"].map(lambda value: int((value or {}).get("fallback_count", 0)))
+            run_health["error_message"] = run_health["summary_json"].map(lambda value: str((value or {}).get("error_message", "")))
+            run_health["elapsed_minutes"] = run_health.apply(lambda row: run_elapsed_minutes(row.to_dict()) or 0, axis=1)
+            run_health["elapsed"] = run_health.apply(lambda row: run_elapsed_label(row.to_dict()) if row.get("status") == "running" else "", axis=1)
+            status_counts = run_health["status"].value_counts().to_dict()
+            health_cols = st.columns(3)
+            health_cols[0].metric("Completed", int(status_counts.get("completed", 0)))
+            health_cols[1].metric("Running", int(status_counts.get("running", 0)))
+            health_cols[2].metric("Failed", int(status_counts.get("failed", 0)))
+            stale_running = run_health[
+                (run_health["status"] == "running")
+                & (run_health["elapsed_minutes"] >= 30)
+            ].copy()
+            if not stale_running.empty:
+                st.warning(f"{len(stale_running)} run(s) have been marked running for 30+ minutes.")
+                if st.button("Mark stale running runs as failed", use_container_width=True):
+                    for row in stale_running.to_dict(orient="records"):
+                        fail_analysis_run(
+                            db_path,
+                            str(row["analysis_run_id"]),
+                            {
+                                "items_collected": int(row.get("items_collected", 0)),
+                                "items_analyzed": int(row.get("items_analyzed", 0)),
+                                "ticker_mentions": int(row.get("ticker_mentions", 0)),
+                                "tickers_found": int(row.get("tickers_found", 0)),
+                                "bullish_items": 0,
+                                "bearish_items": 0,
+                                "neutral_items": 0,
+                                "irrelevant_items": 0,
+                                "top_mentioned_tickers": [],
+                                "top_accelerating_tickers": [],
+                                "high_depth_posts_found": 0,
+                                "low_mentions_high_signal_count": 0,
+                                "newly_detected_tickers_count": 0,
+                                "fallback_count": int(row.get("fallback_count", 0)),
+                                "failed_stage": "stale_running_cleanup",
+                                "error_message": "Marked failed from Run health after remaining in running status for 30+ minutes.",
+                            },
+                        )
+                    st.rerun()
             st.dataframe(
                 run_health[
                     [
                         "analysis_run_id",
                         "status",
-                        "data_mode",
                         "started_at",
                         "completed_at",
+                        "elapsed",
                         "time_window_label",
+                        "items_collected",
                         "items_analyzed",
                         "ticker_mentions",
                         "tickers_found",
                         "fallback_count",
+                        "error_message",
                     ]
                 ],
                 use_container_width=True,
                 hide_index=True,
+                column_config={
+                    "analysis_run_id": st.column_config.TextColumn("Run"),
+                    "items_collected": st.column_config.NumberColumn("Collected", format="%d"),
+                    "items_analyzed": st.column_config.NumberColumn("Analysed", format="%d"),
+                    "ticker_mentions": st.column_config.NumberColumn("Mentions", format="%d"),
+                    "tickers_found": st.column_config.NumberColumn("Tickers", format="%d"),
+                    "fallback_count": st.column_config.NumberColumn("Fallback", format="%d"),
+                    "error_message": st.column_config.TextColumn("Error", width="large"),
+                },
             )
 
     with prefs_tab:
@@ -2937,16 +3024,15 @@ def render_settings_page(db_path: Path, data_path: Path, ticker_path: Path, arti
 
 
 init_db(DEFAULT_DB_PATH, SCHEMA_PATH)
-ensure_seed_sources(DEFAULT_DB_PATH, DEFAULT_DATA_PATH, DEFAULT_SOURCES_PATH)
-page, selected_run_id, _, _ = build_sidebar_state(DEFAULT_DB_PATH, DEFAULT_DATA_PATH)
+ensure_seed_sources(DEFAULT_DB_PATH, DEFAULT_SOURCES_PATH)
+page, selected_run_id, _, _ = build_sidebar_state(DEFAULT_DB_PATH)
 
 if page == "Sources":
-    render_sources_page(DEFAULT_DB_PATH, DEFAULT_DATA_PATH)
+    render_sources_page(DEFAULT_DB_PATH)
 elif page == "Run Analysis":
     render_run_analysis_page(
         db_path=DEFAULT_DB_PATH,
         artifacts_dir=DEFAULT_ARTIFACTS_DIR,
-        data_path=DEFAULT_DATA_PATH,
         ticker_path=DEFAULT_TICKER_PATH,
     )
 elif page == "Results Dashboard":
@@ -2956,4 +3042,4 @@ elif page == "Ticker Trends":
 elif page == "Export Data":
     render_export_page(DEFAULT_DB_PATH, selected_run_id)
 elif page == "Settings":
-    render_settings_page(DEFAULT_DB_PATH, DEFAULT_DATA_PATH, DEFAULT_TICKER_PATH, DEFAULT_ARTIFACTS_DIR)
+    render_settings_page(DEFAULT_DB_PATH, DEFAULT_TICKER_PATH, DEFAULT_ARTIFACTS_DIR)

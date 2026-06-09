@@ -9,13 +9,13 @@ This is a research workflow, not a financial advice tool.
 The current prototype covers the dashboard expansion MVP:
 
 - Manage subreddit and thread URL sources in SQLite
-- Run source-filtered fake-data analysis over multi-week time windows
+- Run source-filtered Reddit analysis over configurable time windows
 - Extract tickers and company names from a local CSV catalog
 - Send each item to Ollama over `http://localhost:11434/api/chat`
 - Save raw items, classifications, item-level ticker mentions, ticker summaries, and time buckets to SQLite
 - Explore results in dashboard, trends, and export pages
 
-The Reddit ingestion layer supports both the bundled fake dataset and no-key live Reddit collection through public RSS feeds.
+The Reddit ingestion layer uses public Reddit RSS feeds, so no Reddit API keys are required.
 
 ## Project Layout
 
@@ -27,7 +27,6 @@ The Reddit ingestion layer supports both the bundled fake dataset and no-key liv
 ├── .env.example
 ├── data
 │   ├── default_sources.json
-│   ├── fake_reddit_data.json
 │   └── tickers.csv
 └── signal_from_the_slop
     ├── __init__.py
@@ -79,12 +78,11 @@ If `llama3.1:8b` is not installed locally, the app will let you choose any insta
 
 After `streamlit run app.py` opens the app:
 
-1. Use the left sidebar and select `Run Analysis`.
-2. Leave `Collection mode` set to `Live Reddit scrape`.
-3. Pick the active sources and date window you want.
-4. Set small limits first, for example `Max posts per source = 2` and `Max comments per thread = 1`.
-5. Press `Scrape Reddit and Run Analysis`.
-6. When it finishes, the app moves to `Results Dashboard` and shows the saved run.
+1. Select `02 Scrape` in the workflow header.
+2. Pick the active sources and date window you want.
+3. Set small limits first, for example `Max posts per source = 2` and `Max comments per thread = 1`.
+4. Press `Scrape Reddit and Run Analysis`.
+5. When it finishes, the app moves to `Results Dashboard` and shows the saved run.
 
 The Streamlit `Deploy` button is only for publishing the app online. It does not start scraping.
 Completed runs in the sidebar are shown with a readable label: date, time, source set, and item count.
@@ -129,14 +127,13 @@ streamlit run app.py
 
 ## How It Works
 
-1. The app loads and filters multi-week fake Reddit items from [data/fake_reddit_data.json](/Users/rowanellis/Documents/Signal from the Slop/data/fake_reddit_data.json).
-2. [signal_from_the_slop/reddit_client.py](/Users/rowanellis/Documents/Signal from the Slop/signal_from_the_slop/reddit_client.py) normalizes subreddit or thread URL sources and matches them to fake items.
-3. [signal_from_the_slop/ticker_extractor.py](/Users/rowanellis/Documents/Signal from the Slop/signal_from_the_slop/ticker_extractor.py) matches `$TICKER`, uppercase ticker symbols, and company names from [data/tickers.csv](/Users/rowanellis/Documents/Signal from the Slop/data/tickers.csv).
-4. [signal_from_the_slop/ollama_classifier.py](/Users/rowanellis/Documents/Signal from the Slop/signal_from_the_slop/ollama_classifier.py) sends each item to Ollama using `requests.post(...)` against `/api/chat` and requests strict JSON output.
-5. If Ollama is unavailable or returns invalid JSON, the app falls back to deterministic heuristics so the dashboard remains testable offline.
-6. [signal_from_the_slop/analytics.py](/Users/rowanellis/Documents/Signal from the Slop/signal_from_the_slop/analytics.py) builds long-format mention rows, ticker summaries, and time-bucketed acceleration metrics.
-7. [signal_from_the_slop/database.py](/Users/rowanellis/Documents/Signal from the Slop/signal_from_the_slop/database.py) stores sources, runs, raw items, classifications, long-format mentions, summaries, and trend buckets in SQLite.
-8. [app.py](/Users/rowanellis/Documents/Signal from the Slop/app.py) exposes the Streamlit pages: `Sources`, `Run Analysis`, `Results Dashboard`, `Ticker Trends`, `Export Data`, and `Settings`.
+1. [signal_from_the_slop/reddit_client.py](/Users/rowanellis/Documents/Signal from the Slop/signal_from_the_slop/reddit_client.py) normalizes subreddit or thread URL sources and collects matching Reddit RSS items.
+2. [signal_from_the_slop/ticker_extractor.py](/Users/rowanellis/Documents/Signal from the Slop/signal_from_the_slop/ticker_extractor.py) matches `$TICKER`, uppercase ticker symbols, and company names from [data/tickers.csv](/Users/rowanellis/Documents/Signal from the Slop/data/tickers.csv).
+3. [signal_from_the_slop/ollama_classifier.py](/Users/rowanellis/Documents/Signal from the Slop/signal_from_the_slop/ollama_classifier.py) sends each item to Ollama using `requests.post(...)` against `/api/chat` and requests strict JSON output.
+4. If Ollama is unavailable or returns invalid JSON, the app falls back to deterministic heuristics so the dashboard remains testable offline.
+5. [signal_from_the_slop/analytics.py](/Users/rowanellis/Documents/Signal from the Slop/signal_from_the_slop/analytics.py) builds long-format mention rows, ticker summaries, and time-bucketed acceleration metrics.
+6. [signal_from_the_slop/database.py](/Users/rowanellis/Documents/Signal from the Slop/signal_from_the_slop/database.py) stores sources, runs, raw items, classifications, long-format mentions, summaries, and trend buckets in SQLite.
+7. [app.py](/Users/rowanellis/Documents/Signal from the Slop/app.py) exposes the Streamlit pages: `Sources`, `Run Analysis`, `Results Dashboard`, `Ticker Trends`, `Export Data`, and `Settings`.
 
 ## Environment Variables
 
