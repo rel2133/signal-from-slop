@@ -4,6 +4,7 @@ import os
 import re
 import time
 import xml.etree.ElementTree as ET
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from html import unescape
@@ -41,6 +42,8 @@ class RedditClient:
         max_posts_per_source: int,
         max_comments_per_thread: int,
         include_comments: bool,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        checkpoint: Callable[[], None] | None = None,
     ) -> list[dict[str, Any]]:
         session = self._build_scraper_session()
         deduped_items: dict[str, dict[str, Any]] = {}
@@ -49,7 +52,19 @@ class RedditClient:
             selected_sources,
             key=lambda source: 0 if source["source_type"] == "thread_url" else 1,
         )
-        for source in ordered_sources:
+        total_sources = len(ordered_sources)
+        for source_index, source in enumerate(ordered_sources, start=1):
+            if checkpoint is not None:
+                checkpoint()
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "message": f"Scraping source {source_index}/{total_sources}: {source['display_name']}",
+                        "current": source_index - 1,
+                        "total": total_sources,
+                        "unit": "sources",
+                    }
+                )
             if source["source_type"] == "thread_url":
                 items = self._collect_scraped_thread(
                     session=session,
@@ -68,12 +83,25 @@ class RedditClient:
                     max_posts_per_source=max_posts_per_source,
                     max_comments_per_thread=max_comments_per_thread,
                     include_comments=include_comments,
+                    progress_callback=progress_callback,
+                    checkpoint=checkpoint,
+                    source_index=source_index,
+                    total_sources=total_sources,
                 )
             else:
                 items = []
 
             for item in items:
                 deduped_items.setdefault(item["item_id"], item)
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "message": f"Finished source {source_index}/{total_sources}: {source['display_name']} ({len(items)} items)",
+                        "current": source_index,
+                        "total": total_sources,
+                        "unit": "sources",
+                    }
+                )
 
         return sorted(deduped_items.values(), key=lambda row: row["created_time"])
 
@@ -98,6 +126,10 @@ class RedditClient:
         max_posts_per_source: int,
         max_comments_per_thread: int,
         include_comments: bool,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        checkpoint: Callable[[], None] | None = None,
+        source_index: int = 1,
+        total_sources: int = 1,
     ) -> list[dict[str, Any]]:
         subreddit = normalize_subreddit_name(str(source["normalized_value"]))
         feed_url = f"https://www.reddit.com/r/{subreddit}/new/.rss?limit=100"
@@ -122,7 +154,18 @@ class RedditClient:
                 break
 
         if include_comments and max_comments_per_thread:
-            for post in posts:
+            for post_index, post in enumerate(posts, start=1):
+                if checkpoint is not None:
+                    checkpoint()
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "message": f"Fetching comments {post_index}/{len(posts)} for {source['display_name']}",
+                            "current": source_index - 1,
+                            "total": total_sources,
+                            "unit": "sources",
+                        }
+                    )
                 items.extend(
                     self._collect_scraped_thread_comments(
                         session=session,
@@ -133,6 +176,15 @@ class RedditClient:
                         max_comments_per_thread=max_comments_per_thread,
                     )
                 )
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "message": f"Fetched comments {post_index}/{len(posts)} for {source['display_name']}",
+                            "current": source_index - 1,
+                            "total": total_sources,
+                            "unit": "sources",
+                        }
+                    )
 
         return items
 

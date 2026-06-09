@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sqlite3
+import threading
+import time as time_module
 from html import escape
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -115,6 +118,11 @@ PAGE_STEPS = [
 PAGES = [step["page"] for step in PAGE_STEPS]
 PAGE_LABELS = {step["page"]: f"{step['step']} {step['label']}" for step in PAGE_STEPS}
 PAGE_CONTEXT = {step["page"]: step["context"] for step in PAGE_STEPS}
+ACTIVE_RUN_STATUSES = {"running", "pausing", "paused", "cancelling"}
+RUN_CONTROL_POLL_SECONDS = 0.5
+RUN_HEARTBEAT_STALE_SECONDS = 45
+RUN_WORKERS: dict[str, threading.Thread] = {}
+RUN_WORKERS_LOCK = threading.Lock()
 
 LOCALHOST_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
 FILTER_PRESETS = {
@@ -346,6 +354,52 @@ st.markdown(
             font-weight: 700;
             margin: 0 0.25rem 0.25rem 0;
             padding: 0.16rem 0.48rem;
+        }
+        .run-banner-shell {
+            align-items: center;
+            background: rgba(255, 255, 255, 0.72);
+            border: 1px solid rgba(128, 128, 128, 0.24);
+            border-radius: 8px;
+            display: flex;
+            gap: 0.8rem;
+            margin: 0.25rem 0 0.65rem;
+            padding: 0.8rem 0.95rem;
+        }
+        .run-banner-title {
+            font-size: 0.95rem;
+            font-weight: 700;
+            line-height: 1.2;
+        }
+        .run-banner-meta {
+            font-size: 0.82rem;
+            margin-top: 0.15rem;
+            opacity: 0.72;
+        }
+        .run-pulse {
+            background: rgba(57, 132, 255, 0.22);
+            border-radius: 999px;
+            flex: 0 0 auto;
+            height: 12px;
+            width: 12px;
+        }
+        .run-pulse.active {
+            animation: run-pulse 1.15s ease-in-out infinite;
+            background: rgba(52, 199, 89, 0.88);
+            box-shadow: 0 0 0 0 rgba(52, 199, 89, 0.26);
+        }
+        @keyframes run-pulse {
+            0% {
+                box-shadow: 0 0 0 0 rgba(52, 199, 89, 0.30);
+                transform: scale(0.95);
+            }
+            70% {
+                box-shadow: 0 0 0 12px rgba(52, 199, 89, 0.0);
+                transform: scale(1);
+            }
+            100% {
+                box-shadow: 0 0 0 0 rgba(52, 199, 89, 0.0);
+                transform: scale(0.95);
+            }
         }
     </style>
     """,
@@ -800,6 +854,377 @@ def save_run_artifacts(
     time_bucket_df.to_csv(run_dir / "ticker_time_buckets.csv", index=False)
 
 
+_ANALYSIS_RUN_COMPLETED_UNCHANGED = object()
+
+
+class AnalysisRunCancelled(RuntimeError):
+    pass
+
+
+def analysis_run_now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def decode_summary_object(raw_value: Any) -> dict[str, Any]:
+    if isinstance(raw_value, dict):
+        return dict(raw_value)
+    if raw_value in (None, ""):
+        return {}
+    try:
+        decoded = json.loads(str(raw_value))
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def read_analysis_run_state(db_path: Path, analysis_run_id: str) -> dict[str, Any] | None:
+    try:
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT analysis_run_id, started_at, completed_at, status, summary_json
+                FROM analysis_runs
+                WHERE analysis_run_id = ?
+                """,
+                (analysis_run_id,),
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    return {
+        "analysis_run_id": str(row[0]),
+        "started_at": row[1],
+        "completed_at": row[2],
+        "status": str(row[3]),
+        "summary_json": decode_summary_object(row[4]),
+    }
+
+
+def update_analysis_run_state(
+    db_path: Path,
+    analysis_run_id: str,
+    *,
+    status: str | None = None,
+    summary_updates: dict[str, Any] | None = None,
+    completed_at: object = _ANALYSIS_RUN_COMPLETED_UNCHANGED,
+) -> None:
+    with sqlite3.connect(db_path) as conn:
+        for _ in range(5):
+            updates: list[str] = []
+            values: list[Any] = []
+            current_summary_raw = "{}"
+
+            if summary_updates is not None:
+                current_row = conn.execute(
+                    "SELECT summary_json FROM analysis_runs WHERE analysis_run_id = ?",
+                    (analysis_run_id,),
+                ).fetchone()
+                current_summary_raw = str(current_row[0]) if current_row and current_row[0] is not None else "{}"
+                current_summary = decode_summary_object(current_summary_raw)
+                current_summary.update(summary_updates)
+                updates.append("summary_json = ?")
+                values.append(json.dumps(current_summary, ensure_ascii=True))
+
+            if status is not None:
+                updates.append("status = ?")
+                values.append(status)
+
+            if completed_at is not _ANALYSIS_RUN_COMPLETED_UNCHANGED:
+                updates.append("completed_at = ?")
+                values.append(completed_at)
+
+            if not updates:
+                return
+
+            if summary_updates is not None:
+                values.extend([analysis_run_id, current_summary_raw])
+                cursor = conn.execute(
+                    f"UPDATE analysis_runs SET {', '.join(updates)} WHERE analysis_run_id = ? AND summary_json = ?",
+                    values,
+                )
+                if cursor.rowcount == 0:
+                    conn.rollback()
+                    continue
+            else:
+                values.append(analysis_run_id)
+                conn.execute(
+                    f"UPDATE analysis_runs SET {', '.join(updates)} WHERE analysis_run_id = ?",
+                    values,
+                )
+            conn.commit()
+            return
+    raise RuntimeError(f"Could not update analysis run {analysis_run_id}.")
+
+
+def cancel_analysis_run_local(db_path: Path, analysis_run_id: str, summary: dict[str, Any]) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE analysis_runs
+            SET completed_at = ?, status = ?, summary_json = ?
+            WHERE analysis_run_id = ?
+            """,
+            (
+                analysis_run_now_iso(),
+                "cancelled",
+                json.dumps(summary, ensure_ascii=True),
+                analysis_run_id,
+            ),
+        )
+        conn.commit()
+
+
+def build_run_config(
+    *,
+    model_name: str,
+    ollama_url: str,
+    selected_sources: list[dict[str, Any]],
+    time_window_label: str,
+    time_window_start: datetime,
+    time_window_end: datetime,
+    max_posts_per_source: int,
+    max_comments_per_thread: int,
+    include_comments: bool,
+    skip_previously_analyzed: bool,
+    run_deeper_analysis: bool,
+) -> dict[str, Any]:
+    return {
+        "data_mode": "live",
+        "selected_source_ids": [int(source["source_id"]) for source in selected_sources],
+        "selected_sources": [
+            {
+                "source_id": int(source["source_id"]),
+                "display_name": str(source["display_name"]),
+                "source_type": str(source["source_type"]),
+                "url": str(source["url"]),
+            }
+            for source in selected_sources
+        ],
+        "time_window_label": time_window_label,
+        "time_window_start": time_window_start.isoformat(),
+        "time_window_end": time_window_end.isoformat(),
+        "max_posts_per_source": max_posts_per_source,
+        "max_comments_per_thread": max_comments_per_thread,
+        "include_comments": include_comments,
+        "skip_previously_analyzed": skip_previously_analyzed,
+        "run_deeper_analysis": run_deeper_analysis,
+        "ollama_model": model_name,
+        "ollama_url": ollama_url,
+    }
+
+
+def build_active_run_mask(runs: pd.DataFrame) -> pd.Series:
+    return runs["status"].astype(str).str.lower().isin(ACTIVE_RUN_STATUSES)
+
+
+def latest_active_run(runs: pd.DataFrame) -> dict[str, Any] | None:
+    if runs.empty:
+        return None
+    active_runs = runs[build_active_run_mask(runs)].copy()
+    if active_runs.empty:
+        return None
+    return active_runs.iloc[0].to_dict()
+
+
+def scale_progress(start: float, end: float, current: int, total: int) -> float:
+    if total <= 0:
+        return end
+    clamped_current = min(max(current, 0), total)
+    return start + ((end - start) * (clamped_current / total))
+
+
+def register_run_worker(run_id: str, worker: threading.Thread) -> None:
+    with RUN_WORKERS_LOCK:
+        RUN_WORKERS[run_id] = worker
+
+
+def unregister_run_worker(run_id: str) -> None:
+    with RUN_WORKERS_LOCK:
+        RUN_WORKERS.pop(run_id, None)
+
+
+def has_live_run_worker(run_id: str) -> bool:
+    with RUN_WORKERS_LOCK:
+        worker = RUN_WORKERS.get(run_id)
+        if worker is None:
+            return False
+        if worker.is_alive():
+            return True
+        RUN_WORKERS.pop(run_id, None)
+        return False
+
+
+def request_run_pause(db_path: Path, analysis_run_id: str, *, pause_requested: bool) -> None:
+    run_state = read_analysis_run_state(db_path, analysis_run_id)
+    if not run_state:
+        return
+    current_status = str(run_state.get("status", "")).lower()
+    if current_status in {"completed", "failed", "cancelled"}:
+        return
+    summary = run_state.get("summary_json", {}) or {}
+    control = dict(summary.get("control", {})) if isinstance(summary.get("control", {}), dict) else {}
+    control["pause_requested"] = pause_requested
+    control["updated_at"] = analysis_run_now_iso()
+    next_status = current_status
+    if pause_requested and current_status == "running":
+        next_status = "pausing"
+    elif pause_requested and current_status == "paused":
+        next_status = "paused"
+    elif not pause_requested and current_status in {"paused", "pausing"}:
+        next_status = "running"
+    update_analysis_run_state(
+        db_path,
+        analysis_run_id,
+        status=next_status,
+        summary_updates={"control": control},
+    )
+
+
+def request_run_cancel(db_path: Path, analysis_run_id: str) -> None:
+    run_state = read_analysis_run_state(db_path, analysis_run_id)
+    if not run_state:
+        return
+    current_status = str(run_state.get("status", "")).lower()
+    if current_status in {"completed", "failed", "cancelled"}:
+        return
+    summary = run_state.get("summary_json", {}) or {}
+    control = dict(summary.get("control", {})) if isinstance(summary.get("control", {}), dict) else {}
+    control["cancel_requested"] = True
+    control["updated_at"] = analysis_run_now_iso()
+    update_analysis_run_state(
+        db_path,
+        analysis_run_id,
+        status="cancelling",
+        summary_updates={"control": control},
+    )
+
+
+def track_background_run(run_id: str) -> None:
+    st.session_state["background_run_id"] = run_id
+    st.session_state["background_run_last_status"] = "running"
+    st.session_state.pop("background_run_notice", None)
+    st.session_state.pop("background_run_notice_level", None)
+    st.session_state.pop("background_run_notice_run_id", None)
+
+
+def sync_tracked_background_run(db_path: Path) -> None:
+    tracked_run_id = str(st.session_state.get("background_run_id", "") or "")
+    if not tracked_run_id:
+        return
+    run_state = read_analysis_run_state(db_path, tracked_run_id)
+    if not run_state:
+        return
+    status = str(run_state.get("status", "unknown")).lower()
+    st.session_state["background_run_last_status"] = status
+    if status not in {"completed", "failed", "cancelled"}:
+        return
+
+    if status == "completed":
+        st.session_state["background_run_notice_level"] = "success"
+        st.session_state["background_run_notice"] = f"Background run `{tracked_run_id}` completed."
+        st.session_state["background_run_notice_run_id"] = tracked_run_id
+        st.session_state["selected_run_id"] = tracked_run_id
+    elif status == "cancelled":
+        st.session_state["background_run_notice_level"] = "warning"
+        st.session_state["background_run_notice"] = f"Background run `{tracked_run_id}` was cancelled."
+        st.session_state["background_run_notice_run_id"] = tracked_run_id
+    else:
+        st.session_state["background_run_notice_level"] = "error"
+        st.session_state["background_run_notice"] = f"Background run `{tracked_run_id}` failed."
+        st.session_state["background_run_notice_run_id"] = tracked_run_id
+    st.session_state.pop("background_run_id", None)
+
+
+class AnalysisRunController:
+    def __init__(self, *, db_path: Path, run_id: str) -> None:
+        self.db_path = db_path
+        self.run_id = run_id
+        self.last_status = "running"
+        self.last_runtime: dict[str, Any] = {
+            "stage": "queued",
+            "message": "Waiting to start.",
+            "progress_fraction": 0.0,
+            "progress_current": 0,
+            "progress_total": 0,
+            "progress_unit": "items",
+            "heartbeat_at": analysis_run_now_iso(),
+        }
+
+    def report(
+        self,
+        *,
+        stage: str,
+        message: str,
+        progress_fraction: float,
+        progress_current: int = 0,
+        progress_total: int = 0,
+        progress_unit: str = "items",
+        status: str = "running",
+    ) -> None:
+        runtime = {
+            "stage": stage,
+            "message": message,
+            "progress_fraction": min(max(float(progress_fraction), 0.0), 1.0),
+            "progress_current": int(progress_current),
+            "progress_total": int(progress_total),
+            "progress_unit": str(progress_unit),
+            "heartbeat_at": analysis_run_now_iso(),
+        }
+        self.last_runtime = runtime
+        self.last_status = status
+        try:
+            update_analysis_run_state(
+                self.db_path,
+                self.run_id,
+                status=status,
+                summary_updates={"runtime": runtime},
+            )
+        except RuntimeError:
+            logging.warning("Could not persist runtime update for analysis run %s", self.run_id)
+
+    def checkpoint(self) -> None:
+        while True:
+            run_state = read_analysis_run_state(self.db_path, self.run_id)
+            if not run_state:
+                raise AnalysisRunCancelled("Run no longer exists.")
+            status = str(run_state.get("status", "running")).lower()
+            summary = run_state.get("summary_json", {}) or {}
+            control = dict(summary.get("control", {})) if isinstance(summary.get("control", {}), dict) else {}
+            if bool(control.get("cancel_requested")) or status == "cancelling":
+                self.report(
+                    stage=str(self.last_runtime.get("stage", "running")),
+                    message="Cancellation requested. Stopping after the current request.",
+                    progress_fraction=float(self.last_runtime.get("progress_fraction", 0.0)),
+                    progress_current=int(self.last_runtime.get("progress_current", 0)),
+                    progress_total=int(self.last_runtime.get("progress_total", 0)),
+                    progress_unit=str(self.last_runtime.get("progress_unit", "items")),
+                    status="cancelling",
+                )
+                raise AnalysisRunCancelled("Run cancelled by user.")
+            if bool(control.get("pause_requested")) or status in {"pausing", "paused"}:
+                self.report(
+                    stage=str(self.last_runtime.get("stage", "running")),
+                    message="Paused. Resume to continue.",
+                    progress_fraction=float(self.last_runtime.get("progress_fraction", 0.0)),
+                    progress_current=int(self.last_runtime.get("progress_current", 0)),
+                    progress_total=int(self.last_runtime.get("progress_total", 0)),
+                    progress_unit=str(self.last_runtime.get("progress_unit", "items")),
+                    status="paused",
+                )
+                time_module.sleep(RUN_CONTROL_POLL_SECONDS)
+                continue
+            if self.last_status == "paused":
+                self.report(
+                    stage=str(self.last_runtime.get("stage", "running")),
+                    message="Resuming analysis.",
+                    progress_fraction=float(self.last_runtime.get("progress_fraction", 0.0)),
+                    progress_current=int(self.last_runtime.get("progress_current", 0)),
+                    progress_total=int(self.last_runtime.get("progress_total", 0)),
+                    progress_unit=str(self.last_runtime.get("progress_unit", "items")),
+                    status="running",
+                )
+            return
 def build_run_display_label(run_record: dict[str, Any], source_lookup: dict[int, str]) -> str:
     timestamp = str(run_record.get("completed_at") or run_record.get("started_at") or "")[:19].replace("T", " ")
     source_ids = [int(source_id) for source_id in run_record.get("selected_source_ids", [])]
@@ -884,6 +1309,7 @@ def render_latest_run_status(runs: pd.DataFrame, source_lookup: dict[int, str]) 
     items_collected = int(summary.get("items_collected", items_analyzed) or 0)
     items_scraped = int(summary.get("items_scraped", items_collected) or 0)
     items_skipped_existing = int(summary.get("items_skipped_existing", 0) or 0)
+    runtime = summary.get("runtime", {}) if isinstance(summary.get("runtime", {}), dict) else {}
     run_label = f"`{latest.get('analysis_run_id')}`"
     source_label = format_source_names(latest, source_lookup)
 
@@ -891,6 +1317,14 @@ def render_latest_run_status(runs: pd.DataFrame, source_lookup: dict[int, str]) 
         st.success(f"Latest run complete: {run_label} with {items_analyzed} analysed item(s).")
     elif status == "running":
         st.warning(f"Latest run still running: {run_label} started {run_elapsed_label(latest)} ago.")
+    elif status == "pausing":
+        st.warning(f"Latest run pause requested: {run_label}.")
+    elif status == "paused":
+        st.info(f"Latest run paused: {run_label}.")
+    elif status == "cancelling":
+        st.warning(f"Latest run cancelling: {run_label}.")
+    elif status == "cancelled":
+        st.warning(f"Latest run cancelled: {run_label}.")
     elif status == "failed":
         st.error(f"Latest run failed: {run_label}.")
     else:
@@ -899,6 +1333,8 @@ def render_latest_run_status(runs: pd.DataFrame, source_lookup: dict[int, str]) 
         f"Sources: {source_label}. Scraped: {items_scraped}. Skipped existing: {items_skipped_existing}. "
         f"Analysed: {items_analyzed}. Completed: `{run_completed_label(latest)}`."
     )
+    if runtime:
+        st.caption(str(runtime.get("message", "") or ""))
 
 
 def render_recent_run_statuses(runs: pd.DataFrame, source_lookup: dict[int, str]) -> None:
@@ -913,14 +1349,142 @@ def render_recent_run_statuses(runs: pd.DataFrame, source_lookup: dict[int, str]
             items_collected = int(summary.get("items_collected", items_analyzed) or 0)
             items_scraped = int(summary.get("items_scraped", items_collected) or 0)
             items_skipped_existing = int(summary.get("items_skipped_existing", 0) or 0)
+            runtime = summary.get("runtime", {}) if isinstance(summary.get("runtime", {}), dict) else {}
             st.markdown(f"**{status}** `{run_id}`")
             st.caption(
                 f"{format_source_names(row, source_lookup)} | started `{str(row.get('started_at', ''))[:19].replace('T', ' ')}` | "
                 f"scraped {items_scraped} | skipped {items_skipped_existing} | analysed {items_analyzed}"
             )
+            runtime_message = str(runtime.get("message", "") or "")
+            if runtime_message:
+                st.caption(runtime_message)
             error_message = str(summary.get("error_message", "") or "")
             if error_message:
                 st.caption(f"Error: {error_message[:180]}")
+
+
+def render_background_run_notice() -> None:
+    notice = str(st.session_state.get("background_run_notice", "") or "")
+    if not notice:
+        return
+    level = str(st.session_state.get("background_run_notice_level", "info") or "info").lower()
+    run_id = str(st.session_state.get("background_run_notice_run_id", "") or "")
+    if level == "success":
+        st.success(notice)
+    elif level == "warning":
+        st.warning(notice)
+    elif level == "error":
+        st.error(notice)
+    else:
+        st.info(notice)
+    action_cols = st.columns([1, 1, 6])
+    if run_id and level == "success" and action_cols[0].button("Open results", key=f"notice_results_{run_id}"):
+        st.session_state["selected_run_id"] = run_id
+        st.session_state["page"] = "Results Dashboard"
+        st.rerun()
+    if action_cols[1].button("Dismiss", key=f"notice_dismiss_{run_id or 'latest'}"):
+        st.session_state.pop("background_run_notice", None)
+        st.session_state.pop("background_run_notice_level", None)
+        st.session_state.pop("background_run_notice_run_id", None)
+        st.rerun()
+
+
+def run_heartbeat_age_seconds(run_record: dict[str, Any]) -> int | None:
+    summary = run_record.get("summary_json", {}) or {}
+    runtime = summary.get("runtime", {}) if isinstance(summary.get("runtime", {}), dict) else {}
+    heartbeat_at = str(runtime.get("heartbeat_at", "") or "")
+    if not heartbeat_at:
+        return None
+    try:
+        heartbeat = parse_created_time(heartbeat_at)
+    except Exception:
+        return None
+    return max(int((datetime.now(UTC) - heartbeat).total_seconds()), 0)
+
+
+@st.fragment(run_every=1)
+def render_background_run_banner(db_path: Path, source_lookup: dict[int, str]) -> None:
+    sync_tracked_background_run(db_path)
+    render_background_run_notice()
+
+    runs = load_analysis_runs(db_path)
+    if not runs.empty:
+        runs = runs[runs["data_mode"] == "live"].copy()
+    active_run = latest_active_run(runs) if not runs.empty else None
+    if not active_run:
+        return
+
+    summary = active_run.get("summary_json", {}) or {}
+    runtime = summary.get("runtime", {}) if isinstance(summary.get("runtime", {}), dict) else {}
+    status = str(active_run.get("status", "running")).lower()
+    run_id = str(active_run.get("analysis_run_id", ""))
+    progress_fraction = float(runtime.get("progress_fraction", 0.0) or 0.0)
+    progress_current = int(runtime.get("progress_current", 0) or 0)
+    progress_total = int(runtime.get("progress_total", 0) or 0)
+    progress_unit = str(runtime.get("progress_unit", "items") or "items")
+    source_label = format_source_names(active_run, source_lookup)
+    stage_label = str(runtime.get("stage", status)).replace("_", " ").title()
+    status_message = str(runtime.get("message", "") or f"{stage_label} in progress.")
+    heartbeat_age = run_heartbeat_age_seconds(active_run)
+    worker_attached = has_live_run_worker(run_id)
+    live_signal = heartbeat_age is not None and heartbeat_age <= RUN_HEARTBEAT_STALE_SECONDS and worker_attached
+
+    if status == "paused":
+        pulse_label = "Paused"
+    elif status == "pausing":
+        pulse_label = "Pause requested"
+    elif status == "cancelling":
+        pulse_label = "Cancelling"
+    elif live_signal:
+        pulse_label = "Live background run"
+    else:
+        pulse_label = "Checking background state"
+
+    pulse_class = "run-pulse active" if live_signal else "run-pulse"
+    st.markdown(
+        f"""
+        <div class="run-banner-shell">
+            <div class="{pulse_class}"></div>
+            <div>
+                <div class="run-banner-title">{escape(pulse_label)} · {escape(stage_label)}</div>
+                <div class="run-banner-meta">Run {escape(run_id)} · {escape(source_label)} · started {escape(run_elapsed_label(active_run))} ago</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    progress_text = status_message
+    if progress_total > 0:
+        progress_text = f"{status_message} ({progress_current}/{progress_total} {progress_unit})"
+    st.progress(progress_fraction, text=progress_text)
+
+    info_cols = st.columns([3, 2, 2, 2, 1, 1])
+    info_cols[0].caption(status_message)
+    info_cols[1].metric("Stage", stage_label)
+    info_cols[2].metric("Progress", f"{progress_current}/{progress_total}" if progress_total else "Tracking")
+    info_cols[3].metric("Heartbeat", f"{heartbeat_age}s ago" if heartbeat_age is not None else "Waiting")
+
+    if status in {"running", "pausing"}:
+        if info_cols[4].button("Pause", key=f"pause_run_{run_id}", use_container_width=True):
+            request_run_pause(db_path, run_id, pause_requested=True)
+            st.rerun()
+    elif status == "paused":
+        if info_cols[4].button("Resume", key=f"resume_run_{run_id}", use_container_width=True):
+            request_run_pause(db_path, run_id, pause_requested=False)
+            st.rerun()
+    else:
+        info_cols[4].empty()
+
+    cancel_disabled = status == "cancelling"
+    if info_cols[5].button("Cancel", key=f"cancel_run_{run_id}", use_container_width=True, disabled=cancel_disabled):
+        request_run_cancel(db_path, run_id)
+        st.rerun()
+
+    if not live_signal and status in {"running", "pausing", "cancelling"}:
+        st.warning(
+            "This run is marked active, but its heartbeat is stale. Wait a few seconds for the current request to finish, "
+            "or open Settings -> Run health if it remains stuck."
+        )
 
 
 def render_watchlist_controls(db_path: Path, run_id: str | None) -> None:
@@ -1061,6 +1625,8 @@ def run_analysis_pipeline(
     ticker_path: Path,
     db_path: Path,
     artifacts_dir: Path,
+    run_id: str,
+    run_config: dict[str, Any],
     model_name: str,
     ollama_url: str,
     selected_sources: list[dict[str, Any]],
@@ -1072,37 +1638,11 @@ def run_analysis_pipeline(
     include_comments: bool,
     skip_previously_analyzed: bool,
     run_deeper_analysis: bool,
-    progress_bar: st.delta_generator.DeltaGenerator,
-    status_box: st.delta_generator.DeltaGenerator,
+    controller: AnalysisRunController | None = None,
 ) -> tuple[str, dict[str, Any]]:
     reddit_client = RedditClient()
     extractor = TickerExtractor(ticker_path)
     classifier = OllamaClassifier(model=model_name, endpoint=ollama_url)
-    run_config = {
-        "data_mode": "live",
-        "selected_source_ids": [int(source["source_id"]) for source in selected_sources],
-        "selected_sources": [
-            {
-                "source_id": int(source["source_id"]),
-                "display_name": str(source["display_name"]),
-                "source_type": str(source["source_type"]),
-                "url": str(source["url"]),
-            }
-            for source in selected_sources
-        ],
-        "time_window_label": time_window_label,
-        "time_window_start": time_window_start.isoformat(),
-        "time_window_end": time_window_end.isoformat(),
-        "max_posts_per_source": max_posts_per_source,
-        "max_comments_per_thread": max_comments_per_thread,
-        "include_comments": include_comments,
-        "skip_previously_analyzed": skip_previously_analyzed,
-        "run_deeper_analysis": run_deeper_analysis,
-        "ollama_model": model_name,
-        "ollama_url": ollama_url,
-    }
-
-    run_id = create_analysis_run(db_path, run_config)
 
     item_rows: list[dict[str, Any]] = []
     item_lookup: dict[str, dict[str, Any]] = {}
@@ -1135,12 +1675,46 @@ def run_analysis_pipeline(
             "error_message": str(error),
         }
 
-    try:
-        progress_bar.progress(0.02, text="Scraping Reddit sources...")
-        status_box.info(
-            f"Scraping {len(selected_sources)} source(s) from "
-            f"{time_window_start.date().isoformat()} to {time_window_end.date().isoformat()}."
+    def report(
+        *,
+        stage: str,
+        message: str,
+        progress_fraction: float,
+        progress_current: int = 0,
+        progress_total: int = 0,
+        progress_unit: str = "items",
+        status: str = "running",
+    ) -> None:
+        if controller is None:
+            return
+        controller.report(
+            stage=stage,
+            message=message,
+            progress_fraction=progress_fraction,
+            progress_current=progress_current,
+            progress_total=progress_total,
+            progress_unit=progress_unit,
+            status=status,
         )
+
+    def checkpoint() -> None:
+        if controller is None:
+            return
+        controller.checkpoint()
+
+    try:
+        report(
+            stage="scraping",
+            message=(
+                f"Scraping {len(selected_sources)} source(s) from "
+                f"{time_window_start.date().isoformat()} to {time_window_end.date().isoformat()}."
+            ),
+            progress_fraction=0.02,
+            progress_current=0,
+            progress_total=len(selected_sources),
+            progress_unit="sources",
+        )
+        checkpoint()
         items = reddit_client.collect_live_items(
             selected_sources=selected_sources,
             window_start=time_window_start,
@@ -1148,6 +1722,20 @@ def run_analysis_pipeline(
             max_posts_per_source=max_posts_per_source,
             max_comments_per_thread=max_comments_per_thread,
             include_comments=include_comments,
+            progress_callback=lambda payload: report(
+                stage="scraping",
+                message=str(payload.get("message", "Scraping Reddit sources...")),
+                progress_fraction=scale_progress(
+                    0.02,
+                    0.22,
+                    int(payload.get("current", 0) or 0),
+                    int(payload.get("total", len(selected_sources)) or len(selected_sources) or 1),
+                ),
+                progress_current=int(payload.get("current", 0) or 0),
+                progress_total=int(payload.get("total", len(selected_sources)) or len(selected_sources) or 0),
+                progress_unit=str(payload.get("unit", "sources") or "sources"),
+            ),
+            checkpoint=checkpoint,
         )
         if not items:
             source_names = ", ".join(str(source.get("display_name", source.get("source_id"))) for source in selected_sources)
@@ -1167,15 +1755,29 @@ def run_analysis_pipeline(
                     "Turn off 'Skip already analysed items' if you want to re-analyse this full window."
                 )
 
-        status_box.info(
-            f"Scraped {scraped_items_count} item(s), skipped {skipped_existing_count} already analysed item(s), "
-            f"classifying {len(items)} new item(s)."
+        report(
+            stage="classifying",
+            message=(
+                f"Scraped {scraped_items_count} item(s), skipped {skipped_existing_count} already analysed item(s), "
+                f"classifying {len(items)} new item(s)."
+            ),
+            progress_fraction=0.24,
+            progress_current=0,
+            progress_total=len(items),
+            progress_unit="items",
         )
 
         total_items = max(len(items), 1)
         for index, item in enumerate(items, start=1):
-            status_box.info(f"Classifying {index}/{len(items)}: {item['thread_title']}")
-            progress_bar.progress(index / total_items, text=f"Analysed {index}/{len(items)} items")
+            checkpoint()
+            report(
+                stage="classifying",
+                message=f"Classifying {index}/{len(items)}: {item['thread_title']}",
+                progress_fraction=scale_progress(0.24, 0.78, index - 1, total_items),
+                progress_current=index - 1,
+                progress_total=total_items,
+                progress_unit="items",
+            )
 
             normalized_item = dict(item)
             normalized_item["author_hash"] = author_hash(item.get("author", ""))
@@ -1215,6 +1817,14 @@ def run_analysis_pipeline(
                 classifier_mode=stage_one.mode,
                 model_name=model_name,
             )
+            report(
+                stage="classifying",
+                message=f"Classified {index}/{len(items)} items.",
+                progress_fraction=scale_progress(0.24, 0.78, index, total_items),
+                progress_current=index,
+                progress_total=total_items,
+                progress_unit="items",
+            )
 
         temp_mentions = [
             mention
@@ -1236,9 +1846,28 @@ def run_analysis_pipeline(
             if low_signal_tickers:
                 eligible_item_ids.update(temp_long_df.loc[temp_long_df["ticker"].isin(low_signal_tickers), "item_id"].tolist())
 
-            for item_id in sorted(eligible_item_ids):
+            eligible_list = sorted(eligible_item_ids)
+            total_eligible = max(len(eligible_list), 1)
+            for index, item_id in enumerate(eligible_list, start=1):
+                checkpoint()
+                report(
+                    stage="deep_analysis",
+                    message=f"Running deeper analysis {index}/{len(eligible_list)}: {item_lookup[item_id]['thread_title']}",
+                    progress_fraction=scale_progress(0.80, 0.92, index - 1, total_eligible),
+                    progress_current=index - 1,
+                    progress_total=total_eligible,
+                    progress_unit="items",
+                )
                 deeper_result = classifier.deep_analyze(item_lookup[item_id], classification_rows[item_id])
                 classification_rows[item_id]["deeper_analysis_json"] = deeper_result.payload
+                report(
+                    stage="deep_analysis",
+                    message=f"Completed deeper analysis {index}/{len(eligible_list)}.",
+                    progress_fraction=scale_progress(0.80, 0.92, index, total_eligible),
+                    progress_current=index,
+                    progress_total=total_eligible,
+                    progress_unit="items",
+                )
 
         final_mentions = [
             mention
@@ -1261,6 +1890,16 @@ def run_analysis_pipeline(
         summary["irrelevant_items"] = item_sentiments.count("irrelevant")
         summary["fallback_count"] = fallback_count
 
+        checkpoint()
+        report(
+            stage="saving",
+            message=f"Saving run {run_id} results.",
+            progress_fraction=0.95,
+            progress_current=1,
+            progress_total=1,
+            progress_unit="save",
+        )
+
         replaceable_mentions = long_df.to_dict(orient="records") if not long_df.empty else []
         replaceable_summaries = ticker_summary_df.to_dict(orient="records") if not ticker_summary_df.empty else []
         replaceable_buckets = time_bucket_df.to_dict(orient="records") if not time_bucket_df.empty else []
@@ -1282,10 +1921,12 @@ def run_analysis_pipeline(
         )
         complete_analysis_run(db_path, run_id, summary)
         run_completed = True
-
-        progress_bar.empty()
-        status_box.success(f"Analysis complete. Run `{run_id}` saved with {len(classification_rows)} analysed item(s).")
         return run_id, summary
+    except AnalysisRunCancelled as exc:
+        summary = failure_summary("cancelled", exc)
+        summary["cancelled"] = True
+        cancel_analysis_run_local(db_path, run_id, summary)
+        raise
     except Exception as exc:
         if not run_completed:
             try:
@@ -1293,6 +1934,170 @@ def run_analysis_pipeline(
             except Exception:
                 logging.exception("Failed to mark analysis run %s as failed", run_id)
         raise
+
+
+def background_analysis_worker(
+    *,
+    ticker_path: Path,
+    db_path: Path,
+    artifacts_dir: Path,
+    run_id: str,
+    run_config: dict[str, Any],
+    model_name: str,
+    ollama_url: str,
+    selected_sources: list[dict[str, Any]],
+    time_window_label: str,
+    time_window_start: datetime,
+    time_window_end: datetime,
+    max_posts_per_source: int,
+    max_comments_per_thread: int,
+    include_comments: bool,
+    skip_previously_analyzed: bool,
+    run_deeper_analysis: bool,
+) -> None:
+    controller = AnalysisRunController(db_path=db_path, run_id=run_id)
+    try:
+        run_analysis_pipeline(
+            ticker_path=ticker_path,
+            db_path=db_path,
+            artifacts_dir=artifacts_dir,
+            run_id=run_id,
+            run_config=run_config,
+            model_name=model_name,
+            ollama_url=ollama_url,
+            selected_sources=selected_sources,
+            time_window_label=time_window_label,
+            time_window_start=time_window_start,
+            time_window_end=time_window_end,
+            max_posts_per_source=max_posts_per_source,
+            max_comments_per_thread=max_comments_per_thread,
+            include_comments=include_comments,
+            skip_previously_analyzed=skip_previously_analyzed,
+            run_deeper_analysis=run_deeper_analysis,
+            controller=controller,
+        )
+    except AnalysisRunCancelled:
+        logging.info("Analysis run %s was cancelled by the user.", run_id)
+    except Exception:
+        logging.exception("Background analysis run %s crashed", run_id)
+    finally:
+        unregister_run_worker(run_id)
+
+
+def start_background_analysis_run(
+    *,
+    ticker_path: Path,
+    db_path: Path,
+    artifacts_dir: Path,
+    model_name: str,
+    ollama_url: str,
+    selected_sources: list[dict[str, Any]],
+    time_window_label: str,
+    time_window_start: datetime,
+    time_window_end: datetime,
+    max_posts_per_source: int,
+    max_comments_per_thread: int,
+    include_comments: bool,
+    skip_previously_analyzed: bool,
+    run_deeper_analysis: bool,
+) -> str:
+    existing_runs = load_analysis_runs(db_path)
+    if not existing_runs.empty:
+        existing_runs = existing_runs[existing_runs["data_mode"] == "live"].copy()
+        active_run = latest_active_run(existing_runs)
+        if active_run is not None:
+            raise RuntimeError(
+                f"Run `{active_run['analysis_run_id']}` is already active. Pause, resume, or cancel it before starting another scrape."
+            )
+
+    run_config = build_run_config(
+        model_name=model_name,
+        ollama_url=ollama_url,
+        selected_sources=selected_sources,
+        time_window_label=time_window_label,
+        time_window_start=time_window_start,
+        time_window_end=time_window_end,
+        max_posts_per_source=max_posts_per_source,
+        max_comments_per_thread=max_comments_per_thread,
+        include_comments=include_comments,
+        skip_previously_analyzed=skip_previously_analyzed,
+        run_deeper_analysis=run_deeper_analysis,
+    )
+    run_id = create_analysis_run(db_path, run_config)
+    update_analysis_run_state(
+        db_path,
+        run_id,
+        summary_updates={
+            "control": {
+                "pause_requested": False,
+                "cancel_requested": False,
+                "updated_at": analysis_run_now_iso(),
+            },
+            "runtime": {
+                "stage": "queued",
+                "message": "Background worker starting.",
+                "progress_fraction": 0.0,
+                "progress_current": 0,
+                "progress_total": 0,
+                "progress_unit": "items",
+                "heartbeat_at": analysis_run_now_iso(),
+            },
+        },
+    )
+    worker = threading.Thread(
+        target=background_analysis_worker,
+        kwargs={
+            "ticker_path": ticker_path,
+            "db_path": db_path,
+            "artifacts_dir": artifacts_dir,
+            "run_id": run_id,
+            "run_config": run_config,
+            "model_name": model_name,
+            "ollama_url": ollama_url,
+            "selected_sources": selected_sources,
+            "time_window_label": time_window_label,
+            "time_window_start": time_window_start,
+            "time_window_end": time_window_end,
+            "max_posts_per_source": max_posts_per_source,
+            "max_comments_per_thread": max_comments_per_thread,
+            "include_comments": include_comments,
+            "skip_previously_analyzed": skip_previously_analyzed,
+            "run_deeper_analysis": run_deeper_analysis,
+        },
+        name=f"analysis-{run_id}",
+        daemon=True,
+    )
+    register_run_worker(run_id, worker)
+    try:
+        worker.start()
+    except Exception as exc:
+        unregister_run_worker(run_id)
+        fail_analysis_run(
+            db_path,
+            run_id,
+            {
+                "items_scraped": 0,
+                "items_skipped_existing": 0,
+                "items_collected": 0,
+                "items_analyzed": 0,
+                "ticker_mentions": 0,
+                "tickers_found": 0,
+                "bullish_items": 0,
+                "bearish_items": 0,
+                "neutral_items": 0,
+                "irrelevant_items": 0,
+                "top_mentioned_tickers": [],
+                "top_accelerating_tickers": [],
+                "high_depth_posts_found": 0,
+                "low_mentions_high_signal_count": 0,
+                "newly_detected_tickers_count": 0,
+                "fallback_count": 0,
+                "failed_stage": "worker_startup",
+                "error_message": str(exc),
+            },
+        )
+        raise
+    return run_id
 
 
 def build_sidebar_state(db_path: Path) -> tuple[str, str | None, pd.DataFrame, pd.DataFrame]:
@@ -1465,6 +2270,10 @@ def render_run_analysis_page(
 ) -> None:
     st.header("Run Analysis")
     sources = load_sources(db_path)
+    runs = load_analysis_runs(db_path)
+    if not runs.empty:
+        runs = runs[runs["data_mode"] == "live"].copy()
+    active_run = latest_active_run(runs) if not runs.empty else None
     if sources.empty:
         st.warning("Add at least one source before running analysis.")
         return
@@ -1479,6 +2288,11 @@ def render_run_analysis_page(
         "Reddit scraping uses public Reddit RSS feeds and stores the collected run locally. "
         "No Reddit API keys are required, but large runs may be rate-limited."
     )
+    if active_run:
+        st.caption(
+            "A scrape is already active in the background. You can move between pages while it runs. "
+            "Pause, resume, or cancel it from the live run bar above."
+        )
 
     selected_source_ids = st.multiselect(
         "Active sources to include",
@@ -1569,8 +2383,9 @@ def render_run_analysis_page(
             "for this source set."
         )
 
-    run_disabled = False
-    if st.button("Scrape Reddit and Run Analysis", type="primary", use_container_width=True, disabled=run_disabled):
+    run_disabled = active_run is not None
+    button_label = "Background run already active" if run_disabled else "Start background scrape"
+    if st.button(button_label, type="primary", use_container_width=True, disabled=run_disabled):
         if not selected_source_ids:
             st.error("Select at least one source.")
             return
@@ -1579,10 +2394,8 @@ def render_run_analysis_page(
             return
 
         selected_sources = sources[sources["source_id"].isin(selected_source_ids)].to_dict(orient="records")
-        progress_bar = st.progress(0.0, text="Preparing analysis...")
-        status_box = st.empty()
         try:
-            run_id, _summary = run_analysis_pipeline(
+            run_id = start_background_analysis_run(
                 ticker_path=ticker_path,
                 db_path=db_path,
                 artifacts_dir=artifacts_dir,
@@ -1597,18 +2410,12 @@ def render_run_analysis_page(
                 include_comments=include_comments,
                 skip_previously_analyzed=skip_previously_analyzed,
                 run_deeper_analysis=run_deeper_analysis,
-                progress_bar=progress_bar,
-                status_box=status_box,
             )
-            queue_completed_run_navigation(run_id)
+            track_background_run(run_id)
             st.rerun()
         except RuntimeError as exc:
-            progress_bar.empty()
-            status_box.empty()
             st.error(str(exc))
         except Exception as exc:  # pragma: no cover - surfaced to the UI
-            progress_bar.empty()
-            status_box.empty()
             st.exception(exc)
 
 
@@ -3008,19 +3815,24 @@ def render_settings_page(db_path: Path, ticker_path: Path, artifacts_dir: Path) 
             run_health["fallback_count"] = run_health["summary_json"].map(lambda value: int((value or {}).get("fallback_count", 0)))
             run_health["error_message"] = run_health["summary_json"].map(lambda value: str((value or {}).get("error_message", "")))
             run_health["elapsed_minutes"] = run_health.apply(lambda row: run_elapsed_minutes(row.to_dict()) or 0, axis=1)
-            run_health["elapsed"] = run_health.apply(lambda row: run_elapsed_label(row.to_dict()) if row.get("status") == "running" else "", axis=1)
+            run_health["elapsed"] = run_health.apply(
+                lambda row: run_elapsed_label(row.to_dict()) if str(row.get("status", "")).lower() in ACTIVE_RUN_STATUSES else "",
+                axis=1,
+            )
             status_counts = run_health["status"].value_counts().to_dict()
-            health_cols = st.columns(3)
+            active_count = int(sum(int(status_counts.get(status, 0)) for status in ACTIVE_RUN_STATUSES))
+            health_cols = st.columns(4)
             health_cols[0].metric("Completed", int(status_counts.get("completed", 0)))
-            health_cols[1].metric("Running", int(status_counts.get("running", 0)))
+            health_cols[1].metric("Active", active_count)
             health_cols[2].metric("Failed", int(status_counts.get("failed", 0)))
+            health_cols[3].metric("Cancelled", int(status_counts.get("cancelled", 0)))
             stale_running = run_health[
-                (run_health["status"] == "running")
+                (run_health["status"].astype(str).str.lower().isin({"running", "pausing", "cancelling"}))
                 & (run_health["elapsed_minutes"] >= 30)
             ].copy()
             if not stale_running.empty:
-                st.warning(f"{len(stale_running)} run(s) have been marked running for 30+ minutes.")
-                if st.button("Mark stale running runs as failed", use_container_width=True):
+                st.warning(f"{len(stale_running)} active run(s) have been marked active for 30+ minutes.")
+                if st.button("Mark stale active runs as failed", use_container_width=True):
                     for row in stale_running.to_dict(orient="records"):
                         fail_analysis_run(
                             db_path,
@@ -3100,7 +3912,12 @@ def render_settings_page(db_path: Path, ticker_path: Path, artifacts_dir: Path) 
 
 init_db(DEFAULT_DB_PATH, SCHEMA_PATH)
 ensure_seed_sources(DEFAULT_DB_PATH, DEFAULT_SOURCES_PATH)
-page, selected_run_id, _, _ = build_sidebar_state(DEFAULT_DB_PATH)
+page, selected_run_id, sources_df, _ = build_sidebar_state(DEFAULT_DB_PATH)
+source_lookup = {
+    int(row["source_id"]): str(row["display_name"])
+    for row in sources_df.to_dict(orient="records")
+} if not sources_df.empty else {}
+render_background_run_banner(DEFAULT_DB_PATH, source_lookup)
 
 if page == "Sources":
     render_sources_page(DEFAULT_DB_PATH)
