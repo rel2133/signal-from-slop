@@ -526,6 +526,7 @@ def load_run_mentions(db_path: str | Path, analysis_run_id: str) -> pd.DataFrame
         """
         SELECT * FROM item_ticker_mentions
         WHERE analysis_run_id = ?
+          AND ticker != 'UNKNOWN'
         ORDER BY created_time DESC, alpha_signal_score DESC
         """,
         (analysis_run_id,),
@@ -538,6 +539,7 @@ def load_run_ticker_summaries(db_path: str | Path, analysis_run_id: str) -> pd.D
         """
         SELECT * FROM ticker_summaries
         WHERE analysis_run_id = ?
+          AND ticker != 'UNKNOWN'
         ORDER BY emerging_ticker_score DESC, average_alpha_signal_score DESC
         """,
         (analysis_run_id,),
@@ -566,6 +568,7 @@ def load_historical_ticker_summaries(
         WHERE ar.status = 'completed'
           AND ar.data_mode = ?
           AND ar.selected_source_ids = ?
+          AND ts.ticker != 'UNKNOWN'
         ORDER BY ar.completed_at, ts.ticker
         """,
         (data_mode, selected_source_ids_json),
@@ -578,6 +581,7 @@ def load_run_time_buckets(db_path: str | Path, analysis_run_id: str) -> pd.DataF
         """
         SELECT * FROM ticker_time_buckets
         WHERE analysis_run_id = ?
+          AND ticker != 'UNKNOWN'
         ORDER BY bucket_start, ticker
         """,
         (analysis_run_id,),

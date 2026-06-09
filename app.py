@@ -139,6 +139,8 @@ def latest_matching_run(
     for row in runs.to_dict(orient="records"):
         if row.get("status") != "completed" or row.get("data_mode") != data_mode:
             continue
+        if int((row.get("summary_json") or {}).get("items_analyzed", 0)) <= 0:
+            continue
         row_source_ids = sorted(int(source_id) for source_id in row.get("selected_source_ids", []))
         if row_source_ids == normalized_source_ids:
             return row
@@ -189,6 +191,10 @@ def build_run_display_label(run_record: dict[str, Any], source_lookup: dict[int,
     summary = run_record.get("summary_json", {}) or {}
     items_analyzed = int(summary.get("items_analyzed", 0))
     return f"{timestamp} | {source_label} | {items_analyzed} items"
+
+
+def run_has_analysed_items(run_record: dict[str, Any]) -> bool:
+    return int((run_record.get("summary_json") or {}).get("items_analyzed", 0)) > 0
 
 
 def seed_fake_subreddit_sources(db_path: Path, data_path: Path) -> int:
@@ -247,12 +253,12 @@ def resolve_time_window(
         return start_dt, end_dt
 
     if label == "Since last completed run" and previous_run:
-        previous_end = parse_created_time(str(previous_run["time_window_end"]))
+        previous_end = parse_created_time(str(previous_run.get("completed_at") or previous_run["time_window_end"]))
         if previous_end >= anchor:
             start_dt = anchor.replace(hour=0, minute=0, second=0, microsecond=0)
         else:
             start_dt = (previous_end + timedelta(seconds=1)).replace(microsecond=0)
-        end_dt = anchor.replace(hour=23, minute=59, second=59, microsecond=0)
+        end_dt = anchor.replace(microsecond=0)
         return start_dt, end_dt
     if label == "Since last completed run":
         label = "Last 7 days"
@@ -304,6 +310,12 @@ def run_analysis_pipeline(
             max_posts_per_source=max_posts_per_source,
             max_comments_per_thread=max_comments_per_thread,
             include_comments=include_comments,
+        )
+    if not items:
+        source_names = ", ".join(str(source.get("display_name", source.get("source_id"))) for source in selected_sources)
+        raise RuntimeError(
+            "No Reddit items matched this source selection and time window, so no run was saved. "
+            f"Sources: {source_names}. Window: {time_window_start.date().isoformat()} to {time_window_end.date().isoformat()}."
         )
 
     run_config = {
@@ -418,6 +430,12 @@ def run_analysis_pipeline(
     long_df = apply_ticker_flags_to_mentions(long_df, ticker_summary_df) if not long_df.empty else long_df
     time_bucket_df = build_time_bucket_summary(long_df) if not long_df.empty else pd.DataFrame()
     summary = build_run_summary(long_df, ticker_summary_df)
+    item_sentiments = [row["sentiment"] for row in classification_rows.values()]
+    summary["items_analyzed"] = len(classification_rows)
+    summary["bullish_items"] = item_sentiments.count("bullish")
+    summary["bearish_items"] = item_sentiments.count("bearish")
+    summary["neutral_items"] = item_sentiments.count("neutral")
+    summary["irrelevant_items"] = item_sentiments.count("irrelevant")
     summary["fallback_count"] = fallback_count
 
     replaceable_mentions = long_df.to_dict(orient="records") if not long_df.empty else []
@@ -455,7 +473,10 @@ def build_sidebar_state(db_path: Path, data_path: Path) -> tuple[str, str | None
     pending_run_id = st.session_state.pop("pending_selected_run_id", None)
     if pending_run_id and not runs.empty and pending_run_id in runs["analysis_run_id"].tolist():
         st.session_state["selected_run_id"] = pending_run_id
-    completed_runs = runs[runs["status"] == "completed"].copy() if not runs.empty else runs
+    completed_runs = runs[
+        (runs["status"] == "completed")
+        & (runs.apply(lambda row: run_has_analysed_items(row.to_dict()), axis=1))
+    ].copy() if not runs.empty else runs
     selectable_runs = completed_runs if not completed_runs.empty else runs
     source_lookup = {
         int(row["source_id"]): str(row["display_name"])
@@ -483,7 +504,7 @@ def build_sidebar_state(db_path: Path, data_path: Path) -> tuple[str, str | None
                 format_func=lambda value: run_label_lookup.get(str(value), str(value)),
             )
             if not completed_runs.empty and len(completed_runs) != len(runs):
-                st.caption("Only completed runs are shown here.")
+                st.caption("Only completed runs with analysed items are shown here.")
         else:
             st.info("No analysis runs saved yet.")
 
@@ -627,7 +648,7 @@ def render_run_analysis_page(
     ) if selected_source_ids else None
     use_last_run_window = st.toggle(
         "Use last completed run -> now",
-        value=bool(previous_run),
+        value=False,
         disabled=not previous_run,
         help="If enabled, the analysis window starts immediately after the most recent completed run for the current source selection.",
     )
@@ -691,7 +712,7 @@ def render_run_analysis_page(
     st.caption(f"Window resolved against {anchor_label}: `{start_dt.date().isoformat()}` to `{end_dt.date().isoformat()}`.")
     if use_last_run_window and previous_run:
         st.caption(
-            f"Most recent matching completed run ended at `{str(previous_run['time_window_end'])[:19]}` "
+            f"Most recent matching completed run completed at `{str(previous_run.get('completed_at') or previous_run['time_window_end'])[:19]}` "
             f"for `{DATA_MODE_LABELS.get(str(previous_run['data_mode']), str(previous_run['data_mode']))}` mode."
         )
 
@@ -729,6 +750,10 @@ def render_run_analysis_page(
             )
             queue_completed_run_navigation(run_id)
             st.rerun()
+        except RuntimeError as exc:
+            progress_bar.empty()
+            status_box.empty()
+            st.error(str(exc))
         except Exception as exc:  # pragma: no cover - surfaced to the UI
             progress_bar.empty()
             status_box.empty()
@@ -752,11 +777,19 @@ def render_run_summary_cards(summary: dict[str, Any]) -> None:
 
     top_cols = st.columns(2)
     with top_cols[0]:
+        top_mentioned = [
+            row for row in summary.get("top_mentioned_tickers", [])
+            if row.get("ticker") != "UNKNOWN"
+        ]
         st.write("Top mentioned tickers")
-        st.dataframe(pd.DataFrame(summary.get("top_mentioned_tickers", [])), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(top_mentioned), use_container_width=True, hide_index=True)
     with top_cols[1]:
+        top_accelerating = [
+            row for row in summary.get("top_accelerating_tickers", [])
+            if row.get("ticker") != "UNKNOWN"
+        ]
         st.write("Top accelerating tickers")
-        st.dataframe(pd.DataFrame(summary.get("top_accelerating_tickers", [])), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(top_accelerating), use_container_width=True, hide_index=True)
 
     if summary.get("fallback_count", 0):
         st.warning(
@@ -855,6 +888,11 @@ def render_results_dashboard_page(db_path: Path, run_id: str | None) -> None:
     if long_df.empty:
         if summary and int(summary.get("items_analyzed", 0)) == 0:
             st.warning("This run completed, but no Reddit items matched the selected sources and time window.")
+        elif summary:
+            st.info(
+                f"This run analysed {int(summary.get('items_analyzed', 0))} Reddit items, "
+                "but no catalog tickers or company-name matches were found."
+            )
         else:
             st.info("No item-level mention data saved for this run.")
         return

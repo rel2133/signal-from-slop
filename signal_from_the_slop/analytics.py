@@ -139,7 +139,9 @@ def build_classification_record(
 
 
 def build_mention_records(item: dict[str, Any], classification_record: dict[str, Any]) -> list[dict[str, Any]]:
-    tickers = classification_record["tickers"] or ["UNKNOWN"]
+    tickers = classification_record["tickers"]
+    if not tickers:
+        return []
     company_names = classification_record["company_names"] or ["Unknown"]
     if len(company_names) < len(tickers):
         company_names = company_names + ["Unknown"] * (len(tickers) - len(company_names))
@@ -173,7 +175,7 @@ def build_mention_records(item: dict[str, Any], classification_record: dict[str,
                 "created_date": created_date,
                 "time_bucket": time_bucket,
                 "item_type": item.get("item_type", "post"),
-                "ticker": ticker or "UNKNOWN",
+                "ticker": ticker,
                 "company_name": company_name or "Unknown",
                 "sentiment": classification_record["sentiment"],
                 "sentiment_numeric": sentiment_numeric(classification_record["sentiment"]),
@@ -465,7 +467,7 @@ def build_run_summary(long_df: pd.DataFrame, ticker_summary_df: pd.DataFrame) ->
     summary = {
         "items_analyzed": int(item_sentiments["item_id"].nunique()),
         "ticker_mentions": int(len(long_df)),
-        "tickers_found": int(long_df.loc[long_df["ticker"] != "UNKNOWN", "ticker"].nunique()),
+        "tickers_found": int(long_df["ticker"].nunique()),
         "bullish_items": int((item_sentiments["sentiment"] == "bullish").sum()),
         "bearish_items": int((item_sentiments["sentiment"] == "bearish").sum()),
         "neutral_items": int((item_sentiments["sentiment"] == "neutral").sum()),
