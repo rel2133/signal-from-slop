@@ -588,6 +588,46 @@ def load_run_time_buckets(db_path: str | Path, analysis_run_id: str) -> pd.DataF
     )
 
 
+def load_run_classification_quality(db_path: str | Path, analysis_run_id: str) -> pd.DataFrame:
+    return _load_table(
+        db_path,
+        """
+        SELECT
+            item_id,
+            classifier_mode,
+            model_name,
+            analyzed_at
+        FROM classifications
+        WHERE analysis_run_id = ?
+        """,
+        (analysis_run_id,),
+    )
+
+
+def load_run_source_activity(db_path: str | Path, analysis_run_id: str) -> pd.DataFrame:
+    return _load_table(
+        db_path,
+        """
+        SELECT
+            ri.source_id,
+            ri.source_name,
+            COUNT(DISTINCT c.item_id) AS items_analyzed,
+            COUNT(itm.item_id) AS ticker_mentions,
+            MAX(ri.created_time) AS newest_item_time
+        FROM classifications c
+        JOIN reddit_items ri
+            ON ri.item_id = c.item_id
+        LEFT JOIN item_ticker_mentions itm
+            ON itm.analysis_run_id = c.analysis_run_id
+           AND itm.item_id = c.item_id
+        WHERE c.analysis_run_id = ?
+        GROUP BY ri.source_id, ri.source_name
+        ORDER BY items_analyzed DESC, ri.source_name
+        """,
+        (analysis_run_id,),
+    )
+
+
 def load_run_summary(db_path: str | Path, analysis_run_id: str) -> dict[str, Any]:
     runs = _load_table(
         db_path,
