@@ -1177,6 +1177,10 @@ def sync_tracked_background_run(db_path: Path) -> None:
         return
     run_state = read_analysis_run_state(db_path, tracked_run_id)
     if not run_state:
+        st.session_state["background_run_notice_level"] = "warning"
+        st.session_state["background_run_notice"] = f"Background run `{tracked_run_id}` could not be found in the current database."
+        st.session_state["background_run_notice_run_id"] = tracked_run_id
+        st.session_state.pop("background_run_id", None)
         return
     status = str(run_state.get("status", "unknown")).lower()
     st.session_state["background_run_last_status"] = status
@@ -1771,6 +1775,54 @@ def run_analysis_pipeline(
             "error_message": str(error),
         }
 
+    def empty_success_summary(message: str) -> dict[str, Any]:
+        return {
+            "items_scraped": scraped_items_count,
+            "items_skipped_existing": skipped_existing_count,
+            "items_collected": len(items),
+            "items_analyzed": 0,
+            "ticker_mentions": 0,
+            "tickers_found": 0,
+            "bullish_items": 0,
+            "bearish_items": 0,
+            "neutral_items": 0,
+            "irrelevant_items": 0,
+            "top_mentioned_tickers": [],
+            "top_accelerating_tickers": [],
+            "high_depth_posts_found": 0,
+            "low_mentions_high_signal_count": 0,
+            "newly_detected_tickers_count": 0,
+            "fallback_count": fallback_count,
+            "no_new_items": True,
+            "status_message": message,
+            "runtime": {
+                "stage": "completed",
+                "message": message,
+                "progress_fraction": 1.0,
+                "progress_current": 0,
+                "progress_total": 0,
+                "progress_unit": "items",
+                "heartbeat_at": analysis_run_now_iso(),
+            },
+        }
+
+    def complete_empty_run(message: str) -> tuple[str, dict[str, Any]]:
+        summary = empty_success_summary(message)
+        empty_frame = pd.DataFrame()
+        save_run_artifacts(
+            artifacts_dir=artifacts_dir,
+            run_id=run_id,
+            config=run_config,
+            summary=summary,
+            items=[],
+            classifications=[],
+            mentions_df=empty_frame,
+            ticker_summary_df=empty_frame,
+            time_bucket_df=empty_frame,
+        )
+        complete_analysis_run(db_path, run_id, summary)
+        return run_id, summary
+
     def report(
         *,
         stage: str,
@@ -1835,21 +1887,39 @@ def run_analysis_pipeline(
         )
         if not items:
             source_names = ", ".join(str(source.get("display_name", source.get("source_id"))) for source in selected_sources)
-            raise RuntimeError(
+            message = (
                 "No Reddit items matched this source selection and time window. "
-                "The run was saved as failed so it remains visible in Run health. "
                 f"Sources: {source_names}. Window: {time_window_start.date().isoformat()} to {time_window_end.date().isoformat()}."
             )
+            report(
+                stage="completed",
+                message=message,
+                progress_fraction=1.0,
+                status="completed",
+            )
+            run_completed = True
+            return complete_empty_run(message)
         scraped_items_count = len(items)
         if skip_previously_analyzed:
             previously_analyzed = load_previously_analyzed_item_ids(db_path, data_mode="live")
             items = [item for item in items if str(item["item_id"]) not in previously_analyzed]
             skipped_existing_count = scraped_items_count - len(items)
             if not items:
-                raise RuntimeError(
+                message = (
                     "The scrape returned items, but every item has already been analysed in a completed run. "
                     "Turn off 'Skip already analysed items' if you want to re-analyse this full window."
                 )
+                report(
+                    stage="completed",
+                    message=message,
+                    progress_fraction=1.0,
+                    progress_current=scraped_items_count,
+                    progress_total=scraped_items_count,
+                    progress_unit="items",
+                    status="completed",
+                )
+                run_completed = True
+                return complete_empty_run(message)
 
         report(
             stage="classifying",
