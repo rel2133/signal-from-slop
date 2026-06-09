@@ -15,7 +15,7 @@ The current prototype covers the dashboard expansion MVP:
 - Save raw items, classifications, item-level ticker mentions, ticker summaries, and time buckets to SQLite
 - Explore results in dashboard, trends, and export pages
 
-The Reddit ingestion layer is kept modular so live Reddit collection can be swapped in later.
+The Reddit ingestion layer supports both the bundled fake dataset and no-key live Reddit collection through public RSS feeds.
 
 ## Project Layout
 
@@ -130,14 +130,24 @@ streamlit run app.py
 OLLAMA_URL=http://localhost:11434/api/chat
 OLLAMA_MODEL=llama3.1:8b
 SQLITE_PATH=signal_from_the_slop.db
-REDDIT_CLIENT_ID=
-REDDIT_CLIENT_SECRET=
 REDDIT_USER_AGENT=signal-from-the-slop/0.1
 ```
+
+## Live Reddit Smoke Test
+
+Run this to test the no-key Reddit scraper:
+
+```bash
+cd "/Users/rowanellis/Documents/Signal from the Slop"
+source .venv/bin/activate
+python scripts/check_live_reddit.py --subreddit stocks --days 1 --max-posts 3 --max-comments 2
+```
+
+That command exercises the same `collect_live_items(...)` path the Streamlit app uses and prints the fetched item counts plus the newest post permalink.
 
 ## Notes
 
 - The classifier prompt forces strict JSON output and uses `temperature: 0`.
 - The app does not invent tickers. Unknown references remain empty unless the extractor finds a catalog match.
-- The live Reddit API path is intentionally stubbed for now. The fake dataset is the supported MVP input.
+- Live Reddit scraping uses public Reddit RSS feeds. It does not need Reddit API keys, but it can be rate-limited and may only expose recent public posts/comments.
 - Local source edits are stored in SQLite. A fresh Streamlit Community Cloud deployment starts from [data/default_sources.json](/Users/rowanellis/Documents/Signal from the Slop/data/default_sources.json), not from your local `signal_from_the_slop.db`.

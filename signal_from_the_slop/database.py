@@ -20,6 +20,8 @@ JSON_COLUMNS = {
 
 
 def init_db(db_path: str | Path, schema_path: str | Path) -> None:
+    db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db_path) as conn:
         schema = Path(schema_path).read_text(encoding="utf-8")
         conn.executescript(schema)
