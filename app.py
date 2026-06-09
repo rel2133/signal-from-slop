@@ -1090,6 +1090,22 @@ def latest_active_run(runs: pd.DataFrame) -> dict[str, Any] | None:
     return active_runs.iloc[0].to_dict()
 
 
+def run_failure_detail(run_record: dict[str, Any]) -> str:
+    summary = run_record.get("summary_json", {}) or {}
+    runtime = summary.get("runtime", {}) if isinstance(summary.get("runtime", {}), dict) else {}
+    failed_stage = str(summary.get("failed_stage", "") or runtime.get("stage", "") or "").replace("_", " ")
+    error_message = str(summary.get("error_message", "") or "").strip()
+    runtime_message = str(runtime.get("message", "") or "").strip()
+    parts: list[str] = []
+    if failed_stage:
+        parts.append(f"stage: {failed_stage}")
+    if error_message:
+        parts.append(error_message)
+    elif runtime_message:
+        parts.append(runtime_message)
+    return " | ".join(parts)
+
+
 def scale_progress(start: float, end: float, current: int, total: int) -> float:
     if total <= 0:
         return end
@@ -1198,7 +1214,11 @@ def sync_tracked_background_run(db_path: Path) -> None:
         st.session_state["background_run_notice_run_id"] = tracked_run_id
     else:
         st.session_state["background_run_notice_level"] = "error"
-        st.session_state["background_run_notice"] = f"Background run `{tracked_run_id}` failed."
+        failure_detail = run_failure_detail(run_state)
+        if failure_detail:
+            st.session_state["background_run_notice"] = f"Background run `{tracked_run_id}` failed. {failure_detail}"
+        else:
+            st.session_state["background_run_notice"] = f"Background run `{tracked_run_id}` failed."
         st.session_state["background_run_notice_run_id"] = tracked_run_id
     st.session_state.pop("background_run_id", None)
 
@@ -1393,7 +1413,8 @@ def render_latest_run_status(runs: pd.DataFrame, source_lookup: dict[int, str]) 
     elif status == "cancelled":
         st.warning(f"Latest run cancelled: {run_label}.")
     elif status == "failed":
-        st.error(f"Latest run failed: {run_label}.")
+        failure_detail = run_failure_detail(latest)
+        st.error(f"Latest run failed: {run_label}. {failure_detail}" if failure_detail else f"Latest run failed: {run_label}.")
     else:
         st.info(f"Latest run status: {status} for {run_label}.")
     st.caption(
@@ -1481,6 +1502,29 @@ def is_orphaned_active_run(run_record: dict[str, Any], *, worker_attached: bool 
     return heartbeat_age >= RUN_ORPHANED_CANCEL_SECONDS
 
 
+def clear_old_active_runs_without_heartbeat(db_path: Path, runs: pd.DataFrame) -> int:
+    if runs.empty:
+        return 0
+    cleared = 0
+    active_rows = runs[build_active_run_mask(runs)].copy()
+    for row in active_rows.to_dict(orient="records"):
+        run_id = str(row.get("analysis_run_id", "") or "")
+        if not run_id or has_live_run_worker(run_id):
+            continue
+        if run_heartbeat_age_seconds(row) is not None:
+            continue
+        elapsed_minutes = run_elapsed_minutes(row)
+        if elapsed_minutes is None or elapsed_minutes < 2:
+            continue
+        force_cancel_analysis_run(
+            db_path,
+            run_id,
+            "Cancelled automatically because this active run had no worker heartbeat.",
+        )
+        cleared += 1
+    return cleared
+
+
 @st.fragment(run_every=1)
 def render_background_run_banner(db_path: Path, source_lookup: dict[int, str]) -> None:
     sync_tracked_background_run(db_path)
@@ -1489,6 +1533,11 @@ def render_background_run_banner(db_path: Path, source_lookup: dict[int, str]) -
     runs = load_analysis_runs(db_path)
     if not runs.empty:
         runs = runs[runs["data_mode"] == "live"].copy()
+        cleared_runs = clear_old_active_runs_without_heartbeat(db_path, runs)
+        if cleared_runs:
+            runs = load_analysis_runs(db_path)
+            if not runs.empty:
+                runs = runs[runs["data_mode"] == "live"].copy()
     active_run = latest_active_run(runs) if not runs.empty else None
     if not active_run:
         return
@@ -1754,6 +1803,18 @@ def run_analysis_pipeline(
     run_completed = False
 
     def failure_summary(stage: str, error: Exception | str) -> dict[str, Any]:
+        runtime = (
+            dict(controller.last_runtime)
+            if controller is not None and isinstance(controller.last_runtime, dict)
+            else {}
+        )
+        runtime.update(
+            {
+                "stage": stage,
+                "message": f"Failed during {stage.replace('_', ' ')}: {error}",
+                "heartbeat_at": analysis_run_now_iso(),
+            }
+        )
         return {
             "items_scraped": scraped_items_count,
             "items_skipped_existing": skipped_existing_count,
@@ -1773,6 +1834,7 @@ def run_analysis_pipeline(
             "fallback_count": fallback_count,
             "failed_stage": stage,
             "error_message": str(error),
+            "runtime": runtime,
         }
 
     def empty_success_summary(message: str) -> dict[str, Any]:
@@ -2271,6 +2333,12 @@ def build_sidebar_state(db_path: Path) -> tuple[str, str | None, pd.DataFrame, p
     runs = load_analysis_runs(db_path)
     if not runs.empty:
         runs = runs[runs["data_mode"] == "live"].copy()
+        cleared_runs = clear_old_active_runs_without_heartbeat(db_path, runs)
+        if cleared_runs:
+            st.session_state["auto_cleared_orphaned_runs"] = cleared_runs
+            runs = load_analysis_runs(db_path)
+            if not runs.empty:
+                runs = runs[runs["data_mode"] == "live"].copy()
     pending_page = st.session_state.pop("pending_page", None)
     if pending_page in PAGES:
         st.session_state["page"] = pending_page
@@ -2291,6 +2359,9 @@ def build_sidebar_state(db_path: Path) -> tuple[str, str | None, pd.DataFrame, p
 
     with st.sidebar:
         st.subheader("Run context")
+        auto_cleared_runs = int(st.session_state.pop("auto_cleared_orphaned_runs", 0) or 0)
+        if auto_cleared_runs:
+            st.warning(f"Cleared {auto_cleared_runs} old active run(s) with no heartbeat.")
         if not runs.empty:
             overview_cols = st.columns(2)
             overview_cols[0].metric("Completed", len(completed_runs))
