@@ -143,9 +143,21 @@ streamlit run app.py
 ```env
 OLLAMA_URL=http://localhost:11434/api/chat
 OLLAMA_MODEL=llama3.1:8b
+APP_STORAGE_DIR=
 SQLITE_PATH=signal_from_the_slop.db
+ARTIFACTS_DIR=artifacts
 REDDIT_USER_AGENT=signal-from-the-slop/0.1
 ```
+
+To store the SQLite database and run artifacts on an external SSD, set `APP_STORAGE_DIR` in `.env`, for example:
+
+```env
+APP_STORAGE_DIR=/Volumes/reddit slop/Signal from the Slop
+SQLITE_PATH=signal_from_the_slop.db
+ARTIFACTS_DIR=artifacts
+```
+
+If that volume is not mounted, the app stops instead of accidentally writing large run data to the internal disk.
 
 ## Live Reddit Smoke Test
 

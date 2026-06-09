@@ -95,13 +95,30 @@ def resolve_config_path(env_name: str, default_name: str, *, base_dir: Path) -> 
     return configured if configured.is_absolute() else base_dir / configured
 
 
+def validate_storage_root(storage_root: Path) -> str | None:
+    resolved = storage_root.expanduser()
+    parts = resolved.parts
+    if len(parts) >= 3 and parts[1] == "Volumes":
+        volume_root = Path("/", parts[1], parts[2])
+        if not volume_root.exists() or not volume_root.is_mount():
+            return (
+                f"Configured APP_STORAGE_DIR is on `{volume_root}`, but that external volume is not mounted. "
+                "Plug in the SSD or update `.env` before running the app."
+            )
+    return None
+
+
 DEFAULT_DB_PATH = resolve_config_path("SQLITE_PATH", "signal_from_the_slop.db", base_dir=DEFAULT_STORAGE_ROOT)
 DEFAULT_ARTIFACTS_DIR = resolve_config_path("ARTIFACTS_DIR", "artifacts", base_dir=DEFAULT_STORAGE_ROOT)
+STORAGE_ROOT_ERROR = validate_storage_root(DEFAULT_STORAGE_ROOT)
 
 
 st.set_page_config(page_title="Signal from the Slop", layout="wide")
 st.title("Signal from the Slop")
 st.caption("Research dashboard for Reddit stock discussion triage. Not financial advice.")
+if STORAGE_ROOT_ERROR:
+    st.error(STORAGE_ROOT_ERROR)
+    st.stop()
 
 
 def discover_ollama_models(ollama_url: str) -> tuple[list[str], str | None]:
