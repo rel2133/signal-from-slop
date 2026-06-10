@@ -577,6 +577,36 @@ def load_run_mentions(db_path: str | Path, analysis_run_id: str) -> pd.DataFrame
     )
 
 
+def load_completed_mentions(db_path: str | Path, *, data_mode: str = "live") -> pd.DataFrame:
+    return _load_table(
+        db_path,
+        """
+        SELECT
+            itm.*,
+            ar.started_at AS run_started_at,
+            ar.completed_at AS run_completed_at,
+            ar.time_window_label AS run_time_window_label,
+            ar.time_window_start AS run_time_window_start,
+            ar.time_window_end AS run_time_window_end,
+            ar.selected_source_ids AS selected_source_ids,
+            c.classifier_mode,
+            c.model_name,
+            c.analyzed_at
+        FROM item_ticker_mentions itm
+        JOIN analysis_runs ar
+            ON ar.analysis_run_id = itm.analysis_run_id
+        LEFT JOIN classifications c
+            ON c.analysis_run_id = itm.analysis_run_id
+           AND c.item_id = itm.item_id
+        WHERE ar.status = 'completed'
+          AND ar.data_mode = ?
+          AND itm.ticker != 'UNKNOWN'
+        ORDER BY itm.created_time DESC, ar.completed_at DESC, itm.alpha_signal_score DESC
+        """,
+        (data_mode,),
+    )
+
+
 def load_run_ticker_summaries(db_path: str | Path, analysis_run_id: str) -> pd.DataFrame:
     return _load_table(
         db_path,

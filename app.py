@@ -38,6 +38,7 @@ from signal_from_the_slop.database import (
     init_db,
     latest_analysis_run_id,
     load_analysis_runs,
+    load_completed_mentions,
     load_full_results_records,
     load_run_classification_quality,
     load_historical_ticker_summaries,
@@ -119,6 +120,8 @@ PAGES = [step["page"] for step in PAGE_STEPS]
 PAGE_LABELS = {step["page"]: f"{step['step']} {step['label']}" for step in PAGE_STEPS}
 PAGE_CONTEXT = {step["page"]: step["context"] for step in PAGE_STEPS}
 ACTIVE_RUN_STATUSES = {"running", "pausing", "paused", "cancelling"}
+CORPUS_SCOPE_ID = "__combined_completed_corpus__"
+CORPUS_SCOPE_LABEL = "Combined corpus (all completed runs)"
 RUN_CONTROL_POLL_SECONDS = 0.5
 RUN_HEARTBEAT_STALE_SECONDS = 45
 RUN_ORPHANED_CANCEL_SECONDS = 90
@@ -713,6 +716,134 @@ def attach_quality_columns(long_df: pd.DataFrame, quality_df: pd.DataFrame) -> p
     working["classifier_mode"] = working["classifier_mode"].fillna("unknown")
     working["trust_status"] = working.apply(classifier_trust_label, axis=1)
     return working
+
+
+def is_corpus_scope(scope_id: str | None) -> bool:
+    return str(scope_id or "") == CORPUS_SCOPE_ID
+
+
+def dedupe_corpus_mentions(mentions_df: pd.DataFrame) -> pd.DataFrame:
+    if mentions_df.empty:
+        return mentions_df
+
+    working = mentions_df.copy()
+    working["run_completed_at_dt"] = pd.to_datetime(
+        working.get("run_completed_at", working.get("created_time")),
+        errors="coerce",
+        utc=True,
+    )
+    working["created_time_dt"] = pd.to_datetime(working["created_time"], errors="coerce", utc=True)
+    working["ticker"] = working["ticker"].astype(str).str.upper()
+    working = working.sort_values(
+        ["run_completed_at_dt", "created_time_dt", "confidence"],
+        ascending=[False, False, False],
+    )
+    return (
+        working.drop_duplicates(["item_id", "ticker"], keep="first")
+        .drop(columns=["run_completed_at_dt", "created_time_dt"], errors="ignore")
+        .sort_values(["created_time", "alpha_signal_score"], ascending=[False, False])
+    )
+
+
+def canonicalize_corpus_company_names(mentions_df: pd.DataFrame) -> pd.DataFrame:
+    if mentions_df.empty or "company_name" not in mentions_df.columns:
+        return mentions_df
+
+    working = mentions_df.copy()
+    company_lookup: dict[str, str] = {}
+    for ticker, group in working.groupby("ticker", dropna=False):
+        names = group["company_name"].dropna().astype(str)
+        names = names[(names.str.strip() != "") & (names.str.lower() != "unknown")]
+        if names.empty:
+            continue
+        modes = names.mode(dropna=True)
+        company_lookup[str(ticker)] = str(modes.iloc[0] if not modes.empty else names.iloc[0])
+    if company_lookup:
+        working["company_name"] = working.apply(
+            lambda row: company_lookup.get(str(row["ticker"]), row.get("company_name") or "Unknown"),
+            axis=1,
+        )
+    return working
+
+
+def build_corpus_frames(db_path: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    raw_mentions = load_completed_mentions(db_path, data_mode="live")
+    long_df = canonicalize_corpus_company_names(dedupe_corpus_mentions(raw_mentions))
+    if long_df.empty:
+        completed_runs = load_analysis_runs(db_path)
+        completed_count = 0
+        if not completed_runs.empty:
+            completed_count = int((completed_runs["status"] == "completed").sum())
+        return (
+            long_df,
+            pd.DataFrame(),
+            pd.DataFrame(),
+            {
+                "items_scraped": 0,
+                "items_skipped_existing": 0,
+                "items_collected": 0,
+                "items_analyzed": 0,
+                "ticker_mentions": 0,
+                "tickers_found": 0,
+                "bullish_items": 0,
+                "bearish_items": 0,
+                "neutral_items": 0,
+                "irrelevant_items": 0,
+                "top_mentioned_tickers": [],
+                "top_accelerating_tickers": [],
+                "high_depth_posts_found": 0,
+                "low_mentions_high_signal_count": 0,
+                "newly_detected_tickers_count": 0,
+                "runs_included": completed_count,
+                "raw_mention_rows": int(len(raw_mentions)),
+                "deduplicated_mentions_removed": 0,
+            },
+        )
+
+    if "classifier_mode" not in long_df.columns:
+        long_df["classifier_mode"] = "unknown"
+    if "model_name" not in long_df.columns:
+        long_df["model_name"] = ""
+    long_df["classifier_mode"] = long_df["classifier_mode"].fillna("unknown")
+    long_df["model_name"] = long_df["model_name"].fillna("")
+    long_df["trust_status"] = long_df.apply(classifier_trust_label, axis=1)
+
+    summary_df = build_ticker_summaries(long_df)
+    long_df = apply_ticker_flags_to_mentions(long_df, summary_df) if not summary_df.empty else long_df
+    bucket_df = build_time_bucket_summary(long_df) if not long_df.empty else pd.DataFrame()
+    summary = build_run_summary(long_df, summary_df)
+    run_count = int(long_df["analysis_run_id"].nunique()) if "analysis_run_id" in long_df.columns else 0
+    summary.update(
+        {
+            "items_scraped": int(long_df["item_id"].nunique()),
+            "items_skipped_existing": int(len(raw_mentions) - len(long_df)),
+            "items_collected": int(long_df["item_id"].nunique()),
+            "runs_included": run_count,
+            "raw_mention_rows": int(len(raw_mentions)),
+            "deduplicated_mentions_removed": int(len(raw_mentions) - len(long_df)),
+            "first_seen_date": str(long_df["created_date"].min()),
+            "most_recent_seen_date": str(long_df["created_date"].max()),
+        }
+    )
+    return long_df, summary_df, bucket_df, summary
+
+
+def load_scope_mentions(db_path: Path, scope_id: str | None) -> pd.DataFrame:
+    if is_corpus_scope(scope_id):
+        long_df, _, _, _ = build_corpus_frames(db_path)
+        return long_df
+    if not scope_id:
+        return pd.DataFrame()
+    return load_run_mentions(db_path, scope_id)
+
+
+def load_scope_ticker_summaries(db_path: Path, scope_id: str | None) -> pd.DataFrame:
+    if is_corpus_scope(scope_id):
+        _, summary_df, _, _ = build_corpus_frames(db_path)
+        return summary_df
+    if not scope_id:
+        return pd.DataFrame()
+    return load_run_ticker_summaries(db_path, scope_id)
 
 
 def selected_run_source_ids(run_record: dict[str, Any]) -> list[int]:
@@ -1641,7 +1772,7 @@ def render_watchlist_controls(db_path: Path, run_id: str | None) -> None:
     watchlist = prefs.get("watchlist", [])
     ticker_options = set(watchlist)
     if run_id:
-        summary_df = load_run_ticker_summaries(db_path, run_id)
+        summary_df = load_scope_ticker_summaries(db_path, run_id)
         if not summary_df.empty:
             ticker_options.update(summary_df["ticker"].dropna().astype(str).tolist())
 
@@ -1669,8 +1800,8 @@ def render_sidebar_quick_search(db_path: Path, run_id: str | None) -> None:
     if len(query) < 2:
         return
 
-    summary_df = load_run_ticker_summaries(db_path, run_id)
-    mentions_df = load_run_mentions(db_path, run_id)
+    summary_df = load_scope_ticker_summaries(db_path, run_id)
+    mentions_df = load_scope_mentions(db_path, run_id)
     lowered = query.lower()
 
     ticker_matches = pd.DataFrame()
@@ -1696,7 +1827,7 @@ def render_sidebar_quick_search(db_path: Path, run_id: str | None) -> None:
         mention_matches = mentions_df[searchable.str.contains(lowered, regex=False)].head(3)
 
     if ticker_matches.empty and mention_matches.empty:
-        st.caption("No current-run matches.")
+        st.caption("No current-scope matches.")
         return
 
     if not ticker_matches.empty:
@@ -2380,6 +2511,8 @@ def build_sidebar_state(db_path: Path) -> tuple[str, str | None, pd.DataFrame, p
             str(row["analysis_run_id"]): build_run_display_label(row, source_lookup)
             for row in selectable_runs.to_dict(orient="records")
         }
+        if not completed_runs.empty:
+            run_label_lookup[CORPUS_SCOPE_ID] = CORPUS_SCOPE_LABEL
 
         run_id = None
         if not selectable_runs.empty:
@@ -2401,18 +2534,24 @@ def build_sidebar_state(db_path: Path) -> tuple[str, str | None, pd.DataFrame, p
                 filtered_runs = selectable_runs
 
             filtered_run_options = filtered_runs["analysis_run_id"].tolist()
+            if not completed_runs.empty:
+                corpus_search_text = "combined corpus all completed runs all data timeline aggregate"
+                if not run_search.strip() or run_search.strip().lower() in corpus_search_text:
+                    filtered_run_options = [CORPUS_SCOPE_ID, *filtered_run_options]
             default_run_id = st.session_state.get("selected_run_id")
             if default_run_id not in filtered_run_options:
-                default_run_id = str(filtered_run_options[0])
+                default_run_id = CORPUS_SCOPE_ID if CORPUS_SCOPE_ID in filtered_run_options else str(filtered_run_options[0])
             run_index = filtered_run_options.index(default_run_id) if default_run_id in filtered_run_options else 0
             run_id = st.selectbox(
-                "Analysis run",
+                "Analysis scope",
                 filtered_run_options,
                 index=run_index,
                 key="selected_run_id",
                 format_func=lambda value: run_label_lookup.get(str(value), str(value)),
             )
-            selected_rows = selectable_runs[selectable_runs["analysis_run_id"] == run_id]
+            selected_rows = selectable_runs[selectable_runs["analysis_run_id"] == run_id] if not is_corpus_scope(run_id) else pd.DataFrame()
+            if is_corpus_scope(run_id):
+                st.caption(f"Scope: all completed live runs with analysed ticker mentions. Overlapping item/ticker rows are counted once.")
             if not selected_rows.empty:
                 selected_record = selected_rows.iloc[0].to_dict()
                 st.caption(f"Sources: {format_source_names(selected_record, source_lookup)}")
@@ -2699,6 +2838,51 @@ def render_run_summary_cards(summary: dict[str, Any]) -> None:
         st.warning(
             "Some items used heuristic fallback classification because the Ollama endpoint was unavailable "
             "or returned invalid JSON."
+        )
+
+
+def render_corpus_summary_cards(summary: dict[str, Any]) -> None:
+    metrics = st.columns(6)
+    metrics[0].metric("Runs included", summary.get("runs_included", 0))
+    metrics[1].metric("Unique items", summary.get("items_analyzed", 0))
+    metrics[2].metric("Ticker mentions", summary.get("ticker_mentions", 0))
+    metrics[3].metric("Tickers found", summary.get("tickers_found", 0))
+    metrics[4].metric("Bullish items", summary.get("bullish_items", 0))
+    metrics[5].metric("Bearish items", summary.get("bearish_items", 0))
+
+    extra = st.columns(4)
+    extra[0].metric("Deduped overlaps", summary.get("deduplicated_mentions_removed", 0))
+    extra[1].metric("Raw mention rows", summary.get("raw_mention_rows", 0))
+    extra[2].metric("Low-mention high-signal", summary.get("low_mentions_high_signal_count", 0))
+    extra[3].metric("Newly detected tickers", summary.get("newly_detected_tickers_count", 0))
+
+    date_start = str(summary.get("first_seen_date", "") or "")
+    date_end = str(summary.get("most_recent_seen_date", "") or "")
+    if date_start or date_end:
+        st.caption(f"Corpus timeline uses Reddit item dates from `{date_start or 'unknown'}` to `{date_end or 'unknown'}`.")
+
+    top_cols = st.columns(2)
+    with top_cols[0]:
+        top_mentioned = [
+            row for row in summary.get("top_mentioned_tickers", [])
+            if row.get("ticker") != "UNKNOWN"
+        ]
+        render_copyable_ticker_chips(
+            [str(row.get("ticker", "")) for row in top_mentioned],
+            label="Top mentioned tickers",
+            help_text="Click to copy ticker.",
+            max_items=8,
+        )
+    with top_cols[1]:
+        top_accelerating = [
+            row for row in summary.get("top_accelerating_tickers", [])
+            if row.get("ticker") != "UNKNOWN"
+        ]
+        render_copyable_ticker_chips(
+            [str(row.get("ticker", "")) for row in top_accelerating],
+            label="Top accelerating tickers",
+            help_text="Click to copy ticker.",
+            max_items=8,
         )
 
 
@@ -3528,54 +3712,10 @@ def render_ticker_summary_table(summary_df: pd.DataFrame) -> None:
     )
 
 
-def render_results_dashboard_page(db_path: Path, run_id: str | None) -> None:
-    st.header("Results Dashboard")
-    st.caption("Use this page to review the actual Reddit evidence: which threads mentioned which tickers, how strong the signal looks, and what needs verification.")
-    if not run_id:
-        st.info("Run an analysis first.")
-        return
-
-    completed_notice = st.session_state.pop("completed_run_notice", None)
-    if completed_notice:
-        st.success(completed_notice)
-
-    summary = load_run_summary(db_path, run_id)
-    if summary:
-        render_run_summary_cards(summary)
-    render_run_metadata(db_path, run_id)
-    runs = load_analysis_runs(db_path)
-    run_rows = runs[runs["analysis_run_id"] == run_id]
-    sources = load_sources(db_path)
-    source_lookup = {
-        int(row["source_id"]): str(row["display_name"])
-        for row in sources.to_dict(orient="records")
-    } if not sources.empty else {}
-    if not run_rows.empty:
-        render_source_health(
-            db_path=db_path,
-            run_id=run_id,
-            run_record=run_rows.iloc[0].to_dict(),
-            source_lookup=source_lookup,
-        )
-
-    long_df = load_run_mentions(db_path, run_id)
-    if long_df.empty:
-        if summary and int(summary.get("items_analyzed", 0)) == 0:
-            st.warning("This run completed, but no Reddit items matched the selected sources and time window.")
-        elif summary:
-            st.info(
-                f"This run analysed {int(summary.get('items_analyzed', 0))} Reddit items, "
-                "but no catalog tickers or company-name matches were found."
-            )
-        else:
-            st.info("No item-level mention data saved for this run.")
-        return
-
-    long_df = attach_quality_columns(long_df, load_run_classification_quality(db_path, run_id))
-    summary_df = load_run_ticker_summaries(db_path, run_id)
+def render_results_mentions_review(long_df: pd.DataFrame, summary_df: pd.DataFrame, scope_id: str) -> None:
     render_all_tickers_panel(summary_df, long_df)
     render_metric_guide("Metric guide for Results", expanded=False)
-    filtered = filter_results_dataframe(long_df, run_id)
+    filtered = filter_results_dataframe(long_df, scope_id)
     st.write(f"{len(filtered)} mention rows matched the current filters.")
     if filtered.empty:
         render_filtered_empty_state(long_df)
@@ -3584,6 +3724,7 @@ def render_results_dashboard_page(db_path: Path, run_id: str | None) -> None:
     display_columns = [
         "created_time",
         "source_name",
+        "analysis_run_id",
         "ticker",
         "company_name",
         "sentiment",
@@ -3636,6 +3777,7 @@ def render_results_dashboard_page(db_path: Path, run_id: str | None) -> None:
                 "permalink": st.column_config.LinkColumn("permalink"),
                 "trust_status": st.column_config.TextColumn("trust"),
                 "classifier_mode": st.column_config.TextColumn("mode"),
+                "analysis_run_id": st.column_config.TextColumn("run", width="small"),
             },
         )
 
@@ -3643,11 +3785,184 @@ def render_results_dashboard_page(db_path: Path, run_id: str | None) -> None:
         render_mention_details(filtered)
 
 
+def render_results_dashboard_page(db_path: Path, run_id: str | None) -> None:
+    st.header("Results Dashboard")
+    st.caption("Use this page to review the actual Reddit evidence: which threads mentioned which tickers, how strong the signal looks, and what needs verification.")
+    if not run_id:
+        st.info("Run an analysis first.")
+        return
+
+    completed_notice = st.session_state.pop("completed_run_notice", None)
+    if completed_notice:
+        st.success(completed_notice)
+
+    if is_corpus_scope(run_id):
+        long_df, summary_df, _, summary = build_corpus_frames(db_path)
+        st.subheader(CORPUS_SCOPE_LABEL)
+        st.caption(
+            "This combines all completed live runs into one deduped item-level dataset. "
+            "If the same Reddit item/ticker appears in overlapping scrapes, the newest completed classification is kept."
+        )
+        render_corpus_summary_cards(summary)
+        if long_df.empty:
+            st.info("No completed ticker mentions are available in the combined corpus yet.")
+            return
+        render_results_mentions_review(long_df, summary_df, run_id)
+        return
+
+    summary = load_run_summary(db_path, run_id)
+    if summary:
+        render_run_summary_cards(summary)
+    render_run_metadata(db_path, run_id)
+    runs = load_analysis_runs(db_path)
+    run_rows = runs[runs["analysis_run_id"] == run_id]
+    sources = load_sources(db_path)
+    source_lookup = {
+        int(row["source_id"]): str(row["display_name"])
+        for row in sources.to_dict(orient="records")
+    } if not sources.empty else {}
+    if not run_rows.empty:
+        render_source_health(
+            db_path=db_path,
+            run_id=run_id,
+            run_record=run_rows.iloc[0].to_dict(),
+            source_lookup=source_lookup,
+        )
+
+    long_df = load_run_mentions(db_path, run_id)
+    if long_df.empty:
+        if summary and int(summary.get("items_analyzed", 0)) == 0:
+            st.warning("This run completed, but no Reddit items matched the selected sources and time window.")
+        elif summary:
+            st.info(
+                f"This run analysed {int(summary.get('items_analyzed', 0))} Reddit items, "
+                "but no catalog tickers or company-name matches were found."
+            )
+        else:
+            st.info("No item-level mention data saved for this run.")
+        return
+
+    long_df = attach_quality_columns(long_df, load_run_classification_quality(db_path, run_id))
+    summary_df = load_run_ticker_summaries(db_path, run_id)
+    render_results_mentions_review(long_df, summary_df, run_id)
+
+
 def render_ticker_trends_page(db_path: Path, run_id: str | None) -> None:
     st.header("Ticker Trends")
     st.caption("Use this page to answer what changed between scrapes, which tickers are accelerating, and which leads deserve a closer read.")
     if not run_id:
         st.info("Run an analysis first.")
+        return
+
+    if is_corpus_scope(run_id):
+        long_df, summary_df, bucket_df, summary = build_corpus_frames(db_path)
+        st.subheader(CORPUS_SCOPE_LABEL)
+        st.caption(
+            "The combined timeline uses Reddit item dates across every completed live run, with overlapping item/ticker mentions counted once."
+        )
+        if summary_df.empty:
+            st.info("No completed ticker history is available in the combined corpus yet.")
+            return
+
+        metric_cols = st.columns(5)
+        metric_cols[0].metric("Runs", int(summary.get("runs_included", 0)))
+        metric_cols[1].metric("Tickers", int(summary_df["ticker"].nunique()))
+        metric_cols[2].metric("Mentions", int(summary_df["total_mentions"].sum()))
+        metric_cols[3].metric("Best acceleration", f"{float(summary_df['acceleration_score'].max()):.1f}")
+        metric_cols[4].metric("Overlap rows removed", int(summary.get("deduplicated_mentions_removed", 0)))
+        render_all_tickers_panel(summary_df, long_df)
+        render_metric_guide("Metric guide for Trends", expanded=False)
+        render_ticker_focus(
+            run_id=run_id,
+            summary_df=summary_df,
+            bucket_df=bucket_df,
+            long_df=long_df,
+            history_df=pd.DataFrame(),
+        )
+
+        timeline_tab, map_tab, table_tab, run_tab = st.tabs(
+            ["Corpus Timeline", "Signal Map", "Summary Table", "Run Coverage"]
+        )
+        with timeline_tab:
+            st.subheader("All completed runs timeline")
+            if bucket_df.empty:
+                st.info("No time buckets are available for the combined corpus.")
+            else:
+                timeline_controls = st.columns([2, 1])
+                selected_tickers = timeline_controls[0].multiselect(
+                    "Tickers",
+                    summary_df["ticker"].tolist(),
+                    default=summary_df["ticker"].head(min(8, len(summary_df))).tolist(),
+                    key=f"timeline_tickers_{run_id}",
+                )
+                timeline_metric = timeline_controls[1].selectbox(
+                    "Metric",
+                    list(WITHIN_RUN_METRICS.keys()),
+                    format_func=lambda value: WITHIN_RUN_METRICS[value],
+                    key=f"timeline_metric_{run_id}",
+                )
+                if selected_tickers:
+                    render_within_run_chart(bucket_df, selected_tickers, timeline_metric)
+                else:
+                    st.info("Select at least one ticker to draw the timeline.")
+
+                spike_notes = build_spike_notes(bucket_df, long_df, selected_tickers)
+                if not spike_notes.empty:
+                    with st.expander("Spike notes", expanded=False):
+                        st.dataframe(
+                            spike_notes,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "permalink": st.column_config.LinkColumn("permalink"),
+                                "likely_driver": st.column_config.TextColumn("Likely driver", width="large"),
+                                "summary": st.column_config.TextColumn("Summary", width="large"),
+                            },
+                        )
+
+        with map_tab:
+            st.subheader("Ticker signal overview")
+            map_cols = st.columns([1.65, 1])
+            with map_cols[0]:
+                render_signal_map(summary_df)
+            with map_cols[1]:
+                st.write("Top acceleration")
+                render_acceleration_bar(summary_df)
+
+        with table_tab:
+            st.subheader("Ticker summary")
+            render_ticker_summary_table(summary_df)
+
+        with run_tab:
+            runs = load_analysis_runs(db_path)
+            if runs.empty:
+                st.info("No runs saved yet.")
+            else:
+                completed = runs[
+                    (runs["status"] == "completed")
+                    & (runs["data_mode"] == "live")
+                    & (runs.apply(lambda row: run_has_analysed_items(row.to_dict()), axis=1))
+                ].copy()
+                if completed.empty:
+                    st.info("No completed runs with analysed items yet.")
+                else:
+                    completed["items_analyzed"] = completed["summary_json"].map(lambda value: int((value or {}).get("items_analyzed", 0) or 0))
+                    completed["ticker_mentions"] = completed["summary_json"].map(lambda value: int((value or {}).get("ticker_mentions", 0) or 0))
+                    completed["tickers_found"] = completed["summary_json"].map(lambda value: int((value or {}).get("tickers_found", 0) or 0))
+                    st.dataframe(
+                        completed[
+                            [
+                                "analysis_run_id",
+                                "completed_at",
+                                "time_window_label",
+                                "items_analyzed",
+                                "ticker_mentions",
+                                "tickers_found",
+                            ]
+                        ],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
         return
 
     runs = load_analysis_runs(db_path)
@@ -3921,36 +4236,43 @@ def render_export_page(db_path: Path, run_id: str | None) -> None:
         st.info("Run an analysis first.")
         return
 
-    long_df = load_run_mentions(db_path, run_id)
-    summary_df = load_run_ticker_summaries(db_path, run_id)
-    bucket_df = load_run_time_buckets(db_path, run_id)
-    summary_json = load_run_summary(db_path, run_id)
+    if is_corpus_scope(run_id):
+        long_df, summary_df, bucket_df, summary_json = build_corpus_frames(db_path)
+        export_id = "combined_corpus"
+        st.caption("Exporting the deduped combined corpus across all completed live runs.")
+    else:
+        long_df = load_run_mentions(db_path, run_id)
+        summary_df = load_run_ticker_summaries(db_path, run_id)
+        bucket_df = load_run_time_buckets(db_path, run_id)
+        summary_json = load_run_summary(db_path, run_id)
+        export_id = run_id
 
     if long_df.empty:
-        st.info("No data available for export in this run.")
+        st.info("No data available for export in this scope.")
         return
 
-    run_artifact_dir = DEFAULT_ARTIFACTS_DIR / run_id
-    if run_artifact_dir.exists():
-        st.caption(f"Automatic run artifacts saved to `{run_artifact_dir}`.")
+    if not is_corpus_scope(run_id):
+        run_artifact_dir = DEFAULT_ARTIFACTS_DIR / run_id
+        if run_artifact_dir.exists():
+            st.caption(f"Automatic run artifacts saved to `{run_artifact_dir}`.")
 
     st.write("Long format: one row per analysed item and ticker mention. Wide format: a pivoted table for statistical tools like JASP.")
     st.download_button(
         "Download raw item-level long format CSV",
         long_df.to_csv(index=False).encode("utf-8"),
-        file_name=f"{run_id}_long_format.csv",
+        file_name=f"{export_id}_long_format.csv",
         mime="text/csv",
     )
     st.download_button(
         "Download ticker-level summary CSV",
         summary_df.to_csv(index=False).encode("utf-8"),
-        file_name=f"{run_id}_ticker_summary.csv",
+        file_name=f"{export_id}_ticker_summary.csv",
         mime="text/csv",
     )
     st.download_button(
         "Download time-bucketed ticker trend CSV",
         bucket_df.to_csv(index=False).encode("utf-8"),
-        file_name=f"{run_id}_ticker_trends.csv",
+        file_name=f"{export_id}_ticker_trends.csv",
         mime="text/csv",
     )
 
@@ -3965,21 +4287,21 @@ def render_export_page(db_path: Path, run_id: str | None) -> None:
     st.download_button(
         "Download wide format CSV",
         wide_df.to_csv(index=False).encode("utf-8"),
-        file_name=f"{run_id}_wide_format.csv",
+        file_name=f"{export_id}_wide_format.csv",
         mime="text/csv",
     )
 
     full_payload = {
-        "analysis_run_id": run_id,
+        "analysis_scope": export_id,
         "run_summary": summary_json,
-        "long_format": load_full_results_records(db_path, run_id),
+        "long_format": long_df.to_dict(orient="records") if is_corpus_scope(run_id) else load_full_results_records(db_path, run_id),
         "ticker_summaries": summary_df.to_dict(orient="records"),
         "ticker_time_buckets": bucket_df.to_dict(orient="records"),
     }
     st.download_button(
         "Download JSON export of full classified results",
         json.dumps(full_payload, indent=2).encode("utf-8"),
-        file_name=f"{run_id}_full_results.json",
+        file_name=f"{export_id}_full_results.json",
         mime="application/json",
     )
 
