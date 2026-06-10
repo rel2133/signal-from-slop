@@ -122,7 +122,7 @@ PAGE_STEPS = [
     {"page": "Settings", "label": "Settings", "step": "06", "context": "Storage and model"},
 ]
 PAGES = [step["page"] for step in PAGE_STEPS]
-PAGE_LABELS = {step["page"]: f"{step['step']} {step['label']}" for step in PAGE_STEPS}
+PAGE_LABELS = {step["page"]: step["label"] for step in PAGE_STEPS}
 PAGE_CONTEXT = {step["page"]: step["context"] for step in PAGE_STEPS}
 ACTIVE_RUN_STATUSES = {"running", "pausing", "paused", "cancelling"}
 CORPUS_SCOPE_ID = "__combined_completed_corpus__"
@@ -1471,16 +1471,24 @@ def run_has_analysed_items(run_record: dict[str, Any]) -> bool:
 
 def render_workflow_navigation() -> str:
     st.markdown('<div class="workflow-kicker">Workflow</div>', unsafe_allow_html=True)
-    page = st.radio(
-        "Workflow",
-        PAGES,
-        key="page",
-        horizontal=True,
-        format_func=lambda value: PAGE_LABELS.get(value, value),
-        label_visibility="collapsed",
-    )
-    st.caption(f"{page}: {PAGE_CONTEXT.get(page, '')}")
-    return page
+    current_page = str(st.session_state.get("page", PAGES[0]) or PAGES[0])
+    if current_page not in PAGES:
+        current_page = PAGES[0]
+        st.session_state["page"] = current_page
+
+    nav_cols = st.columns(len(PAGE_STEPS))
+    for column, step in zip(nav_cols, PAGE_STEPS):
+        with column:
+            if st.button(
+                step["label"],
+                key=f"workflow_nav_{step['page']}",
+                use_container_width=True,
+                type="primary" if current_page == step["page"] else "secondary",
+            ):
+                if current_page != step["page"]:
+                    st.session_state["page"] = step["page"]
+                    st.rerun()
+    return current_page
 
 
 def run_completed_label(run_record: dict[str, Any]) -> str:
@@ -2494,23 +2502,34 @@ def build_sidebar_state(db_path: Path) -> tuple[str, str | None, pd.DataFrame, p
     } if not sources.empty else {}
 
     with st.sidebar:
-        st.subheader("Run context")
+        st.subheader("Analysis scope")
         auto_cleared_runs = int(st.session_state.pop("auto_cleared_orphaned_runs", 0) or 0)
         if auto_cleared_runs:
             st.warning(f"Cleared {auto_cleared_runs} old active run(s) with no heartbeat.")
-        if not runs.empty:
-            overview_cols = st.columns(2)
-            overview_cols[0].metric("Completed", len(completed_runs))
-            overview_cols[1].metric("All runs", len(runs))
-            render_latest_run_status(runs, source_lookup)
-            render_recent_run_statuses(runs, source_lookup)
 
-        show_all_runs = st.toggle(
-            "Show all runs",
-            value=False,
-            help="Includes running, failed, and zero-item runs that are hidden from the default results picker.",
-            disabled=runs.empty,
-        )
+        show_all_runs = False
+        run_search = ""
+        with st.expander("Run browser", expanded=False):
+            if not runs.empty:
+                overview_cols = st.columns(2)
+                overview_cols[0].metric("Completed", len(completed_runs))
+                overview_cols[1].metric("All runs", len(runs))
+                render_latest_run_status(runs, source_lookup)
+                render_recent_run_statuses(runs, source_lookup)
+            show_all_runs = st.toggle(
+                "Show all runs",
+                value=False,
+                key="sidebar_show_all_runs",
+                help="Includes running, failed, and zero-item runs that are hidden from the default results picker.",
+                disabled=runs.empty,
+            )
+            run_search = st.text_input(
+                "Find run",
+                placeholder="Search ID, date, or source",
+                key="sidebar_run_search",
+                disabled=runs.empty,
+            ).strip()
+
         selectable_runs = runs if show_all_runs else (completed_runs if not completed_runs.empty else runs)
         run_label_lookup = {
             str(row["analysis_run_id"]): build_run_display_label(row, source_lookup)
@@ -2521,10 +2540,9 @@ def build_sidebar_state(db_path: Path) -> tuple[str, str | None, pd.DataFrame, p
 
         run_id = None
         if not selectable_runs.empty:
-            run_search = st.text_input("Find run", placeholder="Search ID, date, or source")
             filtered_runs = selectable_runs.copy()
-            if run_search.strip():
-                query = run_search.strip().lower()
+            if run_search:
+                query = run_search.lower()
                 filtered_runs = selectable_runs[
                     selectable_runs["analysis_run_id"].astype(str).str.lower().str.contains(query)
                     | selectable_runs["status"].astype(str).str.lower().str.contains(query)
@@ -2541,7 +2559,7 @@ def build_sidebar_state(db_path: Path) -> tuple[str, str | None, pd.DataFrame, p
             filtered_run_options = filtered_runs["analysis_run_id"].tolist()
             if not completed_runs.empty:
                 corpus_search_text = "combined corpus all completed runs all data timeline aggregate"
-                if not run_search.strip() or run_search.strip().lower() in corpus_search_text:
+                if not run_search or run_search.lower() in corpus_search_text:
                     filtered_run_options = [CORPUS_SCOPE_ID, *filtered_run_options]
             default_run_id = st.session_state.get("selected_run_id")
             if default_run_id not in filtered_run_options:
@@ -2561,8 +2579,6 @@ def build_sidebar_state(db_path: Path) -> tuple[str, str | None, pd.DataFrame, p
                 selected_record = selected_rows.iloc[0].to_dict()
                 st.caption(f"Sources: {format_source_names(selected_record, source_lookup)}")
                 st.caption(f"Completed: `{run_completed_label(selected_record)}`")
-            if not completed_runs.empty and len(completed_runs) != len(runs):
-                st.caption("Default view shows completed runs with analysed items. Turn on 'Show all runs' to inspect failed, running, or zero-item runs.")
         else:
             st.info("No analysis runs saved yet.")
 
@@ -2570,20 +2586,14 @@ def build_sidebar_state(db_path: Path) -> tuple[str, str | None, pd.DataFrame, p
             render_watchlist_controls(db_path, run_id)
             render_sidebar_quick_search(db_path, run_id)
 
-        st.divider()
-        st.caption(f"Current step: `{page}`")
-        with st.expander("Storage paths", expanded=False):
-            st.caption(f"SQLite: `{db_path}`")
-
     return page, run_id, sources, runs
 
 
 def render_sources_page(db_path: Path) -> None:
     st.header("Sources")
-    st.write("Add subreddit sources or Reddit thread URLs. Inputs are normalized before saving.")
-    st.caption("Sources are the watchlist. To scrape Reddit and analyse posts, open `02 Scrape` in the workflow.")
+    st.write("Add subreddit sources or Reddit thread URLs.")
 
-    if st.button("Go to Run Analysis", type="primary"):
+    if st.button("Open Scrape", type="primary"):
         st.session_state["pending_page"] = "Run Analysis"
         st.rerun()
 
@@ -2665,14 +2675,9 @@ def render_run_analysis_page(
         return
 
     data_mode = "live"
-    st.info(
-        "Reddit scraping uses public Reddit RSS feeds and stores the collected run locally. "
-        "No Reddit API keys are required, but large runs may be rate-limited."
-    )
     if active_run:
         st.caption(
-            "A scrape is already active in the background. You can move between pages while it runs. "
-            "Pause, resume, or cancel it from the live run bar above."
+            "A scrape is already running in the background. Pause, resume, or cancel it from the live run bar above."
         )
 
     selected_source_ids = st.multiselect(
@@ -2688,19 +2693,15 @@ def render_run_analysis_page(
         data_mode=data_mode,
     ) if selected_source_ids else None
     use_last_run_window = st.toggle(
-        "Use last completed run -> now",
+        "Start from last completed run",
         value=False,
         disabled=not previous_run,
         help="If enabled, the analysis window starts immediately after the most recent completed run for the current source selection.",
     )
     if previous_run:
         st.caption(
-            "Most recent matching completed run: "
-            f"`{previous_run['analysis_run_id']}` at "
-            f"`{previous_run.get('completed_at') or previous_run.get('started_at')}`."
+            f"Previous matching run: `{previous_run['analysis_run_id']}` at `{previous_run.get('completed_at') or previous_run.get('started_at')}`."
         )
-    else:
-        st.caption("No matching completed run exists yet for the current source selection.")
     manual_time_window_options = [
         option for option in TIME_WINDOW_OPTIONS.keys() if option != "Since last completed run"
     ]
@@ -2777,12 +2778,11 @@ def render_run_analysis_page(
         ),
     )
     run_deeper_analysis = st.toggle("Run deeper analysis for qualifying items", value=True)
-    ollama_url = st.text_input("Ollama URL", DEFAULT_OLLAMA_URL)
-    if is_localhost_url(ollama_url):
-        st.caption(
-            "`localhost` only works when this Streamlit app runs on the same machine as Ollama. "
-            "On Streamlit Community Cloud, `localhost` points to the cloud container, not your Mac."
-        )
+    ollama_url = st.text_input(
+        "Ollama URL",
+        DEFAULT_OLLAMA_URL,
+        help="For local use, keep this on localhost. Streamlit Cloud cannot reach the Ollama server on your Mac.",
+    )
     available_models, model_error = discover_ollama_models(ollama_url)
     if available_models:
         default_model = DEFAULT_MODEL if DEFAULT_MODEL in available_models else available_models[0]
@@ -2803,8 +2803,7 @@ def render_run_analysis_page(
     st.caption(f"Window resolved against current time: `{start_dt.date().isoformat()}` to `{end_dt.date().isoformat()}`.")
     if use_last_run_window and previous_run:
         st.caption(
-            f"Most recent matching completed run completed at `{str(previous_run.get('completed_at') or previous_run['time_window_end'])[:19]}` "
-            "for this source set."
+            f"Using `{str(previous_run.get('completed_at') or previous_run['time_window_end'])[:19]}` as the start point for this source set."
         )
 
     run_disabled = active_run is not None
@@ -4372,8 +4371,16 @@ def render_settings_page(db_path: Path, ticker_path: Path, artifacts_dir: Path) 
         env_cols[1].metric("Altair", alt.__version__)
         env_cols[2].metric("Pandas", pd.__version__)
         env_cols[3].metric("Requests", requests.__version__)
-
-        st.write("Collection uses public Reddit RSS feeds and stores runs locally.")
+        storage_parts = DEFAULT_STORAGE_ROOT.parts
+        using_external_storage = len(storage_parts) >= 3 and storage_parts[1] == "Volumes"
+        ollama_models_dir = Path(os.getenv("OLLAMA_MODELS", str(Path.home() / ".ollama" / "models"))).expanduser()
+        if using_external_storage:
+            st.success(f"App data writes directly to the external SSD at `{DEFAULT_STORAGE_ROOT}`.")
+        else:
+            st.warning(f"App data is currently writing to `{DEFAULT_STORAGE_ROOT}` on the local machine.")
+        st.caption("The app writes the database and run artifacts directly to these paths. It does not save to the laptop first and then move files later.")
+        if not str(ollama_models_dir).startswith(str(DEFAULT_STORAGE_ROOT)):
+            st.warning(f"Ollama model files are separate from app data and currently live at `{ollama_models_dir}`.")
 
         st.subheader("Paths")
         st.code(
