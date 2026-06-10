@@ -418,7 +418,7 @@ def replace_run_mentions(db_path: str | Path, analysis_run_id: str, rows: list[d
             ]
             conn.executemany(
                 """
-                INSERT INTO item_ticker_mentions (
+                INSERT OR REPLACE INTO item_ticker_mentions (
                     analysis_run_id, item_id, source_id, source_type, source_name,
                     subreddit, thread_id, thread_title, comment_id, parent_id,
                     author_hash, created_time, created_date, time_bucket, item_type,
