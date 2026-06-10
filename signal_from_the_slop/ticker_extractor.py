@@ -43,7 +43,6 @@ class TickerExtractor:
     def extract(self, text: str) -> ExtractionResult:
         text = text or ""
         found_tickers = []
-        found_companies = []
 
         for ticker in self._find_cash_tag_tickers(text):
             if ticker not in found_tickers:
@@ -58,16 +57,10 @@ class TickerExtractor:
             pattern = rf"(?<!\w){re.escape(alias)}(?!\w)"
             if re.search(pattern, lowered):
                 ticker = payload["ticker"]
-                company_name = payload["company_name"]
                 if ticker not in found_tickers:
                     found_tickers.append(ticker)
-                if company_name not in found_companies:
-                    found_companies.append(company_name)
 
-        for ticker in found_tickers:
-            company_name = self.catalog[ticker]["company_name"]
-            if company_name and company_name not in found_companies:
-                found_companies.append(company_name)
+        found_companies = [self.catalog[ticker]["company_name"] or "Unknown" for ticker in found_tickers]
 
         return ExtractionResult(tickers=found_tickers, company_names=found_companies)
 

@@ -344,6 +344,21 @@ def replace_run_classifications(db_path: str | Path, analysis_run_id: str, rows:
 
 
 def replace_run_mentions(db_path: str | Path, analysis_run_id: str, rows: list[dict[str, Any]]) -> None:
+    deduped_rows: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        ticker = str(row.get("ticker", "") or "").strip().upper()
+        if not ticker:
+            continue
+        item_id = str(row.get("item_id", "") or "")
+        key = (item_id, ticker)
+        normalized_row = dict(row)
+        normalized_row["ticker"] = ticker
+        if key not in deduped_rows:
+            deduped_rows[key] = normalized_row
+        elif deduped_rows[key].get("company_name") == "Unknown" and normalized_row.get("company_name") != "Unknown":
+            deduped_rows[key] = normalized_row
+    rows = list(deduped_rows.values())
+
     with sqlite3.connect(db_path) as conn:
         conn.execute("DELETE FROM item_ticker_mentions WHERE analysis_run_id = ?", (analysis_run_id,))
         if rows:

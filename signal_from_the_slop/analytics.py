@@ -95,6 +95,10 @@ def build_classification_record(
     deeper_analysis_json: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     text = " ".join([item.get("thread_title", ""), item.get("body_text", "")]).strip()
+    ticker_company_pairs = normalize_ticker_company_pairs(
+        classification_payload.get("tickers") or [],
+        classification_payload.get("company_names") or [],
+    )
     claim_specificity_score = coerce_claim_specificity_score(
         classification_payload.get("claim_specificity_score"),
         text,
@@ -117,8 +121,8 @@ def build_classification_record(
         "item_id": item["item_id"],
         "sentiment": classification_payload.get("sentiment", "irrelevant"),
         "confidence": float(classification_payload.get("confidence", 0.0)),
-        "tickers": classification_payload.get("tickers") or [],
-        "company_names": classification_payload.get("company_names") or [],
+        "tickers": [ticker for ticker, _ in ticker_company_pairs],
+        "company_names": [company_name for _, company_name in ticker_company_pairs],
         "summary": str(classification_payload.get("summary", "")).strip(),
         "bull_case": str(classification_payload.get("bull_case", "")).strip(),
         "bear_case": str(classification_payload.get("bear_case", "")).strip(),
@@ -138,13 +142,28 @@ def build_classification_record(
     }
 
 
+def normalize_ticker_company_pairs(tickers: list[Any], company_names: list[Any]) -> list[tuple[str, str]]:
+    pairs: dict[str, str] = {}
+    for index, raw_ticker in enumerate(tickers):
+        ticker = str(raw_ticker or "").strip().upper()
+        if not ticker:
+            continue
+        company_name = str(company_names[index]).strip() if index < len(company_names) else "Unknown"
+        company_name = company_name or "Unknown"
+        if ticker not in pairs:
+            pairs[ticker] = company_name
+        elif pairs[ticker] == "Unknown" and company_name != "Unknown":
+            pairs[ticker] = company_name
+    return list(pairs.items())
+
+
 def build_mention_records(item: dict[str, Any], classification_record: dict[str, Any]) -> list[dict[str, Any]]:
-    tickers = classification_record["tickers"]
-    if not tickers:
+    ticker_company_pairs = normalize_ticker_company_pairs(
+        classification_record["tickers"],
+        classification_record.get("company_names") or [],
+    )
+    if not ticker_company_pairs:
         return []
-    company_names = classification_record["company_names"] or ["Unknown"]
-    if len(company_names) < len(tickers):
-        company_names = company_names + ["Unknown"] * (len(tickers) - len(company_names))
 
     created = parse_created_time(item["created_time"])
     created_date = created.date().isoformat()
@@ -157,8 +176,7 @@ def build_mention_records(item: dict[str, Any], classification_record: dict[str,
     contains_financial_terms = any(term in text.lower() for term in FINANCIAL_TERMS)
 
     records = []
-    for index, ticker in enumerate(tickers):
-        company_name = company_names[index] if index < len(company_names) else "Unknown"
+    for ticker, company_name in ticker_company_pairs:
         records.append(
             {
                 "item_id": item["item_id"],

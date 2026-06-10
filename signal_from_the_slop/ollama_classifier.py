@@ -225,10 +225,6 @@ class OllamaClassifier:
         result["sentiment"] = self._coerce_sentiment(result["sentiment"])
         result["confidence"] = self._coerce_float(result.get("confidence"), minimum=0.0, maximum=1.0)
         result["tickers"] = self._filter_allowed_values(self._coerce_string_list(result.get("tickers")), extraction["tickers"])
-        result["company_names"] = self._filter_allowed_values(
-            self._coerce_string_list(result.get("company_names")),
-            extraction["company_names"],
-        )
         result["summary"] = str(result.get("summary") or "").strip()
         result["bull_case"] = self._coerce_case_text(result.get("bull_case"))
         result["bear_case"] = self._coerce_case_text(result.get("bear_case"))
@@ -245,8 +241,8 @@ class OllamaClassifier:
 
         if not result["tickers"]:
             result["tickers"] = extraction["tickers"]
-        if not result["company_names"]:
-            result["company_names"] = extraction["company_names"]
+        company_by_ticker = dict(zip(extraction["tickers"], extraction["company_names"], strict=False))
+        result["company_names"] = [company_by_ticker.get(ticker, "Unknown") for ticker in result["tickers"]]
         if not result["claim_specificity_score"]:
             result["claim_specificity_score"] = derive_claim_specificity_score(text)
         if not result["repetition_score"]:
@@ -355,8 +351,13 @@ class OllamaClassifier:
         return bool(value)
 
     def _filter_allowed_values(self, values: list[str], allowed: list[str]) -> list[str]:
-        allowed_set = set(allowed)
-        return [value for value in values if value in allowed_set]
+        allowed_by_key = {value.upper(): value for value in allowed}
+        filtered: list[str] = []
+        for value in values:
+            key = value.upper()
+            if key in allowed_by_key and allowed_by_key[key] not in filtered:
+                filtered.append(allowed_by_key[key])
+        return filtered
 
     def _tags_endpoint(self) -> str:
         if self.endpoint.endswith("/api/chat"):
