@@ -85,7 +85,12 @@ except ImportError:
         return {str(row[0]) for row in rows}
 
 from signal_from_the_slop.ollama_classifier import OllamaClassifier
-from signal_from_the_slop.reddit_client import RedditClient, build_subreddit_source, parse_source_input
+from signal_from_the_slop.reddit_client import (
+    REDDIT_SUBREDDIT_RSS_LIMIT,
+    RedditClient,
+    build_subreddit_source,
+    parse_source_input,
+)
 from signal_from_the_slop.ticker_extractor import TickerExtractor
 
 
@@ -2716,10 +2721,53 @@ def render_run_analysis_page(
     elif effective_time_window_label == "Since last completed run" and not previous_run:
         st.warning("No matching completed run was found for the current source selection, so choose another time window.")
 
-    max_posts_per_source = st.slider("Max posts per source", min_value=1, max_value=20, value=8)
-    max_comments_per_thread = st.slider("Max comments per thread", min_value=0, max_value=20, value=4)
+    limit_cols = st.columns(2)
+    max_posts_per_source = int(
+        limit_cols[0].number_input(
+            "Max posts per source",
+            min_value=1,
+            max_value=REDDIT_SUBREDDIT_RSS_LIMIT,
+            value=25,
+            step=5,
+            help=(
+                "Public Reddit RSS can return up to roughly the newest "
+                f"{REDDIT_SUBREDDIT_RSS_LIMIT} posts per subreddit request. "
+                "Use a larger number for overnight runs."
+            ),
+        )
+    )
+    max_comments_per_thread = int(
+        limit_cols[1].number_input(
+            "Max comments per thread",
+            min_value=0,
+            max_value=100,
+            value=4,
+            step=1,
+            help="Comments multiply the number of items sent to Ollama. Set this to 0 for faster posts-only runs.",
+        )
+    )
     item_scope = st.radio("Analyse scope", ["Posts + comments", "Posts only"], horizontal=True)
     include_comments = item_scope == "Posts + comments"
+    selected_source_count = len(selected_source_ids)
+    estimated_items = selected_source_count * max_posts_per_source
+    if include_comments:
+        estimated_items += selected_source_count * max_posts_per_source * max_comments_per_thread
+    st.caption(
+        f"Planned upper bound: about `{estimated_items}` Reddit item(s) "
+        f"({selected_source_count} source(s) x {max_posts_per_source} post(s)"
+        + (f" x up to {max_comments_per_thread} comment(s)" if include_comments and max_comments_per_thread else "")
+        + "). Actual count may be lower if Reddit RSS has fewer posts in the selected window."
+    )
+    if max_posts_per_source >= REDDIT_SUBREDDIT_RSS_LIMIT:
+        st.info(
+            f"{REDDIT_SUBREDDIT_RSS_LIMIT} is the current per-subreddit ceiling for the public RSS collector. "
+            "For deeper history than that, run smaller rolling windows or add Reddit API pagination later."
+        )
+    if estimated_items >= 500:
+        st.warning(
+            "This is a large local Ollama run. It can work, but leave the terminal and Ollama running, "
+            "use the background progress bar, and expect rate limits or long classification time."
+        )
     skip_previously_analyzed = st.toggle(
         "Skip already analysed Reddit items",
         value=True,

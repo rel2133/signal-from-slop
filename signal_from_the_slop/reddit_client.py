@@ -19,6 +19,7 @@ THREAD_URL_PATTERN = re.compile(r"^/r/([A-Za-z0-9_]+)/comments/([A-Za-z0-9]+)/?.
 ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
 DEFAULT_REDDIT_USER_AGENT = "script:signal-from-the-slop:0.1"
 REDDIT_REQUEST_DELAY_SECONDS = 0.25
+REDDIT_SUBREDDIT_RSS_LIMIT = 100
 
 
 @dataclass(frozen=True)
@@ -132,7 +133,7 @@ class RedditClient:
         total_sources: int = 1,
     ) -> list[dict[str, Any]]:
         subreddit = normalize_subreddit_name(str(source["normalized_value"]))
-        feed_url = f"https://www.reddit.com/r/{subreddit}/new/.rss?limit=100"
+        feed_url = f"https://www.reddit.com/r/{subreddit}/new/.rss?limit={REDDIT_SUBREDDIT_RSS_LIMIT}"
         entries = self._fetch_rss_entries(session, feed_url)
         items: list[dict[str, Any]] = []
         posts: list[dict[str, Any]] = []

@@ -80,7 +80,7 @@ After `streamlit run app.py` opens the app:
 
 1. Select `02 Scrape` in the workflow header.
 2. Pick the active sources and date window you want.
-3. Set small limits first, for example `Max posts per source = 2` and `Max comments per thread = 1`.
+3. Set small limits first, for example `Max posts per source = 10` and `Max comments per thread = 1`. For larger overnight runs, the app supports up to the public Reddit RSS depth of about 100 newest posts per subreddit request.
 4. Press `Scrape Reddit and Run Analysis`.
 5. When it finishes, the app moves to `Results Dashboard` and shows the saved run.
 
