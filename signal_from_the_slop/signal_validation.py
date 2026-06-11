@@ -43,6 +43,9 @@ MATERIAL_SIGNAL_DELTA = 12.0
 RANDOM_BENCHMARK_SAMPLE_SIZE = 12
 MARKET_LOOKBACK_CALENDAR_DAYS = 60
 MARKET_FORWARD_CALENDAR_DAYS = 45
+MARKET_TICKER_ALIASES = {
+    "SQ": "XYZ",
+}
 
 
 def run_signal_validation(
@@ -290,7 +293,7 @@ def load_ticker_universe(ticker_path: Path) -> list[str]:
         with ticker_path.open(encoding="utf-8", newline="") as handle:
             reader = csv.DictReader(handle)
             for row in reader:
-                ticker = str(row.get("ticker", "")).strip().upper()
+                ticker = market_symbol_for_ticker(str(row.get("ticker", "")).strip().upper())
                 if ticker:
                     tickers.append(ticker)
     except OSError:
@@ -305,7 +308,8 @@ def ensure_market_data(
     start_date: date,
     end_date: date,
 ) -> dict[str, Any]:
-    ticker = ticker.upper()
+    requested_ticker = ticker.upper()
+    ticker = market_symbol_for_ticker(requested_ticker)
     cached = load_market_prices(
         db_path,
         ticker=ticker,
@@ -329,13 +333,31 @@ def ensure_market_data(
         )
     except Exception as exc:  # pragma: no cover - network/provider failures
         LOGGER.warning("Market data fetch failed for %s: %s", ticker, exc)
-        return {"ticker": ticker, "fetched": False, "cached_rows": len(cached), "error": str(exc)}
+        return {
+            "ticker": requested_ticker,
+            "market_ticker": ticker,
+            "fetched": False,
+            "cached_rows": len(cached),
+            "error": str(exc),
+        }
 
     normalized_rows = _normalize_market_rows(frame, ticker=ticker)
     if not normalized_rows:
-        return {"ticker": ticker, "fetched": False, "cached_rows": len(cached), "error": "no market data returned"}
+        return {
+            "ticker": requested_ticker,
+            "market_ticker": ticker,
+            "fetched": False,
+            "cached_rows": len(cached),
+            "error": "no market data returned",
+        }
     upsert_market_prices(db_path, normalized_rows)
-    return {"ticker": ticker, "fetched": True, "cached_rows": len(cached), "error": ""}
+    return {
+        "ticker": requested_ticker,
+        "market_ticker": ticker,
+        "fetched": True,
+        "cached_rows": len(cached),
+        "error": "",
+    }
 
 
 def build_market_outcomes(
@@ -352,14 +374,14 @@ def build_market_outcomes(
         signal_time = _coerce_datetime(signal.get("signal_time"))
         if not ticker or signal_time is None:
             continue
-        signal_date = signal_time.date()
+        market_ticker = market_symbol_for_ticker(ticker)
         prices = price_cache.setdefault(
-            ticker,
-            _prepare_market_prices(load_market_prices(db_path, ticker=ticker)),
+            market_ticker,
+            _prepare_market_prices(load_market_prices(db_path, ticker=market_ticker)),
         )
         benchmark_prices = benchmark_cache.setdefault(
-            benchmark_ticker,
-            _prepare_market_prices(load_market_prices(db_path, ticker=benchmark_ticker)),
+            market_symbol_for_ticker(benchmark_ticker),
+            _prepare_market_prices(load_market_prices(db_path, ticker=market_symbol_for_ticker(benchmark_ticker))),
         )
         outcome = _build_single_market_outcome(
             ticker=ticker,
@@ -389,9 +411,10 @@ def build_random_benchmark_outcomes(
         signal_time = _coerce_datetime(record.get("signal_date"))
         if not ticker or signal_time is None:
             continue
+        market_ticker = market_symbol_for_ticker(ticker)
         prices = price_cache.setdefault(
-            ticker,
-            _prepare_market_prices(load_market_prices(db_path, ticker=ticker)),
+            market_ticker,
+            _prepare_market_prices(load_market_prices(db_path, ticker=market_ticker)),
         )
         outcome = _build_single_random_benchmark_outcome(
             signal_id=str(record["signal_id"]),
@@ -615,10 +638,17 @@ def _required_market_tickers(
     random_benchmarks: pd.DataFrame,
     benchmark_ticker: str,
 ) -> list[str]:
-    tickers = {benchmark_ticker.upper()}
-    tickers.update(str(signal.get("ticker", "")).upper() for signal in signal_records if str(signal.get("ticker", "")).strip())
+    tickers = {market_symbol_for_ticker(benchmark_ticker.upper())}
+    tickers.update(
+        market_symbol_for_ticker(str(signal.get("ticker", "")).upper())
+        for signal in signal_records
+        if str(signal.get("ticker", "")).strip()
+    )
     if not random_benchmarks.empty:
-        tickers.update(random_benchmarks["benchmark_ticker"].dropna().astype(str).str.upper().tolist())
+        tickers.update(
+            market_symbol_for_ticker(value)
+            for value in random_benchmarks["benchmark_ticker"].dropna().astype(str).str.upper().tolist()
+        )
     return sorted(ticker for ticker in tickers if ticker)
 
 
@@ -640,14 +670,14 @@ def _ticker_market_windows(
 
     for signal in signal_records:
         signal_time = _coerce_datetime(signal.get("signal_time"))
-        ticker = str(signal.get("ticker", "")).upper()
+        ticker = market_symbol_for_ticker(str(signal.get("ticker", "")).upper())
         if signal_time is None or not ticker:
             continue
         update_window(ticker, signal_time.date())
-        update_window(benchmark_ticker.upper(), signal_time.date())
+        update_window(market_symbol_for_ticker(benchmark_ticker.upper()), signal_time.date())
     if not random_benchmarks.empty:
         for record in random_benchmarks.to_dict(orient="records"):
-            ticker = str(record.get("benchmark_ticker", "")).upper()
+            ticker = market_symbol_for_ticker(str(record.get("benchmark_ticker", "")).upper())
             signal_time = _coerce_datetime(record.get("signal_date"))
             if signal_time is None or not ticker:
                 continue
@@ -998,6 +1028,13 @@ def _coerce_float_or_none(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def market_symbol_for_ticker(ticker: str) -> str:
+    normalized = str(ticker or "").strip().upper()
+    if not normalized:
+        return ""
+    return MARKET_TICKER_ALIASES.get(normalized, normalized)
 
 
 def _now_iso() -> str:
