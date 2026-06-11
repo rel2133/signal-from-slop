@@ -13,6 +13,8 @@ The current prototype covers the dashboard expansion MVP:
 - Extract tickers and company names from a local CSV catalog
 - Send each item to Ollama over `http://localhost:11434/api/chat`
 - Save raw items, classifications, item-level ticker mentions, ticker summaries, and time buckets to SQLite
+- Freeze point-in-time ticker signal events and review them later without hindsight edits
+- Cache free daily market data, benchmark comparisons, Reddit attention-spread outcomes, and manual usefulness labels
 - Explore results in dashboard, trends, and export pages
 
 The Reddit ingestion layer uses public Reddit RSS feeds, so no Reddit API keys are required.
@@ -34,6 +36,7 @@ The Reddit ingestion layer uses public Reddit RSS feeds, so no Reddit API keys a
     ├── database.py
     ├── ollama_classifier.py
     ├── reddit_client.py
+    ├── signal_validation.py
     ├── scoring.py
     └── ticker_extractor.py
 ```
@@ -132,8 +135,9 @@ streamlit run app.py
 3. [signal_from_the_slop/ollama_classifier.py](/Users/rowanellis/Documents/Signal from the Slop/signal_from_the_slop/ollama_classifier.py) sends each item to Ollama using `requests.post(...)` against `/api/chat` and requests strict JSON output.
 4. If Ollama is unavailable or returns invalid JSON, the app falls back to deterministic heuristics so the dashboard remains testable offline.
 5. [signal_from_the_slop/analytics.py](/Users/rowanellis/Documents/Signal from the Slop/signal_from_the_slop/analytics.py) builds long-format mention rows, ticker summaries, and time-bucketed acceleration metrics.
-6. [signal_from_the_slop/database.py](/Users/rowanellis/Documents/Signal from the Slop/signal_from_the_slop/database.py) stores sources, runs, raw items, classifications, long-format mentions, summaries, and trend buckets in SQLite.
-7. [app.py](/Users/rowanellis/Documents/Signal from the Slop/app.py) exposes the Streamlit pages: `Sources`, `Run Analysis`, `Results Dashboard`, `Ticker Trends`, `Export Data`, and `Settings`.
+6. [signal_from_the_slop/signal_validation.py](/Users/rowanellis/Documents/Signal from the Slop/signal_from_the_slop/signal_validation.py) freezes signal events, refreshes cached free market data with `yfinance`, and calculates market plus Reddit attention outcomes.
+7. [signal_from_the_slop/database.py](/Users/rowanellis/Documents/Signal from the Slop/signal_from_the_slop/database.py) stores sources, runs, raw items, classifications, long-format mentions, summaries, trend buckets, signal events, market prices, outcomes, and manual labels in SQLite.
+8. [app.py](/Users/rowanellis/Documents/Signal from the Slop/app.py) exposes the Streamlit pages: `Sources`, `Run Analysis`, `Results Dashboard`, `Ticker Trends`, `Signal Validation`, `Export Data`, and `Settings`.
 
 ## Environment Variables
 

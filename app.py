@@ -48,12 +48,18 @@ from signal_from_the_slop.database import (
     load_run_source_coverage,
     load_run_ticker_summaries,
     load_run_time_buckets,
+    load_signal_attention_outcomes,
+    load_signal_events,
+    load_signal_labels,
+    load_signal_outcomes,
+    load_signal_random_benchmarks,
     load_sources,
     replace_run_classifications,
     replace_run_mentions,
     replace_run_source_coverage,
     replace_run_ticker_summaries,
     replace_run_time_buckets,
+    upsert_signal_label,
     update_sources,
     upsert_reddit_items,
 )
@@ -93,6 +99,7 @@ from signal_from_the_slop.reddit_client import (
     build_subreddit_source,
     parse_source_input,
 )
+from signal_from_the_slop.signal_validation import refresh_signal_validation, run_signal_validation
 from signal_from_the_slop.ticker_extractor import TickerExtractor
 
 
@@ -120,8 +127,9 @@ PAGE_STEPS = [
     {"page": "Run Analysis", "label": "Scrape", "step": "02", "context": "Collect and classify"},
     {"page": "Results Dashboard", "label": "Results", "step": "03", "context": "Review mentions"},
     {"page": "Ticker Trends", "label": "Trends", "step": "04", "context": "Compare scrapes"},
-    {"page": "Export Data", "label": "Export", "step": "05", "context": "Download data"},
-    {"page": "Settings", "label": "Settings", "step": "06", "context": "Storage and model"},
+    {"page": "Signal Validation", "label": "Signals", "step": "05", "context": "Freeze and review"},
+    {"page": "Export Data", "label": "Export", "step": "06", "context": "Download data"},
+    {"page": "Settings", "label": "Settings", "step": "07", "context": "Storage and model"},
 ]
 PAGES = [step["page"] for step in PAGE_STEPS]
 PAGE_LABELS = {step["page"]: step["label"] for step in PAGE_STEPS}
@@ -203,6 +211,17 @@ DEFAULT_UI_PREFERENCES = {
     "watchlist": [],
     "evidence_checks": {},
 }
+SIGNAL_LABEL_OPTIONS = [
+    "Useful lead",
+    "Worth deeper research",
+    "Interesting but no action",
+    "Pure hype",
+    "Already obvious",
+    "Bad ticker extraction",
+    "False positive",
+    "Avoided hype trap",
+    "Not enough information",
+]
 METRIC_GUIDE = [
     {
         "metric": "Mentions",
@@ -885,6 +904,56 @@ def load_scope_ticker_summaries(db_path: Path, scope_id: str | None) -> pd.DataF
     return load_run_ticker_summaries(db_path, scope_id)
 
 
+def load_signal_review_frame(db_path: Path, scope_id: str | None) -> pd.DataFrame:
+    signal_df = load_signal_events(db_path)
+    if signal_df.empty:
+        return signal_df
+    if scope_id and not is_corpus_scope(scope_id):
+        signal_df = signal_df[signal_df["analysis_run_id"].astype(str) == str(scope_id)].copy()
+    if signal_df.empty:
+        return signal_df
+
+    labels_df = load_signal_labels(db_path)
+    outcomes_df = load_signal_outcomes(db_path)
+    attention_df = load_signal_attention_outcomes(db_path)
+    random_df = load_signal_random_benchmarks(db_path)
+
+    review_df = signal_df.copy()
+    if not labels_df.empty:
+        review_df = review_df.merge(labels_df, on="signal_id", how="left")
+    if not outcomes_df.empty:
+        review_df = review_df.merge(outcomes_df, on=["signal_id", "ticker", "signal_time"], how="left", suffixes=("", "_market"))
+    if not attention_df.empty:
+        review_df = review_df.merge(attention_df, on=["signal_id", "ticker", "signal_time"], how="left", suffixes=("", "_attention"))
+    if not random_df.empty:
+        benchmark_summary = (
+            random_df.groupby("signal_id", as_index=False)
+            .agg(
+                random_sample_size=("benchmark_ticker", "nunique"),
+                random_mean_return_7d=("return_7d", "mean"),
+                random_mean_return_30d=("return_30d", "mean"),
+                random_mean_volume_spike_7d=("volume_spike_7d", "mean"),
+            )
+        )
+        review_df = review_df.merge(benchmark_summary, on="signal_id", how="left")
+
+    defaults: dict[str, Any] = {
+        "user_label": "",
+        "user_notes": "",
+        "return_7d": None,
+        "excess_return_7d": None,
+        "attention_spread_7d": None,
+        "attention_spread_14d": None,
+        "attention_spread_30d": None,
+        "attention_outcome_reliability": "",
+    }
+    for column_name, default_value in defaults.items():
+        if column_name not in review_df.columns:
+            review_df[column_name] = default_value
+    review_df["signal_time_dt"] = pd.to_datetime(review_df["signal_time"], errors="coerce", utc=True)
+    return review_df.sort_values(["signal_time_dt", "created_at"], ascending=[False, False], na_position="last")
+
+
 def selected_run_source_ids(run_record: dict[str, Any]) -> list[int]:
     return [int(source_id) for source_id in run_record.get("selected_source_ids", [])]
 
@@ -1083,6 +1152,31 @@ def coerce_int(value: Any, default: int = 0) -> int:
         return int(float(value))
     except (TypeError, ValueError):
         return default
+
+
+def _coerce_float(value: Any, default: float = 0.0) -> float:
+    return coerce_float(value, default)
+
+
+def _format_percent(value: Any) -> str:
+    if value in (None, ""):
+        return "n/a"
+    try:
+        return f"{float(value):+.2%}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _signal_select_label(review_df: pd.DataFrame, signal_id: str) -> str:
+    match = review_df[review_df["signal_id"].astype(str) == str(signal_id)]
+    if match.empty:
+        return str(signal_id)
+    row = match.iloc[0]
+    timestamp = str(row.get("signal_time", ""))[:19].replace("T", " ")
+    ticker = str(row.get("ticker", ""))
+    label = str(row.get("user_label", "") or "")
+    suffix = f" · {label}" if label else ""
+    return f"{timestamp} · {ticker}{suffix}"
 
 
 def coverage_reason_list(value: Any) -> list[str]:
@@ -2673,6 +2767,32 @@ def run_analysis_pipeline(
         replace_run_mentions(db_path, run_id, replaceable_mentions)
         replace_run_ticker_summaries(db_path, run_id, replaceable_summaries)
         replace_run_time_buckets(db_path, run_id, replaceable_buckets)
+        report(
+            stage="validation",
+            message=f"Freezing signal snapshots and refreshing validation outcomes for run {run_id}.",
+            progress_fraction=0.97,
+            progress_current=1,
+            progress_total=1,
+            progress_unit="validation",
+        )
+        try:
+            summary["signal_validation"] = run_signal_validation(
+                db_path=db_path,
+                ticker_path=ticker_path,
+                run_id=run_id,
+                run_config=run_config,
+                summary_df=ticker_summary_df,
+                mentions_df=long_df,
+                signal_time=analysis_run_now_iso(),
+            )
+        except Exception as exc:
+            logging.exception("Signal validation failed for run %s", run_id)
+            summary["signal_validation"] = {
+                "status": "error",
+                "signals_created": 0,
+                "market_dependency_available": False,
+                "market_data_errors": [str(exc)],
+            }
         save_run_artifacts(
             artifacts_dir=artifacts_dir,
             run_id=run_id,
@@ -4740,6 +4860,248 @@ def render_ticker_trends_page(db_path: Path, run_id: str | None) -> None:
         render_ticker_summary_table(summary_df)
 
 
+def render_signal_validation_page(db_path: Path, ticker_path: Path, run_id: str | None) -> None:
+    st.header("Signal Validation")
+    st.caption(
+        "Frozen signal events preserve what the app knew at the time a ticker was flagged, "
+        "then track market outcomes, Reddit attention spread, and human review labels without hindsight edits."
+    )
+
+    action_cols = st.columns([1, 1.2, 2.2])
+    refresh_result: dict[str, Any] | None = None
+    manual_result: dict[str, Any] | None = None
+    if action_cols[0].button("Refresh outcomes", use_container_width=True):
+        with st.spinner("Refreshing market caches and recomputing signal outcomes..."):
+            refresh_result = refresh_signal_validation(
+                db_path=db_path,
+                ticker_path=ticker_path,
+            )
+
+    runs = load_analysis_runs(db_path)
+    current_run_record = None
+    summary_df = pd.DataFrame()
+    mentions_df = pd.DataFrame()
+    if run_id and not is_corpus_scope(run_id):
+        run_rows = runs[runs["analysis_run_id"] == run_id]
+        if not run_rows.empty:
+            current_run_record = run_rows.iloc[0].to_dict()
+            summary_df = load_run_ticker_summaries(db_path, run_id)
+            mentions_df = load_run_mentions(db_path, run_id)
+    if current_run_record and not summary_df.empty:
+        with action_cols[1].popover("Freeze manual signal", use_container_width=True):
+            st.caption("Save a frozen signal snapshot from the currently selected run, even if it was not auto-flagged.")
+            manual_ticker = st.selectbox(
+                "Ticker",
+                summary_df["ticker"].tolist(),
+                key=f"manual_signal_ticker_{run_id}",
+            )
+            if st.button("Save frozen signal", type="primary", use_container_width=True):
+                with st.spinner(f"Freezing manual signal for {manual_ticker}..."):
+                    manual_result = run_signal_validation(
+                        db_path=db_path,
+                        ticker_path=ticker_path,
+                        run_id=str(current_run_record["analysis_run_id"]),
+                        run_config=current_run_record,
+                        summary_df=summary_df,
+                        mentions_df=mentions_df,
+                        signal_time=analysis_run_now_iso(),
+                        manual_tickers=[manual_ticker],
+                        allow_automatic_signals=False,
+                    )
+
+    if refresh_result:
+        if refresh_result.get("status") == "ok":
+            st.success(
+                f"Refreshed {int(refresh_result.get('signals_refreshed', 0))} signal(s). "
+                f"Updated {int(refresh_result.get('market_outcomes_updated', 0))} market outcome row(s)."
+            )
+        else:
+            st.warning(
+                f"Refresh completed with gaps. Signals refreshed: {int(refresh_result.get('signals_refreshed', 0))}. "
+                f"Issues: {', '.join(refresh_result.get('market_data_errors', [])[:3]) or 'see cached data status'}."
+            )
+    if manual_result:
+        created_count = int(manual_result.get("signals_created", 0) or 0)
+        if created_count > 0:
+            st.success(f"Saved {created_count} frozen manual signal event.")
+        else:
+            st.info("No new signal event was created. A recent snapshot for that run/ticker likely already exists.")
+
+    review_df = load_signal_review_frame(db_path, run_id if run_id else CORPUS_SCOPE_ID)
+    if review_df.empty:
+        st.info("No frozen signal events have been created yet. Complete a run, or save a manual signal from the current run.")
+        return
+
+    metric_cols = st.columns(4)
+    labelled_count = int(review_df["user_label"].fillna("").astype(str).str.len().gt(0).sum()) if "user_label" in review_df.columns else 0
+    useful_count = int(
+        review_df["user_label"].fillna("").isin(["Useful lead", "Worth deeper research", "Avoided hype trap"]).sum()
+    ) if "user_label" in review_df.columns else 0
+    avg_excess_7d = review_df["excess_return_7d"].dropna().mean() if "excess_return_7d" in review_df.columns else None
+    avg_attention_14d = review_df["attention_spread_14d"].dropna().mean() if "attention_spread_14d" in review_df.columns else None
+    metric_cols[0].metric("Frozen signals", len(review_df))
+    metric_cols[1].metric("Labelled", labelled_count)
+    metric_cols[2].metric("Useful / deeper", useful_count)
+    metric_cols[3].metric("Avg excess 7d", f"{avg_excess_7d:+.2%}" if pd.notna(avg_excess_7d) else "n/a")
+    if pd.notna(avg_attention_14d):
+        st.caption(f"Average 14d attention spread: {float(avg_attention_14d):.1f}")
+
+    filter_cols = st.columns([1.2, 1, 1, 1])
+    label_options = ["All labels", *SIGNAL_LABEL_OPTIONS]
+    selected_label_filter = filter_cols[0].selectbox("Label filter", label_options, key=f"signal_label_filter_{run_id}")
+    ticker_query = filter_cols[1].text_input("Ticker filter", key=f"signal_ticker_filter_{run_id}").strip().upper()
+    signal_type_filter = filter_cols[2].selectbox("Signal type", ["All", "Auto", "Manual"], key=f"signal_type_filter_{run_id}")
+    reliability_filter = filter_cols[3].selectbox("Attention reliability", ["All", "High", "Medium", "Low"], key=f"signal_reliability_filter_{run_id}")
+
+    filtered_df = review_df.copy()
+    filtered_df["user_label"] = filtered_df["user_label"].fillna("")
+    if selected_label_filter != "All labels":
+        filtered_df = filtered_df[filtered_df["user_label"] == selected_label_filter].copy()
+    if ticker_query:
+        filtered_df = filtered_df[filtered_df["ticker"].astype(str).str.contains(ticker_query, regex=False)].copy()
+    if signal_type_filter == "Auto":
+        filtered_df = filtered_df[~filtered_df["manual_signal"].fillna(False).astype(bool)].copy()
+    elif signal_type_filter == "Manual":
+        filtered_df = filtered_df[filtered_df["manual_signal"].fillna(False).astype(bool)].copy()
+    if reliability_filter != "All" and "attention_outcome_reliability" in filtered_df.columns:
+        filtered_df = filtered_df[
+            filtered_df["attention_outcome_reliability"].fillna("").astype(str) == reliability_filter
+        ].copy()
+
+    if filtered_df.empty:
+        st.info("No frozen signals matched those filters.")
+        return
+
+    st.dataframe(
+        filtered_df[
+            [
+                "signal_time",
+                "ticker",
+                "company_name",
+                "signal_rank",
+                "manual_signal",
+                "emerging_ticker_score",
+                "adjusted_acceleration_score",
+                "alpha_signal_score",
+                "hype_score",
+                "trend_reliability",
+                "coverage_reliability",
+                "return_7d",
+                "excess_return_7d",
+                "attention_spread_14d",
+                "user_label",
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "signal_time": st.column_config.TextColumn("Signal time", width="medium"),
+            "manual_signal": st.column_config.CheckboxColumn("Manual"),
+            "emerging_ticker_score": st.column_config.NumberColumn("Emerging", format="%.1f"),
+            "adjusted_acceleration_score": st.column_config.NumberColumn("Adj. accel.", format="%.1f"),
+            "alpha_signal_score": st.column_config.NumberColumn("Alpha", format="%.1f"),
+            "hype_score": st.column_config.NumberColumn("Hype", format="%.1f"),
+            "coverage_reliability": st.column_config.NumberColumn("Coverage", format="%.2f"),
+            "return_7d": st.column_config.NumberColumn("Return 7d", format="%.2f"),
+            "excess_return_7d": st.column_config.NumberColumn("Excess 7d", format="%.2f"),
+            "attention_spread_14d": st.column_config.NumberColumn("Attention 14d", format="%.1f"),
+        },
+    )
+
+    signal_options = filtered_df["signal_id"].astype(str).tolist()
+    selected_signal_id = st.selectbox(
+        "Signal event",
+        signal_options,
+        format_func=lambda value: _signal_select_label(filtered_df, value),
+        key=f"selected_signal_event_{run_id}",
+    )
+    selected_signal = filtered_df[filtered_df["signal_id"].astype(str) == str(selected_signal_id)].iloc[0].to_dict()
+
+    st.subheader(f"{selected_signal['ticker']} signal snapshot")
+    detail_cols = st.columns(6)
+    detail_cols[0].metric("Emerging", f"{_coerce_float(selected_signal.get('emerging_ticker_score')):.1f}")
+    detail_cols[1].metric("Adj. accel.", f"{_coerce_float(selected_signal.get('adjusted_acceleration_score')):.1f}")
+    detail_cols[2].metric("Alpha", f"{_coerce_float(selected_signal.get('alpha_signal_score')):.1f}")
+    detail_cols[3].metric("Hype", f"{_coerce_float(selected_signal.get('hype_score')):.1f}")
+    detail_cols[4].metric("Return 7d", f"{_format_percent(selected_signal.get('return_7d'))}")
+    detail_cols[5].metric("Excess 7d", f"{_format_percent(selected_signal.get('excess_return_7d'))}")
+
+    secondary_cols = st.columns(5)
+    secondary_cols[0].metric("Attention 7d", f"{_coerce_float(selected_signal.get('attention_spread_7d')):.1f}")
+    secondary_cols[1].metric("Attention 30d", f"{_coerce_float(selected_signal.get('attention_spread_30d')):.1f}")
+    secondary_cols[2].metric("Share of voice", f"{_format_percent(_coerce_float(selected_signal.get('share_of_voice')) / 100)}")
+    secondary_cols[3].metric("Trend reliability", str(selected_signal.get("trend_reliability", "")) or "n/a")
+    secondary_cols[4].metric("Coverage", f"{_coerce_float(selected_signal.get('coverage_reliability')):.2f}")
+
+    with st.expander("Frozen evidence snapshot", expanded=True):
+        evidence_titles = selected_signal.get("top_evidence_titles", []) or []
+        evidence_excerpts = selected_signal.get("top_evidence_excerpts", []) or []
+        evidence_ids = selected_signal.get("top_evidence_item_ids", []) or []
+        if not evidence_titles:
+            st.caption("No evidence snapshot was stored for this signal.")
+        else:
+            for idx, title in enumerate(evidence_titles, start=1):
+                excerpt = evidence_excerpts[idx - 1] if idx - 1 < len(evidence_excerpts) else ""
+                item_id = evidence_ids[idx - 1] if idx - 1 < len(evidence_ids) else ""
+                st.markdown(f"**{idx}. {title}**")
+                if excerpt:
+                    st.caption(excerpt)
+                if item_id:
+                    st.caption(f"Item ID: `{item_id}`")
+
+    random_df = load_signal_random_benchmarks(db_path, signal_id=str(selected_signal_id))
+    if not random_df.empty:
+        sample_mean_7d = random_df["return_7d"].dropna().mean()
+        sample_mean_30d = random_df["return_30d"].dropna().mean()
+        sample_cols = st.columns(3)
+        sample_cols[0].metric("Random sample", int(random_df["benchmark_ticker"].nunique()))
+        sample_cols[1].metric("Random avg 7d", _format_percent(sample_mean_7d))
+        sample_cols[2].metric("Random avg 30d", _format_percent(sample_mean_30d))
+        with st.expander("Random benchmark sample", expanded=False):
+            st.dataframe(
+                random_df[
+                    [
+                        "benchmark_ticker",
+                        "sample_index",
+                        "return_7d",
+                        "return_30d",
+                        "max_gain_7d",
+                        "max_drawdown_7d",
+                        "volume_spike_7d",
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    current_label = str(selected_signal.get("user_label", "") or "")
+    label_options_with_blank = ["", *SIGNAL_LABEL_OPTIONS]
+    current_label_index = label_options_with_blank.index(current_label) if current_label in label_options_with_blank else 0
+    with st.form(f"signal_label_form_{selected_signal_id}"):
+        st.caption("Manual labels are stored against the frozen signal event, not the moving live corpus.")
+        selected_label = st.selectbox(
+            "Manual label",
+            label_options_with_blank,
+            index=current_label_index,
+            format_func=lambda value: value if value else "Unlabeled",
+        )
+        user_notes = st.text_area(
+            "Review notes",
+            value=str(selected_signal.get("user_notes", "") or ""),
+            height=140,
+        )
+        submitted = st.form_submit_button("Save label", type="primary")
+        if submitted:
+            upsert_signal_label(
+                db_path,
+                signal_id=str(selected_signal_id),
+                user_label=selected_label,
+                user_notes=user_notes,
+            )
+            st.success("Signal label saved.")
+            st.rerun()
+
+
 def render_export_page(db_path: Path, run_id: str | None) -> None:
     st.header("Export Data")
     if not run_id:
@@ -4815,15 +5177,45 @@ def render_export_page(db_path: Path, run_id: str | None) -> None:
         mime="application/json",
     )
 
+    signal_review_df = load_signal_review_frame(db_path, run_id if run_id else CORPUS_SCOPE_ID)
+    if not signal_review_df.empty:
+        st.subheader("Signal validation exports")
+        st.caption("These files export frozen signal snapshots, linked outcomes, and manual labels.")
+        st.download_button(
+            "Download frozen signal events CSV",
+            signal_review_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"{export_id}_signal_events.csv",
+            mime="text/csv",
+        )
+        signal_ids = set(signal_review_df["signal_id"].astype(str).tolist())
+        random_benchmarks_df = load_signal_random_benchmarks(db_path)
+        if not random_benchmarks_df.empty:
+            random_benchmarks_df = random_benchmarks_df[
+                random_benchmarks_df["signal_id"].astype(str).isin(signal_ids)
+            ].copy()
+        signal_payload = {
+            "analysis_scope": export_id,
+            "signal_events": signal_review_df.to_dict(orient="records"),
+            "random_benchmarks": random_benchmarks_df.to_dict(orient="records") if not random_benchmarks_df.empty else [],
+        }
+        st.download_button(
+            "Download signal validation JSON",
+            json.dumps(signal_payload, indent=2).encode("utf-8"),
+            file_name=f"{export_id}_signal_validation.json",
+            mime="application/json",
+        )
+
 
 def render_settings_page(db_path: Path, ticker_path: Path, artifacts_dir: Path) -> None:
     st.header("Settings")
     overview = db_overview(db_path)
-    overview_cols = st.columns(4)
+    overview_cols = st.columns(6)
     overview_cols[0].metric("Sources", overview["sources"])
     overview_cols[1].metric("Analysis runs", overview["analysis_runs"])
     overview_cols[2].metric("Reddit items", overview["reddit_items"])
     overview_cols[3].metric("Mention rows", overview["item_ticker_mentions"])
+    overview_cols[4].metric("Signal events", overview.get("ticker_signal_events", 0))
+    overview_cols[5].metric("Market rows", overview.get("ticker_market_prices", 0))
 
     settings_tab, guide_tab, runs_tab, prefs_tab = st.tabs(["Diagnostics", "Metric Guide", "Runs", "Preferences"])
 
@@ -4997,6 +5389,8 @@ elif page == "Results Dashboard":
     render_results_dashboard_page(DEFAULT_DB_PATH, selected_run_id)
 elif page == "Ticker Trends":
     render_ticker_trends_page(DEFAULT_DB_PATH, selected_run_id)
+elif page == "Signal Validation":
+    render_signal_validation_page(DEFAULT_DB_PATH, DEFAULT_TICKER_PATH, selected_run_id)
 elif page == "Export Data":
     render_export_page(DEFAULT_DB_PATH, selected_run_id)
 elif page == "Settings":

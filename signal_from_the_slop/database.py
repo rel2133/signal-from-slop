@@ -16,6 +16,9 @@ JSON_COLUMNS = {
     "company_names",
     "red_flags",
     "claims_to_verify",
+    "top_evidence_item_ids",
+    "top_evidence_titles",
+    "top_evidence_excerpts",
 }
 
 
@@ -813,6 +816,432 @@ def load_full_results_records(db_path: str | Path, analysis_run_id: str) -> list
     return mentions.to_dict(orient="records")
 
 
+def create_signal_event(db_path: str | Path, row: dict[str, Any]) -> str:
+    signal_id = str(row.get("signal_id") or f"signal_{uuid.uuid4().hex[:12]}")
+    payload = (
+        signal_id,
+        str(row.get("ticker", "")).upper(),
+        str(row.get("company_name", "Unknown") or "Unknown"),
+        str(row.get("signal_time", "")),
+        row.get("analysis_run_id"),
+        str(row.get("run_type", "")),
+        str(row.get("source_set_hash", "")),
+        int(row.get("signal_rank", 0) or 0),
+        float(row.get("emerging_ticker_score", 0) or 0),
+        float(row.get("adjusted_acceleration_score", 0) or 0),
+        float(row.get("alpha_signal_score", 0) or 0),
+        float(row.get("hype_score", 0) or 0),
+        float(row.get("hype_adjusted_signal_score", 0) or 0),
+        float(row.get("evidence_quality", 0) or 0),
+        float(row.get("claim_specificity_score", 0) or 0),
+        float(row.get("source_diversity", 0) or 0),
+        float(row.get("controversy_score", 0) or 0),
+        float(row.get("mention_rate", 0) or 0),
+        float(row.get("thread_rate", 0) or 0),
+        float(row.get("author_rate", 0) or 0),
+        _nullable_float(row.get("share_of_voice")),
+        str(row.get("trend_reliability", "")),
+        float(row.get("coverage_reliability", 0) or 0),
+        json.dumps(row.get("top_evidence_item_ids", []), ensure_ascii=True),
+        json.dumps(row.get("top_evidence_titles", []), ensure_ascii=True),
+        json.dumps(row.get("top_evidence_excerpts", []), ensure_ascii=True),
+        str(row.get("scoring_version", "")),
+        int(bool(row.get("manual_signal", False))),
+        str(row.get("created_at", _now_iso())),
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO ticker_signal_events (
+                signal_id, ticker, company_name, signal_time, analysis_run_id,
+                run_type, source_set_hash, signal_rank, emerging_ticker_score,
+                adjusted_acceleration_score, alpha_signal_score, hype_score,
+                hype_adjusted_signal_score, evidence_quality,
+                claim_specificity_score, source_diversity, controversy_score,
+                mention_rate, thread_rate, author_rate, share_of_voice,
+                trend_reliability, coverage_reliability, top_evidence_item_ids,
+                top_evidence_titles, top_evidence_excerpts, scoring_version,
+                manual_signal, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            payload,
+        )
+        conn.commit()
+    return signal_id
+
+
+def load_signal_events(
+    db_path: str | Path,
+    *,
+    analysis_run_id: str | None = None,
+    ticker: str | None = None,
+    limit: int | None = None,
+) -> pd.DataFrame:
+    query = """
+        SELECT *
+        FROM ticker_signal_events
+        WHERE 1 = 1
+    """
+    params: list[Any] = []
+    if analysis_run_id:
+        query += " AND analysis_run_id = ?"
+        params.append(analysis_run_id)
+    if ticker:
+        query += " AND ticker = ?"
+        params.append(str(ticker).upper())
+    query += " ORDER BY signal_time DESC, created_at DESC"
+    if limit is not None:
+        query += f" LIMIT {max(int(limit), 0)}"
+    return _load_table(db_path, query, tuple(params))
+
+
+def load_signal_event(db_path: str | Path, signal_id: str) -> dict[str, Any] | None:
+    frame = _load_table(
+        db_path,
+        """
+        SELECT *
+        FROM ticker_signal_events
+        WHERE signal_id = ?
+        LIMIT 1
+        """,
+        (signal_id,),
+    )
+    if frame.empty:
+        return None
+    return frame.iloc[0].to_dict()
+
+
+def upsert_market_prices(db_path: str | Path, rows: Iterable[dict[str, Any]]) -> None:
+    payload = [
+        (
+            str(row.get("ticker", "")).upper(),
+            str(row.get("date", "")),
+            _nullable_float(row.get("open")),
+            _nullable_float(row.get("high")),
+            _nullable_float(row.get("low")),
+            _nullable_float(row.get("close")),
+            _nullable_float(row.get("adjusted_close")),
+            _nullable_float(row.get("volume")),
+            str(row.get("data_source", "yfinance")),
+            str(row.get("fetched_at", _now_iso())),
+        )
+        for row in rows
+        if str(row.get("ticker", "")).strip() and str(row.get("date", "")).strip()
+    ]
+    if not payload:
+        return
+    with sqlite3.connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO ticker_market_prices (
+                ticker, date, open, high, low, close, adjusted_close, volume,
+                data_source, fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(ticker, date) DO UPDATE SET
+                open=excluded.open,
+                high=excluded.high,
+                low=excluded.low,
+                close=excluded.close,
+                adjusted_close=excluded.adjusted_close,
+                volume=excluded.volume,
+                data_source=excluded.data_source,
+                fetched_at=excluded.fetched_at
+            """,
+            payload,
+        )
+        conn.commit()
+
+
+def load_market_prices(
+    db_path: str | Path,
+    *,
+    ticker: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> pd.DataFrame:
+    query = """
+        SELECT *
+        FROM ticker_market_prices
+        WHERE ticker = ?
+    """
+    params: list[Any] = [str(ticker).upper()]
+    if start_date:
+        query += " AND date >= ?"
+        params.append(start_date)
+    if end_date:
+        query += " AND date <= ?"
+        params.append(end_date)
+    query += " ORDER BY date"
+    return _load_table(db_path, query, tuple(params))
+
+
+def upsert_signal_outcomes(db_path: str | Path, rows: Iterable[dict[str, Any]]) -> None:
+    payload = [
+        (
+            str(row.get("signal_id", "")),
+            str(row.get("ticker", "")).upper(),
+            str(row.get("signal_time", "")),
+            _nullable_float(row.get("price_at_signal")),
+            _nullable_float(row.get("return_1d")),
+            _nullable_float(row.get("return_3d")),
+            _nullable_float(row.get("return_7d")),
+            _nullable_float(row.get("return_14d")),
+            _nullable_float(row.get("return_30d")),
+            _nullable_float(row.get("max_gain_7d")),
+            _nullable_float(row.get("max_gain_14d")),
+            _nullable_float(row.get("max_gain_30d")),
+            _nullable_float(row.get("max_drawdown_7d")),
+            _nullable_float(row.get("max_drawdown_14d")),
+            _nullable_float(row.get("max_drawdown_30d")),
+            _nullable_float(row.get("volume_spike_3d")),
+            _nullable_float(row.get("volume_spike_7d")),
+            _nullable_float(row.get("volume_spike_14d")),
+            _nullable_float(row.get("volume_spike_30d")),
+            _nullable_float(row.get("abnormal_volume_7d")),
+            _nullable_float(row.get("abnormal_volume_30d")),
+            _nullable_float(row.get("benchmark_return_7d")),
+            _nullable_float(row.get("benchmark_return_30d")),
+            _nullable_float(row.get("excess_return_7d")),
+            _nullable_float(row.get("excess_return_30d")),
+            str(row.get("outcome_last_updated", _now_iso())),
+        )
+        for row in rows
+        if str(row.get("signal_id", "")).strip()
+    ]
+    if not payload:
+        return
+    with sqlite3.connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO ticker_signal_outcomes (
+                signal_id, ticker, signal_time, price_at_signal, return_1d,
+                return_3d, return_7d, return_14d, return_30d, max_gain_7d,
+                max_gain_14d, max_gain_30d, max_drawdown_7d, max_drawdown_14d,
+                max_drawdown_30d, volume_spike_3d, volume_spike_7d,
+                volume_spike_14d, volume_spike_30d, abnormal_volume_7d,
+                abnormal_volume_30d, benchmark_return_7d, benchmark_return_30d,
+                excess_return_7d, excess_return_30d, outcome_last_updated
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(signal_id) DO UPDATE SET
+                ticker=excluded.ticker,
+                signal_time=excluded.signal_time,
+                price_at_signal=excluded.price_at_signal,
+                return_1d=excluded.return_1d,
+                return_3d=excluded.return_3d,
+                return_7d=excluded.return_7d,
+                return_14d=excluded.return_14d,
+                return_30d=excluded.return_30d,
+                max_gain_7d=excluded.max_gain_7d,
+                max_gain_14d=excluded.max_gain_14d,
+                max_gain_30d=excluded.max_gain_30d,
+                max_drawdown_7d=excluded.max_drawdown_7d,
+                max_drawdown_14d=excluded.max_drawdown_14d,
+                max_drawdown_30d=excluded.max_drawdown_30d,
+                volume_spike_3d=excluded.volume_spike_3d,
+                volume_spike_7d=excluded.volume_spike_7d,
+                volume_spike_14d=excluded.volume_spike_14d,
+                volume_spike_30d=excluded.volume_spike_30d,
+                abnormal_volume_7d=excluded.abnormal_volume_7d,
+                abnormal_volume_30d=excluded.abnormal_volume_30d,
+                benchmark_return_7d=excluded.benchmark_return_7d,
+                benchmark_return_30d=excluded.benchmark_return_30d,
+                excess_return_7d=excluded.excess_return_7d,
+                excess_return_30d=excluded.excess_return_30d,
+                outcome_last_updated=excluded.outcome_last_updated
+            """,
+            payload,
+        )
+        conn.commit()
+
+
+def load_signal_outcomes(db_path: str | Path, *, signal_id: str | None = None) -> pd.DataFrame:
+    query = "SELECT * FROM ticker_signal_outcomes"
+    params: tuple[Any, ...] = ()
+    if signal_id:
+        query += " WHERE signal_id = ?"
+        params = (signal_id,)
+    query += " ORDER BY outcome_last_updated DESC"
+    return _load_table(db_path, query, params)
+
+
+def upsert_signal_attention_outcomes(db_path: str | Path, rows: Iterable[dict[str, Any]]) -> None:
+    payload = [
+        (
+            str(row.get("signal_id", "")),
+            str(row.get("ticker", "")).upper(),
+            str(row.get("signal_time", "")),
+            int(row.get("future_mentions_7d", 0) or 0),
+            int(row.get("future_mentions_14d", 0) or 0),
+            int(row.get("future_mentions_30d", 0) or 0),
+            int(row.get("future_unique_threads_7d", 0) or 0),
+            int(row.get("future_unique_threads_14d", 0) or 0),
+            int(row.get("future_unique_threads_30d", 0) or 0),
+            int(row.get("future_unique_authors_7d", 0) or 0),
+            int(row.get("future_unique_authors_14d", 0) or 0),
+            int(row.get("future_unique_authors_30d", 0) or 0),
+            int(row.get("future_source_count_7d", 0) or 0),
+            int(row.get("future_source_count_14d", 0) or 0),
+            int(row.get("future_source_count_30d", 0) or 0),
+            _nullable_float(row.get("future_share_of_voice_7d")),
+            _nullable_float(row.get("future_share_of_voice_14d")),
+            _nullable_float(row.get("future_share_of_voice_30d")),
+            _nullable_float(row.get("attention_spread_7d")),
+            _nullable_float(row.get("attention_spread_14d")),
+            _nullable_float(row.get("attention_spread_30d")),
+            str(row.get("attention_outcome_reliability", "Low")),
+            str(row.get("outcome_last_updated", _now_iso())),
+        )
+        for row in rows
+        if str(row.get("signal_id", "")).strip()
+    ]
+    if not payload:
+        return
+    with sqlite3.connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO ticker_signal_attention_outcomes (
+                signal_id, ticker, signal_time, future_mentions_7d,
+                future_mentions_14d, future_mentions_30d,
+                future_unique_threads_7d, future_unique_threads_14d,
+                future_unique_threads_30d, future_unique_authors_7d,
+                future_unique_authors_14d, future_unique_authors_30d,
+                future_source_count_7d, future_source_count_14d,
+                future_source_count_30d, future_share_of_voice_7d,
+                future_share_of_voice_14d, future_share_of_voice_30d,
+                attention_spread_7d, attention_spread_14d, attention_spread_30d,
+                attention_outcome_reliability, outcome_last_updated
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(signal_id) DO UPDATE SET
+                ticker=excluded.ticker,
+                signal_time=excluded.signal_time,
+                future_mentions_7d=excluded.future_mentions_7d,
+                future_mentions_14d=excluded.future_mentions_14d,
+                future_mentions_30d=excluded.future_mentions_30d,
+                future_unique_threads_7d=excluded.future_unique_threads_7d,
+                future_unique_threads_14d=excluded.future_unique_threads_14d,
+                future_unique_threads_30d=excluded.future_unique_threads_30d,
+                future_unique_authors_7d=excluded.future_unique_authors_7d,
+                future_unique_authors_14d=excluded.future_unique_authors_14d,
+                future_unique_authors_30d=excluded.future_unique_authors_30d,
+                future_source_count_7d=excluded.future_source_count_7d,
+                future_source_count_14d=excluded.future_source_count_14d,
+                future_source_count_30d=excluded.future_source_count_30d,
+                future_share_of_voice_7d=excluded.future_share_of_voice_7d,
+                future_share_of_voice_14d=excluded.future_share_of_voice_14d,
+                future_share_of_voice_30d=excluded.future_share_of_voice_30d,
+                attention_spread_7d=excluded.attention_spread_7d,
+                attention_spread_14d=excluded.attention_spread_14d,
+                attention_spread_30d=excluded.attention_spread_30d,
+                attention_outcome_reliability=excluded.attention_outcome_reliability,
+                outcome_last_updated=excluded.outcome_last_updated
+            """,
+            payload,
+        )
+        conn.commit()
+
+
+def load_signal_attention_outcomes(db_path: str | Path, *, signal_id: str | None = None) -> pd.DataFrame:
+    query = "SELECT * FROM ticker_signal_attention_outcomes"
+    params: tuple[Any, ...] = ()
+    if signal_id:
+        query += " WHERE signal_id = ?"
+        params = (signal_id,)
+    query += " ORDER BY outcome_last_updated DESC"
+    return _load_table(db_path, query, params)
+
+
+def upsert_signal_label(db_path: str | Path, *, signal_id: str, user_label: str, user_notes: str = "") -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO ticker_signal_labels (
+                signal_id, user_label, user_notes, user_label_updated_at
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(signal_id) DO UPDATE SET
+                user_label=excluded.user_label,
+                user_notes=excluded.user_notes,
+                user_label_updated_at=excluded.user_label_updated_at
+            """,
+            (signal_id, user_label, user_notes, _now_iso()),
+        )
+        conn.commit()
+
+
+def load_signal_labels(db_path: str | Path, *, signal_id: str | None = None) -> pd.DataFrame:
+    query = "SELECT * FROM ticker_signal_labels"
+    params: tuple[Any, ...] = ()
+    if signal_id:
+        query += " WHERE signal_id = ?"
+        params = (signal_id,)
+    query += " ORDER BY user_label_updated_at DESC"
+    return _load_table(db_path, query, params)
+
+
+def upsert_signal_random_benchmarks(db_path: str | Path, rows: Iterable[dict[str, Any]]) -> None:
+    payload = [
+        (
+            str(row.get("signal_id", "")),
+            str(row.get("benchmark_ticker", "")).upper(),
+            int(row.get("sample_index", 0) or 0),
+            str(row.get("universe_name", "")),
+            str(row.get("sample_seed", "")),
+            str(row.get("signal_date", "")),
+            _nullable_float(row.get("price_at_signal")),
+            _nullable_float(row.get("return_7d")),
+            _nullable_float(row.get("return_30d")),
+            _nullable_float(row.get("max_gain_7d")),
+            _nullable_float(row.get("max_drawdown_7d")),
+            _nullable_float(row.get("volume_spike_7d")),
+            _nullable_float(row.get("volume_spike_30d")),
+            str(row.get("outcome_last_updated", _now_iso())),
+        )
+        for row in rows
+        if str(row.get("signal_id", "")).strip() and str(row.get("benchmark_ticker", "")).strip()
+    ]
+    if not payload:
+        return
+    with sqlite3.connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO ticker_signal_random_benchmarks (
+                signal_id, benchmark_ticker, sample_index, universe_name,
+                sample_seed, signal_date, price_at_signal, return_7d,
+                return_30d, max_gain_7d, max_drawdown_7d, volume_spike_7d,
+                volume_spike_30d, outcome_last_updated
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(signal_id, benchmark_ticker) DO UPDATE SET
+                sample_index=excluded.sample_index,
+                universe_name=excluded.universe_name,
+                sample_seed=excluded.sample_seed,
+                signal_date=excluded.signal_date,
+                price_at_signal=excluded.price_at_signal,
+                return_7d=excluded.return_7d,
+                return_30d=excluded.return_30d,
+                max_gain_7d=excluded.max_gain_7d,
+                max_drawdown_7d=excluded.max_drawdown_7d,
+                volume_spike_7d=excluded.volume_spike_7d,
+                volume_spike_30d=excluded.volume_spike_30d,
+                outcome_last_updated=excluded.outcome_last_updated
+            """,
+            payload,
+        )
+        conn.commit()
+
+
+def load_signal_random_benchmarks(
+    db_path: str | Path,
+    *,
+    signal_id: str | None = None,
+) -> pd.DataFrame:
+    query = "SELECT * FROM ticker_signal_random_benchmarks"
+    params: tuple[Any, ...] = ()
+    if signal_id:
+        query += " WHERE signal_id = ?"
+        params = (signal_id,)
+    query += " ORDER BY signal_id, sample_index, benchmark_ticker"
+    return _load_table(db_path, query, params)
+
+
 def db_overview(db_path: str | Path) -> dict[str, int]:
     with sqlite3.connect(db_path) as conn:
         return {
@@ -820,6 +1249,8 @@ def db_overview(db_path: str | Path) -> dict[str, int]:
             "analysis_runs": _count_rows(conn, "analysis_runs"),
             "reddit_items": _count_rows(conn, "reddit_items"),
             "item_ticker_mentions": _count_rows(conn, "item_ticker_mentions"),
+            "ticker_signal_events": _count_rows(conn, "ticker_signal_events"),
+            "ticker_market_prices": _count_rows(conn, "ticker_market_prices"),
         }
 
 
@@ -849,6 +1280,7 @@ def _decode_json_columns(frame: pd.DataFrame) -> pd.DataFrame:
         "hit_post_cap",
         "hit_rss_cap",
         "include_comments",
+        "manual_signal",
         "rate_limited",
         "run_deeper_analysis",
         "needs_deeper_analysis",

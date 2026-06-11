@@ -250,6 +250,137 @@ CREATE TABLE IF NOT EXISTS ticker_time_buckets (
     FOREIGN KEY (analysis_run_id) REFERENCES analysis_runs(analysis_run_id)
 );
 
+CREATE TABLE IF NOT EXISTS ticker_signal_events (
+    signal_id TEXT PRIMARY KEY,
+    ticker TEXT NOT NULL,
+    company_name TEXT NOT NULL DEFAULT 'Unknown',
+    signal_time TEXT NOT NULL,
+    analysis_run_id TEXT,
+    run_type TEXT NOT NULL,
+    source_set_hash TEXT NOT NULL,
+    signal_rank INTEGER NOT NULL DEFAULT 0,
+    emerging_ticker_score REAL NOT NULL DEFAULT 0,
+    adjusted_acceleration_score REAL NOT NULL DEFAULT 0,
+    alpha_signal_score REAL NOT NULL DEFAULT 0,
+    hype_score REAL NOT NULL DEFAULT 0,
+    hype_adjusted_signal_score REAL NOT NULL DEFAULT 0,
+    evidence_quality REAL NOT NULL DEFAULT 0,
+    claim_specificity_score REAL NOT NULL DEFAULT 0,
+    source_diversity REAL NOT NULL DEFAULT 0,
+    controversy_score REAL NOT NULL DEFAULT 0,
+    mention_rate REAL NOT NULL DEFAULT 0,
+    thread_rate REAL NOT NULL DEFAULT 0,
+    author_rate REAL NOT NULL DEFAULT 0,
+    share_of_voice REAL,
+    trend_reliability TEXT NOT NULL DEFAULT '',
+    coverage_reliability REAL NOT NULL DEFAULT 0,
+    top_evidence_item_ids TEXT NOT NULL DEFAULT '[]',
+    top_evidence_titles TEXT NOT NULL DEFAULT '[]',
+    top_evidence_excerpts TEXT NOT NULL DEFAULT '[]',
+    scoring_version TEXT NOT NULL DEFAULT '',
+    manual_signal INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (analysis_run_id) REFERENCES analysis_runs(analysis_run_id)
+);
+
+CREATE TABLE IF NOT EXISTS ticker_market_prices (
+    ticker TEXT NOT NULL,
+    date TEXT NOT NULL,
+    open REAL,
+    high REAL,
+    low REAL,
+    close REAL,
+    adjusted_close REAL,
+    volume REAL,
+    data_source TEXT NOT NULL DEFAULT 'yfinance',
+    fetched_at TEXT NOT NULL,
+    PRIMARY KEY (ticker, date)
+);
+
+CREATE TABLE IF NOT EXISTS ticker_signal_outcomes (
+    signal_id TEXT PRIMARY KEY,
+    ticker TEXT NOT NULL,
+    signal_time TEXT NOT NULL,
+    price_at_signal REAL,
+    return_1d REAL,
+    return_3d REAL,
+    return_7d REAL,
+    return_14d REAL,
+    return_30d REAL,
+    max_gain_7d REAL,
+    max_gain_14d REAL,
+    max_gain_30d REAL,
+    max_drawdown_7d REAL,
+    max_drawdown_14d REAL,
+    max_drawdown_30d REAL,
+    volume_spike_3d REAL,
+    volume_spike_7d REAL,
+    volume_spike_14d REAL,
+    volume_spike_30d REAL,
+    abnormal_volume_7d REAL,
+    abnormal_volume_30d REAL,
+    benchmark_return_7d REAL,
+    benchmark_return_30d REAL,
+    excess_return_7d REAL,
+    excess_return_30d REAL,
+    outcome_last_updated TEXT NOT NULL,
+    FOREIGN KEY (signal_id) REFERENCES ticker_signal_events(signal_id)
+);
+
+CREATE TABLE IF NOT EXISTS ticker_signal_attention_outcomes (
+    signal_id TEXT PRIMARY KEY,
+    ticker TEXT NOT NULL,
+    signal_time TEXT NOT NULL,
+    future_mentions_7d INTEGER NOT NULL DEFAULT 0,
+    future_mentions_14d INTEGER NOT NULL DEFAULT 0,
+    future_mentions_30d INTEGER NOT NULL DEFAULT 0,
+    future_unique_threads_7d INTEGER NOT NULL DEFAULT 0,
+    future_unique_threads_14d INTEGER NOT NULL DEFAULT 0,
+    future_unique_threads_30d INTEGER NOT NULL DEFAULT 0,
+    future_unique_authors_7d INTEGER NOT NULL DEFAULT 0,
+    future_unique_authors_14d INTEGER NOT NULL DEFAULT 0,
+    future_unique_authors_30d INTEGER NOT NULL DEFAULT 0,
+    future_source_count_7d INTEGER NOT NULL DEFAULT 0,
+    future_source_count_14d INTEGER NOT NULL DEFAULT 0,
+    future_source_count_30d INTEGER NOT NULL DEFAULT 0,
+    future_share_of_voice_7d REAL,
+    future_share_of_voice_14d REAL,
+    future_share_of_voice_30d REAL,
+    attention_spread_7d REAL,
+    attention_spread_14d REAL,
+    attention_spread_30d REAL,
+    attention_outcome_reliability TEXT NOT NULL DEFAULT 'Low',
+    outcome_last_updated TEXT NOT NULL,
+    FOREIGN KEY (signal_id) REFERENCES ticker_signal_events(signal_id)
+);
+
+CREATE TABLE IF NOT EXISTS ticker_signal_labels (
+    signal_id TEXT PRIMARY KEY,
+    user_label TEXT NOT NULL,
+    user_notes TEXT NOT NULL DEFAULT '',
+    user_label_updated_at TEXT NOT NULL,
+    FOREIGN KEY (signal_id) REFERENCES ticker_signal_events(signal_id)
+);
+
+CREATE TABLE IF NOT EXISTS ticker_signal_random_benchmarks (
+    signal_id TEXT NOT NULL,
+    benchmark_ticker TEXT NOT NULL,
+    sample_index INTEGER NOT NULL,
+    universe_name TEXT NOT NULL DEFAULT '',
+    sample_seed TEXT NOT NULL DEFAULT '',
+    signal_date TEXT NOT NULL,
+    price_at_signal REAL,
+    return_7d REAL,
+    return_30d REAL,
+    max_gain_7d REAL,
+    max_drawdown_7d REAL,
+    volume_spike_7d REAL,
+    volume_spike_30d REAL,
+    outcome_last_updated TEXT NOT NULL,
+    PRIMARY KEY (signal_id, benchmark_ticker),
+    FOREIGN KEY (signal_id) REFERENCES ticker_signal_events(signal_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_sources_active ON sources(active);
 CREATE INDEX IF NOT EXISTS idx_runs_completed ON analysis_runs(completed_at);
 CREATE INDEX IF NOT EXISTS idx_runs_type ON analysis_runs(run_type, canonical_trend_run);
@@ -257,3 +388,7 @@ CREATE INDEX IF NOT EXISTS idx_source_coverage_run ON scrape_source_coverage(ana
 CREATE INDEX IF NOT EXISTS idx_mentions_run_time ON item_ticker_mentions(analysis_run_id, created_time);
 CREATE INDEX IF NOT EXISTS idx_mentions_run_ticker ON item_ticker_mentions(analysis_run_id, ticker);
 CREATE INDEX IF NOT EXISTS idx_buckets_run_ticker ON ticker_time_buckets(analysis_run_id, ticker);
+CREATE INDEX IF NOT EXISTS idx_signal_events_ticker_time ON ticker_signal_events(ticker, signal_time DESC);
+CREATE INDEX IF NOT EXISTS idx_signal_events_run ON ticker_signal_events(analysis_run_id, signal_time DESC);
+CREATE INDEX IF NOT EXISTS idx_market_prices_ticker_date ON ticker_market_prices(ticker, date);
+CREATE INDEX IF NOT EXISTS idx_signal_random_signal ON ticker_signal_random_benchmarks(signal_id);
