@@ -1179,6 +1179,28 @@ def _signal_select_label(review_df: pd.DataFrame, signal_id: str) -> str:
     return f"{timestamp} · {ticker}{suffix}"
 
 
+def json_safe_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): json_safe_value(inner_value) for key, inner_value in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [json_safe_value(inner_value) for inner_value in value]
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    if hasattr(value, "item") and not isinstance(value, (str, bytes)):
+        try:
+            value = value.item()
+        except Exception:
+            pass
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    return value
+
+
 def coverage_reason_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(item) for item in value if str(item).strip()]
@@ -5172,7 +5194,7 @@ def render_export_page(db_path: Path, run_id: str | None) -> None:
     }
     st.download_button(
         "Download JSON export of full classified results",
-        json.dumps(full_payload, indent=2).encode("utf-8"),
+        json.dumps(json_safe_value(full_payload), indent=2).encode("utf-8"),
         file_name=f"{export_id}_full_results.json",
         mime="application/json",
     )
@@ -5200,7 +5222,7 @@ def render_export_page(db_path: Path, run_id: str | None) -> None:
         }
         st.download_button(
             "Download signal validation JSON",
-            json.dumps(signal_payload, indent=2).encode("utf-8"),
+            json.dumps(json_safe_value(signal_payload), indent=2).encode("utf-8"),
             file_name=f"{export_id}_signal_validation.json",
             mime="application/json",
         )
