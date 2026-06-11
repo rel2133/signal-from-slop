@@ -222,6 +222,23 @@ SIGNAL_LABEL_OPTIONS = [
     "Avoided hype trap",
     "Not enough information",
 ]
+QUICK_SIGNAL_LABELS = [
+    "Useful lead",
+    "Worth deeper research",
+    "Pure hype",
+    "Avoided hype trap",
+    "False positive",
+]
+METRIC_TOOLTIPS = {
+    "emerging_ticker_score": "Lead-ranking score. Blends acceleration, source diversity, alpha quality, evidence quality, specificity, and penalties for hype or repetition.",
+    "acceleration_score": "Coverage-adjusted acceleration. Compares mention, thread, and author rates against a matched Measurement baseline, then applies coverage and hype penalties.",
+    "adjusted_acceleration_score": "Frozen signal copy of coverage-adjusted acceleration at the time the signal was saved.",
+    "coverage_reliability": "0 to 1 score for how much to trust the trend sample. It reflects run type, source coverage, scrape caps, rate limits, and baseline availability.",
+    "attention_spread_14d": "Post-signal Reddit attention score over 14 days. Higher means the ticker spread across more mentions, threads, authors, sources, and share of voice.",
+    "attention_spread_7d": "Post-signal Reddit attention score over 7 days.",
+    "attention_spread_30d": "Post-signal Reddit attention score over 30 days.",
+    "share_of_voice": "Ticker mentions divided by all ticker mentions in the same scope, expressed as a percentage.",
+}
 METRIC_GUIDE = [
     {
         "metric": "Mentions",
@@ -493,6 +510,18 @@ st.markdown(
             margin-top: 0.25rem;
             opacity: 0.76;
         }
+        .top-signal-title {
+            font-size: 0.92rem;
+            font-weight: 760;
+            line-height: 1.2;
+            margin-bottom: 0.15rem;
+        }
+        .top-signal-score {
+            font-size: 1.2rem;
+            font-weight: 780;
+            line-height: 1.15;
+            margin: 0.2rem 0 0.35rem;
+        }
         .status-chip {
             border: 1px solid rgba(128, 128, 128, 0.26);
             border-radius: 999px;
@@ -727,11 +756,18 @@ def render_insight_cards(cards: list[dict[str, str]]) -> None:
 
 def status_chip_style(label: str) -> str:
     lowered = str(label or "").lower()
-    if "measurement" in lowered or lowered == "high":
+    if "measurement" in lowered or lowered == "high" or "high reliability" in lowered or "fresh" in lowered:
         return "background: rgba(52, 199, 89, 0.16); border-color: rgba(52, 199, 89, 0.38);"
     if "discovery" in lowered or "medium" in lowered or "review" in lowered:
         return "background: rgba(57, 132, 255, 0.14); border-color: rgba(57, 132, 255, 0.34);"
-    if "low" in lowered or "warning" in lowered or "fallback" in lowered or "needs baseline" in lowered:
+    if (
+        "low" in lowered
+        or "warning" in lowered
+        or "fallback" in lowered
+        or "needs baseline" in lowered
+        or "partial" in lowered
+        or "needs refresh" in lowered
+    ):
         return "background: rgba(255, 159, 10, 0.16); border-color: rgba(255, 159, 10, 0.36);"
     if "error" in lowered or "failed" in lowered or "cancelled" in lowered:
         return "background: rgba(255, 69, 58, 0.14); border-color: rgba(255, 69, 58, 0.34);"
@@ -750,6 +786,53 @@ def render_status_chips(labels: list[str]) -> None:
     )
     if chips:
         st.markdown(chips, unsafe_allow_html=True)
+
+
+def metric_help(column_name: str) -> str | None:
+    return METRIC_TOOLTIPS.get(column_name)
+
+
+def format_timestamp_with_relative(value: Any) -> str:
+    timestamp = str(value or "").strip()
+    if not timestamp:
+        return "Unknown time"
+    try:
+        dt_value = parse_created_time(timestamp)
+        stamp = dt_value.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        stamp = timestamp[:19].replace("T", " ")
+    relative = relative_time_label(timestamp)
+    return f"{stamp} • {relative}" if relative else stamp
+
+
+def ticker_status_labels(row: dict[str, Any]) -> list[str]:
+    labels = [str(row.get("trend_reliability", "") or row.get("coverage_reliability", "") or "")]
+    if bool(row.get("low_mentions_high_signal")):
+        labels.append("Low-hype lead")
+    if bool(row.get("new_ticker_detected")):
+        labels.append("New ticker")
+    hype = coerce_float(row.get("average_hype_score", row.get("hype_score", 0)))
+    if hype >= 7:
+        labels.append("High hype")
+    return [label for label in labels if label]
+
+
+def market_cache_status_label(review_df: pd.DataFrame) -> str:
+    if review_df.empty or "outcome_last_updated" not in review_df.columns:
+        return "Market cache needs refresh"
+    updated = pd.to_datetime(review_df["outcome_last_updated"], errors="coerce", utc=True).dropna()
+    if updated.empty:
+        return "Market cache needs refresh"
+    latest = updated.max()
+    age_hours = max((datetime.now(UTC) - latest.to_pydatetime()).total_seconds() / 3600, 0)
+    market_columns = [column for column in ("return_7d", "excess_return_7d") if column in review_df.columns]
+    has_missing = bool(market_columns) and bool(review_df[market_columns].isna().to_numpy().any())
+    relative = relative_time_label(latest.isoformat())
+    if age_hours <= 24 and not has_missing:
+        return f"Market cache fresh {relative}".strip()
+    if age_hours <= 72:
+        return f"Market cache partial {relative}".strip()
+    return f"Market cache needs refresh {relative}".strip()
 
 
 def render_copyable_ticker_chips(
@@ -975,17 +1058,24 @@ def render_low_reliability_warning(summary: dict[str, Any] | None) -> None:
     reliability_label = str(coverage.get("reliability_label", "") or "")
     trend_note = str(coverage.get("trend_note", "") or "")
     run_type = str(summary.get("run_type", RUN_TYPE_DISCOVERY)).lower()
+    rss_capped_sources = int(coverage.get("rss_capped_sources", 0) or 0)
+    warnings: list[str] = []
     if run_type == RUN_TYPE_DISCOVERY:
-        st.warning(
-            "This is a Discovery run. Use it for idea finding and evidence review, not as a clean acceleration benchmark."
+        warnings.append(
+            "This is a Discovery run. Use it for idea finding and evidence review, not as a clean acceleration benchmark. "
+            "Run a Measurement scrape on the same source set to unlock acceleration."
         )
-        return
     if reliability_label == "Low":
         reason_text = "; ".join(str(reason) for reason in reasons[:3]) if reasons else "Source coverage came back weak."
-        st.warning(f"Trend reliability is low for this run. {reason_text}")
-        return
+        warnings.append(f"Trend reliability is low for this run. {reason_text}")
+    if rss_capped_sources > 0:
+        warnings.append(
+            f"{rss_capped_sources} source(s) hit the RSS cap, so the run may be missing older posts in the selected window."
+        )
     if trend_note and "baseline" in trend_note.lower():
-        st.warning(trend_note)
+        warnings.append(trend_note)
+    if warnings:
+        st.warning(" ".join(dict.fromkeys(warnings)))
 
 
 def build_page_context_metrics(summary: dict[str, Any]) -> list[dict[str, str]]:
@@ -1037,9 +1127,9 @@ def render_all_tickers_panel(summary_df: pd.DataFrame, mentions_df: pd.DataFrame
                 column_config={
                     "total_mentions": st.column_config.NumberColumn("Mentions", format="%d"),
                     "mention_rate_per_100_posts": st.column_config.NumberColumn("Mentions / 100 posts", format="%.2f"),
-                    "acceleration_score": st.column_config.NumberColumn("Adj. accel.", format="%.1f"),
+                    "acceleration_score": st.column_config.NumberColumn("Adj. accel.", format="%.1f", help=metric_help("acceleration_score")),
                     "trend_reliability": st.column_config.TextColumn("Reliability"),
-                    "emerging_ticker_score": st.column_config.NumberColumn("Emerging", format="%.1f"),
+                    "emerging_ticker_score": st.column_config.NumberColumn("Emerging", format="%.1f", help=metric_help("emerging_ticker_score")),
                     "average_alpha_signal_score": st.column_config.NumberColumn("Alpha", format="%.1f"),
                     "average_hype_score": st.column_config.NumberColumn("Hype", format="%.1f"),
                 },
@@ -1472,9 +1562,12 @@ def _format_percent(value: Any) -> str:
     if value in (None, ""):
         return "n/a"
     try:
-        return f"{float(value):+.2%}"
+        numeric = float(value)
     except (TypeError, ValueError):
         return "n/a"
+    if pd.isna(numeric):
+        return "n/a"
+    return f"{numeric:+.2%}"
 
 
 def _signal_select_label(review_df: pd.DataFrame, signal_id: str) -> str:
@@ -2656,6 +2749,121 @@ def render_sidebar_quick_search(db_path: Path, run_id: str | None) -> None:
         st.caption("Mention matches")
         for row in mention_matches.to_dict(orient="records"):
             st.caption(f"{row['ticker']} · {str(row['thread_title'])[:72]}")
+
+
+def render_body_quick_jump(db_path: Path, run_id: str | None, current_page: str) -> None:
+    if not run_id:
+        return
+    query = st.text_input(
+        "Jump to ticker",
+        placeholder="Search ticker, company, thread, or claim",
+        key=f"body_quick_find_{run_id}",
+        help="Search the selected analysis scope from the main page body.",
+    ).strip()
+    if len(query) < 2:
+        return
+
+    summary_df = load_scope_ticker_summaries(db_path, run_id)
+    mentions_df = load_scope_mentions(db_path, run_id)
+    lowered = query.lower()
+    ticker_matches = pd.DataFrame()
+    if not summary_df.empty:
+        ticker_matches = summary_df[
+            summary_df["ticker"].astype(str).str.lower().str.contains(lowered, regex=False)
+            | summary_df["company_name"].astype(str).str.lower().str.contains(lowered, regex=False)
+        ].head(5)
+
+    mention_matches = pd.DataFrame()
+    if not mentions_df.empty:
+        searchable = (
+            mentions_df["ticker"].astype(str)
+            + " "
+            + mentions_df["company_name"].astype(str)
+            + " "
+            + mentions_df["thread_title"].astype(str)
+            + " "
+            + mentions_df["summary"].astype(str)
+            + " "
+            + mentions_df["body_text"].astype(str)
+        ).str.lower()
+        mention_matches = mentions_df[searchable.str.contains(lowered, regex=False)].head(3)
+
+    if ticker_matches.empty and mention_matches.empty:
+        st.info("No ticker or evidence rows matched that search in the selected scope.")
+        return
+
+    if not ticker_matches.empty:
+        st.caption("Ticker matches")
+        cols = st.columns(min(len(ticker_matches), 5))
+        for column, row in zip(cols, ticker_matches.to_dict(orient="records")):
+            ticker = str(row.get("ticker", ""))
+            score = format_metric_value(row.get("emerging_ticker_score"), decimals=1)
+            target_page = "Signal Validation" if current_page == "Ticker Trends" else "Ticker Trends"
+            if column.button(f"{ticker} · {score}", key=f"body_jump_{run_id}_{current_page}_{ticker}", use_container_width=True):
+                navigate_to_page(target_page, run_id=run_id, ticker=ticker)
+
+    if not mention_matches.empty:
+        st.caption("Evidence matches")
+        for index, row in enumerate(mention_matches.to_dict(orient="records")):
+            ticker = str(row.get("ticker", ""))
+            cols = st.columns([1, 3])
+            if cols[0].button(f"Open {ticker}", key=f"body_evidence_jump_{run_id}_{ticker}_{row.get('item_id', '')}_{index}", use_container_width=True):
+                navigate_to_page("Results Dashboard", run_id=run_id, ticker=ticker)
+            cols[1].caption(f"{ticker} · {str(row.get('thread_title', ''))[:110]}")
+
+
+def render_ticker_action_strip(
+    rows: pd.DataFrame,
+    *,
+    run_id: str,
+    current_page: str,
+    key_prefix: str,
+    limit: int = 5,
+) -> None:
+    if rows.empty:
+        return
+    st.caption("One-click ticker actions")
+    for row in rows.head(limit).to_dict(orient="records"):
+        ticker = str(row.get("ticker", ""))
+        if not ticker:
+            continue
+        cols = st.columns([1.1, 1, 1, 2.2])
+        cols[0].markdown(f"**{escape(ticker)}**")
+        if current_page != "Ticker Trends" and cols[1].button("Open Trends", key=f"{key_prefix}_trends_{run_id}_{ticker}", use_container_width=True):
+            navigate_to_page("Ticker Trends", run_id=run_id, ticker=ticker)
+        elif current_page == "Ticker Trends":
+            cols[1].button("Open Trends", key=f"{key_prefix}_trends_disabled_{run_id}_{ticker}", use_container_width=True, disabled=True)
+        if current_page != "Signal Validation" and cols[2].button("Open Signals", key=f"{key_prefix}_signals_{run_id}_{ticker}", use_container_width=True):
+            navigate_to_page("Signal Validation", run_id=run_id, ticker=ticker)
+        elif current_page == "Signal Validation":
+            cols[2].button("Open Signals", key=f"{key_prefix}_signals_disabled_{run_id}_{ticker}", use_container_width=True, disabled=True)
+        with cols[3]:
+            render_status_chips(ticker_status_labels(row))
+
+
+def render_top_signal_cards(summary_df: pd.DataFrame, *, run_id: str, current_page: str, limit: int = 5) -> None:
+    if summary_df.empty:
+        return
+    top_rows = (
+        summary_df.sort_values(["emerging_ticker_score", "average_alpha_signal_score"], ascending=[False, False])
+        .head(limit)
+        .to_dict(orient="records")
+    )
+    if not top_rows:
+        return
+    st.subheader("Top Signals")
+    cols = st.columns(len(top_rows))
+    for column, row in zip(cols, top_rows):
+        ticker = str(row.get("ticker", ""))
+        score = coerce_float(row.get("emerging_ticker_score"))
+        with column.container(border=True):
+            st.markdown(f'<div class="top-signal-title">{escape(ticker)}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="top-signal-score">{score:.1f} emerging</div>', unsafe_allow_html=True)
+            render_status_chips(ticker_status_labels(row))
+            if current_page != "Ticker Trends" and st.button("Open Trends", key=f"top_signal_trends_{run_id}_{ticker}", use_container_width=True):
+                navigate_to_page("Ticker Trends", run_id=run_id, ticker=ticker)
+            if current_page != "Signal Validation" and st.button("Open Signals", key=f"top_signal_signals_{run_id}_{ticker}", use_container_width=True):
+                navigate_to_page("Signal Validation", run_id=run_id, ticker=ticker)
 
 
 def seed_sources_from_file(db_path: Path, sources_path: Path) -> int:
@@ -3840,7 +4048,6 @@ def filter_results_dataframe(long_df: pd.DataFrame, run_id: str) -> pd.DataFrame
     preset_name = st.selectbox(
         "Preset",
         preset_names,
-        index=preset_names.index(st.session_state[preset_key]) if st.session_state[preset_key] in preset_names else 0,
         key=preset_key,
         help="Start from the view you need most often, then refine only when necessary.",
     )
@@ -3883,19 +4090,16 @@ def filter_results_dataframe(long_df: pd.DataFrame, run_id: str) -> pd.DataFrame
     ticker_filter = primary_cols[0].multiselect(
         "Ticker",
         ticker_options,
-        default=st.session_state[ticker_key],
         key=ticker_key,
     )
     source_filter = primary_cols[1].multiselect(
         "Source",
         source_options,
-        default=st.session_state[source_key],
         key=source_key,
     )
     watchlist = get_watchlist()
     only_watchlist = primary_cols[2].checkbox(
         "Watchlist only",
-        value=bool(st.session_state[watchlist_key]),
         disabled=not watchlist,
         key=watchlist_key,
     )
@@ -3905,22 +4109,19 @@ def filter_results_dataframe(long_df: pd.DataFrame, run_id: str) -> pd.DataFrame
         sentiment_filter = filter_cols[0].multiselect(
             "Sentiment",
             ["bullish", "bearish", "neutral", "irrelevant"],
-            default=st.session_state[f"results_sentiment_filter_{run_id}"],
             key=f"results_sentiment_filter_{run_id}",
         )
         min_confidence = filter_cols[1].slider(
             "Min confidence",
             0.0,
             1.0,
-            float(st.session_state[f"results_min_confidence_{run_id}"]),
-            0.05,
+            step=0.05,
             key=f"results_min_confidence_{run_id}",
         )
         min_depth = filter_cols[2].slider(
             "Min depth score",
             0,
             10,
-            int(st.session_state[f"results_min_depth_{run_id}"]),
             key=f"results_min_depth_{run_id}",
         )
 
@@ -3929,36 +4130,30 @@ def filter_results_dataframe(long_df: pd.DataFrame, run_id: str) -> pd.DataFrame
             "Min alpha signal",
             0,
             100,
-            int(st.session_state[f"results_min_alpha_{run_id}"]),
             key=f"results_min_alpha_{run_id}",
         )
         max_hype = numeric_cols[1].slider(
             "Max hype",
             0,
             10,
-            int(st.session_state[f"results_max_hype_{run_id}"]),
             key=f"results_max_hype_{run_id}",
         )
         hide_hype = numeric_cols[2].checkbox(
             "Hide hype/meme",
-            value=bool(st.session_state[f"results_hide_hype_{run_id}"]),
             key=f"results_hide_hype_{run_id}",
         )
         only_deeper = numeric_cols[3].checkbox(
             "Needs verification",
-            value=bool(st.session_state[f"results_only_deeper_{run_id}"]),
             key=f"results_only_deeper_{run_id}",
         )
 
         flag_cols = st.columns(2)
         only_low_signal = flag_cols[0].checkbox(
             "Low-mention high-signal",
-            value=bool(st.session_state[f"results_only_low_signal_{run_id}"]),
             key=f"results_only_low_signal_{run_id}",
         )
         only_new = flag_cols[1].checkbox(
             "Newly detected",
-            value=bool(st.session_state[f"results_only_new_{run_id}"]),
             key=f"results_only_new_{run_id}",
         )
 
@@ -4145,8 +4340,7 @@ def render_selected_scope_context(db_path: Path, run_id: str | None, *, summary:
     } if not sources.empty else {}
     source_names = format_source_names(run_record, source_lookup)
     completed_at = str(run_record.get("completed_at") or run_record.get("started_at") or "")
-    completed_label = completed_at[:19].replace("T", " ") if completed_at else "Unknown time"
-    relative_label = relative_time_label(completed_at)
+    completed_label = format_timestamp_with_relative(completed_at)
     chips = [
         RUN_TYPE_LABELS.get(str(run_record.get("run_type", RUN_TYPE_DISCOVERY)).lower(), "Discovery"),
         str(coverage.get("reliability_label", "n/a") or "n/a"),
@@ -4155,17 +4349,31 @@ def render_selected_scope_context(db_path: Path, run_id: str | None, *, summary:
         chips.append("Canonical trend sample")
     render_scope_context_bar(
         title=f"Run `{run_id}`",
-        meta=f"{completed_label}{f' • {relative_label}' if relative_label else ''} • {source_names}",
+        meta=f"{source_names}",
         chips=chips,
         metrics=[
+            {"label": "Run type", "value": RUN_TYPE_LABELS.get(str(run_record.get("run_type", RUN_TYPE_DISCOVERY)).lower(), "Discovery")},
+            {"label": "Source set", "value": source_names},
+            {"label": "Completed", "value": completed_label},
             {"label": "Window", "value": str(run_record.get("time_window_label", "") or "Custom")},
             {"label": "Items analysed", "value": str(int(summary.get("items_analyzed", 0) or 0))},
             {"label": "Ticker mentions", "value": str(int(summary.get("ticker_mentions", 0) or 0))},
-            {"label": "Posts scraped", "value": str(int(coverage.get("posts_returned", 0) or 0))},
             {"label": "Coverage", "value": str(coverage.get("reliability_label", "n/a") or "n/a")},
-            {"label": "RSS-capped sources", "value": str(int(coverage.get("rss_capped_sources", 0) or 0))},
         ],
     )
+
+
+def render_persistent_run_context(db_path: Path, run_id: str | None) -> None:
+    if not run_id:
+        st.info("No analysis scope is selected yet. Add sources, run a scrape, then choose the run from the sidebar.")
+        return
+    if is_corpus_scope(run_id):
+        _, _, _, summary = build_corpus_frames(db_path)
+        render_selected_scope_context(db_path, run_id, summary=summary)
+        return
+    summary = load_run_summary(db_path, run_id)
+    render_selected_scope_context(db_path, run_id, summary=summary)
+    render_low_reliability_warning(summary)
 
 
 def navigate_to_page(page_name: str, *, run_id: str | None = None, ticker: str | None = None) -> None:
@@ -4768,9 +4976,9 @@ def render_acceleration_bar(summary_df: pd.DataFrame) -> None:
     st.altair_chart(chart, use_container_width=True)
 
 
-def render_ticker_summary_table(summary_df: pd.DataFrame) -> None:
+def render_ticker_summary_table(summary_df: pd.DataFrame, *, run_id: str, current_page: str) -> None:
     if summary_df.empty:
-        st.info("No ticker summary rows are available.")
+        st.info("No ticker summary rows are available. Run a scrape that finds ticker mentions, then return to this table.")
         return
     display_source = summary_df.copy()
     watchlist = set(get_watchlist())
@@ -4785,13 +4993,32 @@ def render_ticker_summary_table(summary_df: pd.DataFrame) -> None:
     sort_choice = st.selectbox(
         "Sort summary by",
         list(sort_presets.keys()),
-        key=f"summary_sort_{hash(tuple(display_source['ticker'].head(8).tolist()))}",
+        key=f"summary_sort_{current_page}_{run_id}",
     )
     sort_columns = [column for column in sort_presets[sort_choice] if column in display_source.columns]
     ascending = [sort_choice == "Lowest hype"] + [False] * max(len(sort_columns) - 1, 0)
     if sort_columns:
         display_source = display_source.sort_values(sort_columns, ascending=ascending[: len(sort_columns)])
-    display_columns = [
+    render_ticker_action_strip(
+        display_source,
+        run_id=run_id,
+        current_page=current_page,
+        key_prefix=f"summary_actions_{current_page}",
+    )
+    compact_columns = [
+        "watched",
+        "ticker",
+        "company_name",
+        "total_mentions",
+        "acceleration_score",
+        "trend_reliability",
+        "emerging_ticker_score",
+        "average_alpha_signal_score",
+        "average_hype_score",
+        "low_mentions_high_signal",
+        "new_ticker_detected",
+    ]
+    detail_columns = [
         "watched",
         "ticker",
         "company_name",
@@ -4811,26 +5038,37 @@ def render_ticker_summary_table(summary_df: pd.DataFrame) -> None:
         "low_mentions_high_signal",
         "new_ticker_detected",
     ]
-    available_columns = [column for column in display_columns if column in display_source.columns]
+    column_config = {
+        "watched": st.column_config.CheckboxColumn("Watch"),
+        "ticker": st.column_config.TextColumn("Ticker", width="small"),
+        "company_name": st.column_config.TextColumn("Company", width="medium"),
+        "mention_rate_per_100_posts": st.column_config.NumberColumn("Mentions / 100 posts", format="%.2f"),
+        "acceleration_score": st.column_config.NumberColumn("Adj. accel.", format="%.1f", help=metric_help("acceleration_score")),
+        "trend_reliability": st.column_config.TextColumn("Reliability"),
+        "coverage_reliability": st.column_config.NumberColumn("Coverage", format="%.2f", help=metric_help("coverage_reliability")),
+        "emerging_ticker_score": st.column_config.NumberColumn("Emerging", format="%.1f", help=metric_help("emerging_ticker_score")),
+        "average_alpha_signal_score": st.column_config.NumberColumn("Alpha", format="%.1f"),
+        "average_hype_score": st.column_config.NumberColumn("Hype", format="%.1f"),
+        "source_diversity_score": st.column_config.NumberColumn("Source diversity", format="%.1f"),
+        "controversy_score": st.column_config.NumberColumn("Controversy", format="%.1f"),
+    }
+    compact_available = [column for column in compact_columns if column in display_source.columns]
+    detail_available = [column for column in detail_columns if column in display_source.columns]
     st.dataframe(
-        display_source[available_columns],
+        display_source[compact_available],
         use_container_width=True,
         hide_index=True,
-        column_config={
-            "watched": st.column_config.CheckboxColumn("Watch"),
-            "ticker": st.column_config.TextColumn("Ticker", width="small"),
-            "company_name": st.column_config.TextColumn("Company", width="medium"),
-            "mention_rate_per_100_posts": st.column_config.NumberColumn("Mentions / 100 posts", format="%.2f"),
-            "acceleration_score": st.column_config.NumberColumn("Adj. accel.", format="%.1f"),
-            "trend_reliability": st.column_config.TextColumn("Reliability"),
-            "coverage_reliability": st.column_config.NumberColumn("Coverage", format="%.2f"),
-            "emerging_ticker_score": st.column_config.NumberColumn("Emerging", format="%.1f"),
-            "average_alpha_signal_score": st.column_config.NumberColumn("Alpha", format="%.1f"),
-            "average_hype_score": st.column_config.NumberColumn("Hype", format="%.1f"),
-            "source_diversity_score": st.column_config.NumberColumn("Source diversity", format="%.1f"),
-            "controversy_score": st.column_config.NumberColumn("Controversy", format="%.1f"),
-        },
+        column_config=column_config,
+        key=f"summary_compact_table_{current_page}_{run_id}",
     )
+    with st.expander("Deeper ticker metrics", expanded=False):
+        st.dataframe(
+            display_source[detail_available],
+            use_container_width=True,
+            hide_index=True,
+            column_config=column_config,
+            key=f"summary_detail_table_{current_page}_{run_id}",
+        )
 
 
 def render_results_mentions_review(long_df: pd.DataFrame, summary_df: pd.DataFrame, scope_id: str) -> None:
@@ -4889,18 +5127,47 @@ def render_results_mentions_review(long_df: pd.DataFrame, summary_df: pd.DataFra
             )
 
     with mention_tab:
-        display_df = filtered[display_columns].rename(columns={"source_name": "source"})
+        compact_mention_columns = [
+            "created_time",
+            "source_name",
+            "ticker",
+            "company_name",
+            "sentiment",
+            "trust_status",
+            "confidence",
+            "alpha_signal_score",
+            "hype_adjusted_signal_score",
+            "hype_score",
+            "summary",
+            "permalink",
+        ]
+        compact_mention_columns = [column for column in compact_mention_columns if column in filtered.columns]
+        display_df = filtered[compact_mention_columns].rename(columns={"source_name": "source"})
+        mention_column_config = {
+            "permalink": st.column_config.LinkColumn("permalink"),
+            "trust_status": st.column_config.TextColumn("trust"),
+            "classifier_mode": st.column_config.TextColumn("mode"),
+            "analysis_run_id": st.column_config.TextColumn("run", width="small"),
+            "alpha_signal_score": st.column_config.NumberColumn("Alpha", format="%.1f"),
+            "hype_adjusted_signal_score": st.column_config.NumberColumn("Hype-adjusted", format="%.1f"),
+            "hype_score": st.column_config.NumberColumn("Hype", format="%.1f"),
+            "source_diversity_score": st.column_config.NumberColumn("Source diversity", format="%.1f"),
+            "controversy_score": st.column_config.NumberColumn("Controversy", format="%.1f"),
+        }
         st.dataframe(
             display_df,
             use_container_width=True,
             hide_index=True,
-            column_config={
-                "permalink": st.column_config.LinkColumn("permalink"),
-                "trust_status": st.column_config.TextColumn("trust"),
-                "classifier_mode": st.column_config.TextColumn("mode"),
-                "analysis_run_id": st.column_config.TextColumn("run", width="small"),
-            },
+            column_config=mention_column_config,
         )
+        with st.expander("Deeper mention metrics", expanded=False):
+            full_display_df = filtered[display_columns].rename(columns={"source_name": "source"})
+            st.dataframe(
+                full_display_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config=mention_column_config,
+            )
 
     with detail_tab:
         render_mention_details(filtered)
@@ -4925,8 +5192,8 @@ def render_results_dashboard_page(db_path: Path, run_id: str | None) -> None:
             "If the same Reddit item/ticker appears in overlapping scrapes, the newest completed classification is kept. "
             "Coverage-adjusted acceleration is reserved for matched Measurement runs."
         )
-        render_selected_scope_context(db_path, run_id, summary=summary)
         render_corpus_summary_cards(summary)
+        render_top_signal_cards(summary_df, run_id=run_id, current_page="Results Dashboard")
         render_quick_ticker_jump_strip(
             summary_df,
             run_id=run_id,
@@ -4934,15 +5201,13 @@ def render_results_dashboard_page(db_path: Path, run_id: str | None) -> None:
             title="Quick open top leads in Trends",
         )
         if long_df.empty:
-            st.info("No completed ticker mentions are available in the combined corpus yet.")
+            st.info("No completed ticker mentions are available in the combined corpus yet. Run a live scrape that finds ticker mentions, then return to Results.")
             return
         render_results_mentions_review(long_df, summary_df, run_id)
         return
 
     summary = load_run_summary(db_path, run_id)
     if summary:
-        render_selected_scope_context(db_path, run_id, summary=summary)
-        render_low_reliability_warning(summary)
         render_run_summary_cards(summary)
     render_run_metadata(db_path, run_id)
     runs = load_analysis_runs(db_path)
@@ -4963,18 +5228,19 @@ def render_results_dashboard_page(db_path: Path, run_id: str | None) -> None:
     long_df = load_run_mentions(db_path, run_id)
     if long_df.empty:
         if summary and int(summary.get("items_analyzed", 0)) == 0:
-            st.warning("This run completed, but no Reddit items matched the selected sources and time window.")
+            st.warning("This run completed, but no Reddit items matched the selected sources and time window. Broaden the time window or add active sources, then run another scrape.")
         elif summary:
             st.info(
                 f"This run analysed {int(summary.get('items_analyzed', 0))} Reddit items, "
-                "but no catalog tickers or company-name matches were found."
+                "but no catalog tickers or company-name matches were found. Add ticker aliases or scrape sources with clearer stock discussion."
             )
         else:
-            st.info("No item-level mention data saved for this run.")
+            st.info("No item-level mention data saved for this run. Run a scrape first, then return to Results.")
         return
 
     long_df = attach_quality_columns(long_df, load_run_classification_quality(db_path, run_id))
     summary_df = load_run_ticker_summaries(db_path, run_id)
+    render_top_signal_cards(summary_df, run_id=run_id, current_page="Results Dashboard")
     render_quick_ticker_jump_strip(
         summary_df,
         run_id=run_id,
@@ -4998,9 +5264,8 @@ def render_ticker_trends_page(db_path: Path, run_id: str | None) -> None:
             "The combined timeline uses Reddit item dates across every completed live run, with overlapping item/ticker mentions counted once. "
             "Use individual Measurement runs for coverage-adjusted acceleration."
         )
-        render_selected_scope_context(db_path, run_id, summary=summary)
         if summary_df.empty:
-            st.info("No completed ticker history is available in the combined corpus yet.")
+            st.info("No completed ticker history is available in the combined corpus yet. Run at least one live scrape with ticker mentions, then return to Trends.")
             return
 
         metric_cols = st.columns(5)
@@ -5077,7 +5342,7 @@ def render_ticker_trends_page(db_path: Path, run_id: str | None) -> None:
 
         with table_tab:
             st.subheader("Ticker summary")
-            render_ticker_summary_table(summary_df)
+            render_ticker_summary_table(summary_df, run_id=run_id, current_page="Ticker Trends")
 
         with run_tab:
             runs = load_analysis_runs(db_path)
@@ -5121,7 +5386,7 @@ def render_ticker_trends_page(db_path: Path, run_id: str | None) -> None:
     bucket_df = load_run_time_buckets(db_path, run_id)
     long_df = load_run_mentions(db_path, run_id)
     if summary_df.empty:
-        st.info("No ticker summary data saved for this run.")
+        st.info("No ticker summary data saved for this run. Run a scrape that finds ticker mentions, then return to Trends.")
         return
 
     sources = load_sources(db_path)
@@ -5138,8 +5403,6 @@ def render_ticker_trends_page(db_path: Path, run_id: str | None) -> None:
         f"Selected scrape: `{run_completed_label(run_record)}` · "
         f"{format_source_names(run_record, source_lookup)}"
     )
-    render_selected_scope_context(db_path, run_id, summary=run_record.get("summary_json", {}) or {})
-    render_low_reliability_warning(run_record.get("summary_json", {}) or {})
     metric_cols = st.columns(5)
     metric_cols[0].metric("Tickers", int(summary_df["ticker"].nunique()))
     metric_cols[1].metric("Mentions", int(summary_df["total_mentions"].sum()))
@@ -5387,7 +5650,7 @@ def render_ticker_trends_page(db_path: Path, run_id: str | None) -> None:
 
     with table_tab:
         st.subheader("Ticker summary")
-        render_ticker_summary_table(summary_df)
+        render_ticker_summary_table(summary_df, run_id=run_id, current_page="Ticker Trends")
 
 
 def render_signal_validation_page(db_path: Path, ticker_path: Path, run_id: str | None) -> None:
@@ -5417,8 +5680,6 @@ def render_signal_validation_page(db_path: Path, ticker_path: Path, run_id: str 
             current_run_record = run_rows.iloc[0].to_dict()
             summary_df = load_run_ticker_summaries(db_path, run_id)
             mentions_df = load_run_mentions(db_path, run_id)
-    if current_run_record:
-        render_selected_scope_context(db_path, run_id, summary=current_run_record.get("summary_json", {}) or {})
     if current_run_record and not summary_df.empty:
         with action_cols[1].popover("Freeze manual signal", use_container_width=True):
             st.caption("Save a frozen signal snapshot from the currently selected run, even if it was not auto-flagged.")
@@ -5461,7 +5722,7 @@ def render_signal_validation_page(db_path: Path, ticker_path: Path, run_id: str 
 
     review_df = load_signal_review_frame(db_path, run_id if run_id else CORPUS_SCOPE_ID)
     if review_df.empty:
-        st.info("No frozen signal events have been created yet. Complete a run, or save a manual signal from the current run.")
+        st.info("No frozen signal events have been created yet. Complete a run, then save a manual signal or let the auto-signal workflow freeze top leads.")
         return
 
     if is_corpus_scope(run_id):
@@ -5492,9 +5753,7 @@ def render_signal_validation_page(db_path: Path, ticker_path: Path, run_id: str 
     metric_cols[3].metric("Avg excess 7d", f"{avg_excess_7d:+.2%}" if pd.notna(avg_excess_7d) else "n/a")
     if pd.notna(avg_attention_14d):
         st.caption(f"Average 14d attention spread: {float(avg_attention_14d):.1f}")
-    latest_outcome_update = review_df["outcome_last_updated"].dropna().astype(str).iloc[0] if "outcome_last_updated" in review_df.columns and review_df["outcome_last_updated"].notna().any() else ""
-    if latest_outcome_update:
-        render_status_chips([f"Market cache {relative_time_label(latest_outcome_update) or 'updated'}"])
+    render_status_chips([market_cache_status_label(review_df)])
 
     filter_cols = st.columns([1.2, 1, 1, 1])
     label_options = ["All labels", *SIGNAL_LABEL_OPTIONS]
@@ -5502,6 +5761,11 @@ def render_signal_validation_page(db_path: Path, ticker_path: Path, run_id: str 
     ticker_query = filter_cols[1].text_input("Ticker filter", key=f"signal_ticker_filter_{run_id}").strip().upper()
     signal_type_filter = filter_cols[2].selectbox("Signal type", ["All", "Auto", "Manual"], key=f"signal_type_filter_{run_id}")
     reliability_filter = filter_cols[3].selectbox("Attention reliability", ["All", "High", "Medium", "Low"], key=f"signal_reliability_filter_{run_id}")
+    sort_choice = st.selectbox(
+        "Sort inbox by",
+        ["Newest signal, unlabeled first", "Best emerging", "Highest attention spread", "Best excess return", "Lowest hype"],
+        key=f"signal_sort_{run_id}",
+    )
 
     filtered_df = review_df.copy()
     filtered_df["user_label"] = filtered_df["user_label"].fillna("")
@@ -5518,11 +5782,20 @@ def render_signal_validation_page(db_path: Path, ticker_path: Path, run_id: str 
             filtered_df["attention_outcome_reliability"].fillna("").astype(str) == reliability_filter
         ].copy()
     filtered_df["unlabelled_first"] = filtered_df["user_label"].fillna("").astype(str).eq("")
-    filtered_df = filtered_df.sort_values(
-        ["unlabelled_first", "signal_time_dt"],
-        ascending=[False, False],
-        na_position="last",
-    )
+    if sort_choice == "Best emerging":
+        filtered_df = filtered_df.sort_values(["unlabelled_first", "emerging_ticker_score", "signal_time_dt"], ascending=[False, False, False], na_position="last")
+    elif sort_choice == "Highest attention spread":
+        filtered_df = filtered_df.sort_values(["unlabelled_first", "attention_spread_14d", "signal_time_dt"], ascending=[False, False, False], na_position="last")
+    elif sort_choice == "Best excess return":
+        filtered_df = filtered_df.sort_values(["unlabelled_first", "excess_return_7d", "signal_time_dt"], ascending=[False, False, False], na_position="last")
+    elif sort_choice == "Lowest hype":
+        filtered_df = filtered_df.sort_values(["unlabelled_first", "hype_score", "signal_time_dt"], ascending=[False, True, False], na_position="last")
+    else:
+        filtered_df = filtered_df.sort_values(
+            ["unlabelled_first", "signal_time_dt"],
+            ascending=[False, False],
+            na_position="last",
+        )
 
     if filtered_df.empty:
         st.info("No frozen signals matched those filters.")
@@ -5553,14 +5826,14 @@ def render_signal_validation_page(db_path: Path, ticker_path: Path, run_id: str 
         column_config={
             "signal_time": st.column_config.TextColumn("Signal time", width="medium"),
             "manual_signal": st.column_config.CheckboxColumn("Manual"),
-            "emerging_ticker_score": st.column_config.NumberColumn("Emerging", format="%.1f"),
-            "adjusted_acceleration_score": st.column_config.NumberColumn("Adj. accel.", format="%.1f"),
+            "emerging_ticker_score": st.column_config.NumberColumn("Emerging", format="%.1f", help=metric_help("emerging_ticker_score")),
+            "adjusted_acceleration_score": st.column_config.NumberColumn("Adj. accel.", format="%.1f", help=metric_help("adjusted_acceleration_score")),
             "alpha_signal_score": st.column_config.NumberColumn("Alpha", format="%.1f"),
             "hype_score": st.column_config.NumberColumn("Hype", format="%.1f"),
-            "coverage_reliability": st.column_config.NumberColumn("Coverage", format="%.2f"),
+            "coverage_reliability": st.column_config.NumberColumn("Coverage", format="%.2f", help=metric_help("coverage_reliability")),
             "return_7d": st.column_config.NumberColumn("Return 7d", format="%.2f"),
             "excess_return_7d": st.column_config.NumberColumn("Excess 7d", format="%.2f"),
-            "attention_spread_14d": st.column_config.NumberColumn("Attention 14d", format="%.1f"),
+            "attention_spread_14d": st.column_config.NumberColumn("Attention 14d", format="%.1f", help=metric_help("attention_spread_14d")),
         },
     )
 
@@ -5582,26 +5855,44 @@ def render_signal_validation_page(db_path: Path, ticker_path: Path, run_id: str 
         ]
     )
     detail_cols = st.columns(6)
-    detail_cols[0].metric("Emerging", f"{_coerce_float(selected_signal.get('emerging_ticker_score')):.1f}")
-    detail_cols[1].metric("Adj. accel.", f"{_coerce_float(selected_signal.get('adjusted_acceleration_score')):.1f}")
+    detail_cols[0].metric("Emerging", f"{_coerce_float(selected_signal.get('emerging_ticker_score')):.1f}", help=metric_help("emerging_ticker_score"))
+    detail_cols[1].metric("Adj. accel.", f"{_coerce_float(selected_signal.get('adjusted_acceleration_score')):.1f}", help=metric_help("adjusted_acceleration_score"))
     detail_cols[2].metric("Alpha", f"{_coerce_float(selected_signal.get('alpha_signal_score')):.1f}")
     detail_cols[3].metric("Hype", f"{_coerce_float(selected_signal.get('hype_score')):.1f}")
     detail_cols[4].metric("Return 7d", f"{_format_percent(selected_signal.get('return_7d'))}")
     detail_cols[5].metric("Excess 7d", f"{_format_percent(selected_signal.get('excess_return_7d'))}")
 
     secondary_cols = st.columns(5)
-    secondary_cols[0].metric("Attention 7d", f"{_coerce_float(selected_signal.get('attention_spread_7d')):.1f}")
-    secondary_cols[1].metric("Attention 30d", f"{_coerce_float(selected_signal.get('attention_spread_30d')):.1f}")
-    secondary_cols[2].metric("Share of voice", f"{_format_percent(_coerce_float(selected_signal.get('share_of_voice')) / 100)}")
+    secondary_cols[0].metric("Attention 7d", f"{_coerce_float(selected_signal.get('attention_spread_7d')):.1f}", help=metric_help("attention_spread_7d"))
+    secondary_cols[1].metric("Attention 30d", f"{_coerce_float(selected_signal.get('attention_spread_30d')):.1f}", help=metric_help("attention_spread_30d"))
+    secondary_cols[2].metric("Share of voice", f"{_format_percent(_coerce_float(selected_signal.get('share_of_voice')) / 100)}", help=metric_help("share_of_voice"))
     secondary_cols[3].metric("Trend reliability", str(selected_signal.get("trend_reliability", "")) or "n/a")
-    secondary_cols[4].metric("Coverage", f"{_coerce_float(selected_signal.get('coverage_reliability')):.2f}")
+    secondary_cols[4].metric("Coverage", f"{_coerce_float(selected_signal.get('coverage_reliability')):.2f}", help=metric_help("coverage_reliability"))
     if run_id:
         render_ticker_navigation_buttons(current_page="Signal Validation", run_id=str(run_id), ticker=str(selected_signal["ticker"]))
     if selected_signal.get("outcome_last_updated"):
         st.caption(
-            f"Market and attention outcomes last refreshed `{str(selected_signal['outcome_last_updated'])[:19].replace('T', ' ')}`"
-            + (f" • {relative_time_label(selected_signal['outcome_last_updated'])}" if relative_time_label(selected_signal["outcome_last_updated"]) else "")
+            f"Market and attention outcomes last refreshed `{format_timestamp_with_relative(selected_signal['outcome_last_updated'])}`"
         )
+
+    current_label = str(selected_signal.get("user_label", "") or "")
+    st.caption("Quick label")
+    quick_cols = st.columns(len(QUICK_SIGNAL_LABELS))
+    for column, label in zip(quick_cols, QUICK_SIGNAL_LABELS):
+        if column.button(
+            label,
+            key=f"quick_label_{selected_signal_id}_{label}",
+            use_container_width=True,
+            disabled=current_label == label,
+        ):
+            upsert_signal_label(
+                db_path,
+                signal_id=str(selected_signal_id),
+                user_label=label,
+                user_notes=str(selected_signal.get("user_notes", "") or ""),
+            )
+            st.success("Signal label saved.")
+            st.rerun()
 
     with st.expander("Frozen evidence snapshot", expanded=True):
         evidence_titles = selected_signal.get("top_evidence_titles", []) or []
@@ -5644,7 +5935,6 @@ def render_signal_validation_page(db_path: Path, ticker_path: Path, run_id: str 
                 hide_index=True,
             )
 
-    current_label = str(selected_signal.get("user_label", "") or "")
     label_options_with_blank = ["", *SIGNAL_LABEL_OPTIONS]
     current_label_index = label_options_with_blank.index(current_label) if current_label in label_options_with_blank else 0
     with st.form(f"signal_label_form_{selected_signal_id}"):
@@ -5690,10 +5980,8 @@ def render_export_page(db_path: Path, run_id: str | None) -> None:
         export_id = run_id
 
     if long_df.empty:
-        st.info("No data available for export in this scope.")
+        st.info("No data available for export in this scope. Run a scrape with ticker mentions, then return to Export.")
         return
-
-    render_selected_scope_context(db_path, run_id, summary=summary_json)
 
     if not is_corpus_scope(run_id):
         run_artifact_dir = DEFAULT_ARTIFACTS_DIR / run_id
@@ -5941,6 +6229,8 @@ source_lookup = {
     for row in sources_df.to_dict(orient="records")
 } if not sources_df.empty else {}
 render_background_run_banner(DEFAULT_DB_PATH, source_lookup)
+render_persistent_run_context(DEFAULT_DB_PATH, selected_run_id)
+render_body_quick_jump(DEFAULT_DB_PATH, selected_run_id, page)
 
 if page == "Sources":
     render_sources_page(DEFAULT_DB_PATH)
