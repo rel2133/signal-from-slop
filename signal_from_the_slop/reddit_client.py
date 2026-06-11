@@ -43,11 +43,15 @@ class RedditClient:
         max_posts_per_source: int,
         max_comments_per_thread: int,
         include_comments: bool,
+        run_type: str = "discovery",
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        coverage_callback: Callable[[dict[str, Any]], None] | None = None,
         checkpoint: Callable[[], None] | None = None,
     ) -> list[dict[str, Any]]:
         session = self._build_scraper_session()
         deduped_items: dict[str, dict[str, Any]] = {}
+        scrape_mode = "posts_plus_comments" if include_comments and max_comments_per_thread else "posts_only"
+        canonical_trend_run = str(run_type).lower() == "measurement" and scrape_mode == "posts_only"
 
         ordered_sources = sorted(
             selected_sources,
@@ -66,34 +70,71 @@ class RedditClient:
                         "unit": "sources",
                     }
                 )
-            if source["source_type"] == "thread_url":
-                items = self._collect_scraped_thread(
-                    session=session,
-                    source=source,
-                    window_start=window_start,
-                    window_end=window_end,
-                    max_comments_per_thread=max_comments_per_thread,
-                    include_comments=include_comments,
-                )
-            elif source["source_type"] == "subreddit":
-                items = self._collect_scraped_subreddit(
-                    session=session,
-                    source=source,
-                    window_start=window_start,
-                    window_end=window_end,
-                    max_posts_per_source=max_posts_per_source,
-                    max_comments_per_thread=max_comments_per_thread,
-                    include_comments=include_comments,
-                    progress_callback=progress_callback,
-                    checkpoint=checkpoint,
-                    source_index=source_index,
-                    total_sources=total_sources,
-                )
-            else:
-                items = []
+            try:
+                if source["source_type"] == "thread_url":
+                    items, coverage = self._collect_scraped_thread(
+                        session=session,
+                        source=source,
+                        window_start=window_start,
+                        window_end=window_end,
+                        max_comments_per_thread=max_comments_per_thread,
+                        include_comments=include_comments,
+                        scrape_mode=scrape_mode,
+                        canonical_trend_run=canonical_trend_run,
+                    )
+                elif source["source_type"] == "subreddit":
+                    items, coverage = self._collect_scraped_subreddit(
+                        session=session,
+                        source=source,
+                        window_start=window_start,
+                        window_end=window_end,
+                        max_posts_per_source=max_posts_per_source,
+                        max_comments_per_thread=max_comments_per_thread,
+                        include_comments=include_comments,
+                        scrape_mode=scrape_mode,
+                        canonical_trend_run=canonical_trend_run,
+                        progress_callback=progress_callback,
+                        checkpoint=checkpoint,
+                        source_index=source_index,
+                        total_sources=total_sources,
+                    )
+                else:
+                    items = []
+                    coverage = self._build_source_coverage(
+                        source=source,
+                        window_start=window_start,
+                        window_end=window_end,
+                        scrape_mode=scrape_mode,
+                        posts_requested=0,
+                        comments_requested=0,
+                        items=[],
+                        canonical_trend_run=canonical_trend_run,
+                        collection_completed=True,
+                        collection_error="Unsupported source type.",
+                    )
+            except Exception as exc:
+                if coverage_callback is not None:
+                    coverage_callback(
+                        self._build_source_coverage(
+                            source=source,
+                            window_start=window_start,
+                            window_end=window_end,
+                            scrape_mode=scrape_mode,
+                            posts_requested=max_posts_per_source,
+                            comments_requested=0,
+                            items=[],
+                            canonical_trend_run=canonical_trend_run,
+                            collection_completed=False,
+                            collection_error=str(exc),
+                            rate_limited="rate-limit" in str(exc).lower() or "rate limited" in str(exc).lower(),
+                        )
+                    )
+                raise
 
             for item in items:
                 deduped_items.setdefault(item["item_id"], item)
+            if coverage_callback is not None:
+                coverage_callback(coverage)
             if progress_callback is not None:
                 progress_callback(
                     {
@@ -131,28 +172,37 @@ class RedditClient:
         checkpoint: Callable[[], None] | None = None,
         source_index: int = 1,
         total_sources: int = 1,
-    ) -> list[dict[str, Any]]:
+        scrape_mode: str = "posts_only",
+        canonical_trend_run: bool = False,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         subreddit = normalize_subreddit_name(str(source["normalized_value"]))
         feed_url = f"https://www.reddit.com/r/{subreddit}/new/.rss?limit={REDDIT_SUBREDDIT_RSS_LIMIT}"
         entries = self._fetch_rss_entries(session, feed_url)
         items: list[dict[str, Any]] = []
-        posts: list[dict[str, Any]] = []
+        feed_posts: list[tuple[ET.Element, datetime]] = [
+            (entry, self._entry_timestamp(entry))
+            for entry in entries
+            if self._entry_id(entry).startswith("t3_")
+        ]
+        window_post_entries: list[ET.Element] = []
 
-        for entry in entries:
-            if not self._entry_id(entry).startswith("t3_"):
-                continue
-
-            created_at = self._entry_timestamp(entry)
+        for entry, created_at in feed_posts:
             if created_at > window_end:
                 continue
             if created_at < window_start:
                 break
+            window_post_entries.append(entry)
 
-            post = self._rss_entry_to_item(entry, source, item_type="post")
-            posts.append(post)
-            items.append(post)
-            if max_posts_per_source and len(posts) >= max_posts_per_source:
-                break
+        selected_post_entries = (
+            window_post_entries[:max_posts_per_source]
+            if max_posts_per_source
+            else window_post_entries
+        )
+        posts = [
+            self._rss_entry_to_item(entry, source, item_type="post")
+            for entry in selected_post_entries
+        ]
+        items.extend(posts)
 
         if include_comments and max_comments_per_thread:
             for post_index, post in enumerate(posts, start=1):
@@ -167,16 +217,15 @@ class RedditClient:
                             "unit": "sources",
                         }
                     )
-                items.extend(
-                    self._collect_scraped_thread_comments(
-                        session=session,
-                        source=source,
-                        thread_url=str(post["thread_url"]),
-                        window_start=window_start,
-                        window_end=window_end,
-                        max_comments_per_thread=max_comments_per_thread,
-                    )
+                comments = self._collect_scraped_thread_comments(
+                    session=session,
+                    source=source,
+                    thread_url=str(post["thread_url"]),
+                    window_start=window_start,
+                    window_end=window_end,
+                    max_comments_per_thread=max_comments_per_thread,
                 )
+                items.extend(comments)
                 if progress_callback is not None:
                     progress_callback(
                         {
@@ -187,7 +236,28 @@ class RedditClient:
                         }
                     )
 
-        return items
+        oldest_feed_post = min((created_at for _, created_at in feed_posts), default=None)
+        hit_rss_cap = (
+            len(feed_posts) >= REDDIT_SUBREDDIT_RSS_LIMIT
+            and oldest_feed_post is not None
+            and oldest_feed_post > window_start
+        )
+        hit_post_cap = bool(max_posts_per_source and len(window_post_entries) > len(selected_post_entries))
+        comments_requested = len(posts) * max_comments_per_thread if include_comments and max_comments_per_thread else 0
+        coverage = self._build_source_coverage(
+            source=source,
+            window_start=window_start,
+            window_end=window_end,
+            scrape_mode=scrape_mode,
+            posts_requested=max_posts_per_source,
+            comments_requested=comments_requested,
+            items=items,
+            hit_post_cap=hit_post_cap,
+            hit_rss_cap=hit_rss_cap,
+            canonical_trend_run=canonical_trend_run,
+            collection_completed=True,
+        )
+        return items, coverage
 
     def _collect_scraped_thread(
         self,
@@ -198,7 +268,9 @@ class RedditClient:
         window_end: datetime,
         max_comments_per_thread: int,
         include_comments: bool,
-    ) -> list[dict[str, Any]]:
+        scrape_mode: str = "posts_only",
+        canonical_trend_run: bool = False,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         entries = self._fetch_rss_entries(session, self._thread_rss_url(str(source["url"])))
         items: list[dict[str, Any]] = []
         for entry in entries:
@@ -217,7 +289,20 @@ class RedditClient:
             comments.sort(key=lambda row: row["created_time"], reverse=True)
             items.extend(comments[:max_comments_per_thread])
 
-        return items
+        comments_requested = max_comments_per_thread if include_comments and max_comments_per_thread else 0
+        coverage = self._build_source_coverage(
+            source=source,
+            window_start=window_start,
+            window_end=window_end,
+            scrape_mode=scrape_mode,
+            posts_requested=1,
+            comments_requested=comments_requested,
+            items=items,
+            hit_rss_cap=len(entries) >= 100 and include_comments,
+            canonical_trend_run=canonical_trend_run,
+            collection_completed=True,
+        )
+        return items, coverage
 
     def _collect_scraped_thread_comments(
         self,
@@ -429,6 +514,73 @@ class RedditClient:
     def _parse_timestamp(self, value: str) -> datetime:
         return _parse_iso_datetime(value)
 
+    def _build_source_coverage(
+        self,
+        *,
+        source: dict[str, Any],
+        window_start: datetime,
+        window_end: datetime,
+        scrape_mode: str,
+        posts_requested: int,
+        comments_requested: int,
+        items: list[dict[str, Any]],
+        hit_post_cap: bool = False,
+        hit_rss_cap: bool = False,
+        rate_limited: bool = False,
+        collection_error: str = "",
+        collection_completed: bool = True,
+        canonical_trend_run: bool = False,
+    ) -> dict[str, Any]:
+        posts_returned = sum(1 for item in items if item.get("item_type") == "post")
+        comments_returned = sum(1 for item in items if item.get("item_type") == "comment")
+        threads_returned = len({str(item.get("thread_id", "")) for item in items if item.get("thread_id")})
+        authors_returned = len({str(item.get("author", "")) for item in items if item.get("author")})
+        timestamps = [
+            _parse_iso_datetime(str(item.get("created_time", "")))
+            for item in items
+            if str(item.get("created_time", "")).strip()
+        ]
+        oldest_seen_at = min(timestamps).isoformat() if timestamps else ""
+        newest_seen_at = max(timestamps).isoformat() if timestamps else ""
+        reliability, label, reasons = calculate_coverage_reliability(
+            source_type=str(source.get("source_type", "")),
+            scrape_mode=scrape_mode,
+            window_start=window_start,
+            window_end=window_end,
+            oldest_seen_at=oldest_seen_at,
+            posts_returned=posts_returned,
+            hit_post_cap=hit_post_cap,
+            hit_rss_cap=hit_rss_cap,
+            rate_limited=rate_limited,
+            collection_completed=collection_completed,
+            collection_error=collection_error,
+            canonical_trend_run=canonical_trend_run,
+        )
+        return {
+            "source_id": int(source["source_id"]) if source.get("source_id") is not None else None,
+            "source_name": str(source.get("display_name", source.get("source_name", ""))),
+            "source_type": str(source.get("source_type", "")),
+            "scrape_mode": scrape_mode,
+            "lookback_hours": round(max((window_end - window_start).total_seconds() / 3600, 0), 2),
+            "posts_requested": int(posts_requested or 0),
+            "posts_returned": int(posts_returned),
+            "comments_requested": int(comments_requested or 0),
+            "comments_returned": int(comments_returned),
+            "threads_returned": int(threads_returned),
+            "authors_returned": int(authors_returned),
+            "oldest_seen_at": oldest_seen_at,
+            "newest_seen_at": newest_seen_at,
+            "hit_post_cap": bool(hit_post_cap),
+            "hit_rss_cap": bool(hit_rss_cap),
+            "rate_limited": bool(rate_limited),
+            "collection_error": str(collection_error or ""),
+            "collection_completed": bool(collection_completed and not collection_error),
+            "canonical_trend_run": bool(canonical_trend_run),
+            "coverage_reliability": reliability,
+            "reliability_label": label,
+            "reliability_reason": reasons,
+        }
+
 
 def parse_source_input(raw_value: str) -> SourceCandidate | None:
     candidate = (raw_value or "").strip()
@@ -504,6 +656,74 @@ def canonicalize_thread_url(value: str) -> str:
 def slugify(value: str) -> str:
     normalized = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
     return normalized or "thread"
+
+
+def calculate_coverage_reliability(
+    *,
+    source_type: str,
+    scrape_mode: str,
+    window_start: datetime,
+    window_end: datetime,
+    oldest_seen_at: str,
+    posts_returned: int,
+    hit_post_cap: bool,
+    hit_rss_cap: bool,
+    rate_limited: bool,
+    collection_completed: bool,
+    collection_error: str,
+    canonical_trend_run: bool,
+) -> tuple[float, str, list[str]]:
+    reasons: list[str] = []
+    if not collection_completed or collection_error:
+        return 0.0, "Low", [collection_error or "Collection did not complete."]
+
+    score = 1.0
+    if not canonical_trend_run:
+        score *= 0.65
+        reasons.append("Discovery or comment-inclusive run; useful for evidence, weaker for acceleration.")
+    if source_type == "thread_url":
+        score *= 0.7
+        reasons.append("Single-thread source; not a broad subreddit sample.")
+    if rate_limited:
+        score *= 0.2
+        reasons.append("Reddit rate limit affected collection.")
+    if hit_rss_cap:
+        score *= 0.45
+        reasons.append("RSS cap was hit before the requested window was fully visible.")
+    if hit_post_cap:
+        score *= 0.75
+        reasons.append("Configured post cap stopped collection before the feed was exhausted.")
+    if posts_returned == 0:
+        score = 0.0
+        reasons.append("No posts returned for this source.")
+    elif posts_returned < 10:
+        score *= 0.55
+        reasons.append("Very small post sample.")
+    elif posts_returned < 30:
+        score *= 0.78
+        reasons.append("Post sample is below the preferred 30-post trend minimum.")
+
+    if oldest_seen_at:
+        try:
+            oldest = _parse_iso_datetime(oldest_seen_at)
+            window_seconds = max((window_end - window_start).total_seconds(), 1)
+            missed_fraction = max((oldest - window_start).total_seconds(), 0) / window_seconds
+            if missed_fraction > 0.35:
+                score *= 0.75
+                reasons.append("Oldest returned post does not cover much of the requested window.")
+        except (TypeError, ValueError):
+            reasons.append("Could not parse oldest returned timestamp.")
+
+    score = round(max(min(score, 1.0), 0.0), 3)
+    if score >= 0.8:
+        label = "High"
+    elif score >= 0.5:
+        label = "Medium"
+    else:
+        label = "Low"
+    if not reasons:
+        reasons.append("Comparable posts-only source sample.")
+    return score, label, reasons
 
 
 def _parse_iso_datetime(value: str) -> datetime:

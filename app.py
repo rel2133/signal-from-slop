@@ -45,11 +45,13 @@ from signal_from_the_slop.database import (
     load_run_mentions,
     load_run_summary,
     load_run_source_activity,
+    load_run_source_coverage,
     load_run_ticker_summaries,
     load_run_time_buckets,
     load_sources,
     replace_run_classifications,
     replace_run_mentions,
+    replace_run_source_coverage,
     replace_run_ticker_summaries,
     replace_run_time_buckets,
     update_sources,
@@ -127,6 +129,12 @@ PAGE_CONTEXT = {step["page"]: step["context"] for step in PAGE_STEPS}
 ACTIVE_RUN_STATUSES = {"running", "pausing", "paused", "cancelling"}
 CORPUS_SCOPE_ID = "__combined_completed_corpus__"
 CORPUS_SCOPE_LABEL = "Combined corpus (all completed runs)"
+RUN_TYPE_DISCOVERY = "discovery"
+RUN_TYPE_MEASUREMENT = "measurement"
+RUN_TYPE_LABELS = {
+    RUN_TYPE_MEASUREMENT: "Measurement",
+    RUN_TYPE_DISCOVERY: "Discovery",
+}
 RUN_CONTROL_POLL_SECONDS = 0.5
 RUN_HEARTBEAT_STALE_SECONDS = 45
 RUN_ORPHANED_CANCEL_SECONDS = 90
@@ -232,14 +240,24 @@ METRIC_GUIDE = [
         "how_it_is_determined": "Alpha signal minus hype/repetition penalties, capped to 0 to 100.",
     },
     {
-        "metric": "Acceleration",
-        "plain_english": "Whether mentions are rising compared with the previous bucket or scrape.",
-        "how_it_is_determined": "Uses mention change, growth rate, unique author/thread growth, and hype penalties.",
+        "metric": "Coverage-adjusted acceleration",
+        "plain_english": "Whether ticker attention is rising across comparable scrape coverage, not just raw mention count.",
+        "how_it_is_determined": "Measurement runs compare mention, thread, and author rates per scraped posts against the previous matched Measurement run, then apply coverage, hype, and repetition penalties.",
+    },
+    {
+        "metric": "Trend reliability",
+        "plain_english": "How much trust to put in the acceleration score.",
+        "how_it_is_determined": "Uses source coverage metadata: run type, post sample size, RSS/post caps, rate limits, and whether a matched Measurement baseline exists.",
+    },
+    {
+        "metric": "Mention rate",
+        "plain_english": "Ticker mentions normalized by scrape depth.",
+        "how_it_is_determined": "Ticker mentions divided by total posts scraped, shown as mentions per 100 posts.",
     },
     {
         "metric": "Emerging ticker score",
         "plain_english": "A lead-ranking score for tickers that may deserve follow-up.",
-        "how_it_is_determined": "Combines acceleration, source diversity, alpha score, evidence quality, low-volume bonus, and mega-cap penalty.",
+        "how_it_is_determined": "Combines adjusted acceleration, source diversity, alpha score, evidence quality, low-volume bonus, and mega-cap penalty.",
     },
     {
         "metric": "Source diversity",
@@ -675,7 +693,9 @@ def render_all_tickers_panel(summary_df: pd.DataFrame, mentions_df: pd.DataFrame
                 "ticker",
                 "company_name",
                 "total_mentions",
+                "mention_rate_per_100_posts",
                 "acceleration_score",
+                "trend_reliability",
                 "emerging_ticker_score",
                 "average_alpha_signal_score",
                 "average_hype_score",
@@ -687,7 +707,9 @@ def render_all_tickers_panel(summary_df: pd.DataFrame, mentions_df: pd.DataFrame
                 hide_index=True,
                 column_config={
                     "total_mentions": st.column_config.NumberColumn("Mentions", format="%d"),
-                    "acceleration_score": st.column_config.NumberColumn("Acceleration", format="%.1f"),
+                    "mention_rate_per_100_posts": st.column_config.NumberColumn("Mentions / 100 posts", format="%.2f"),
+                    "acceleration_score": st.column_config.NumberColumn("Adj. accel.", format="%.1f"),
+                    "trend_reliability": st.column_config.TextColumn("Reliability"),
                     "emerging_ticker_score": st.column_config.NumberColumn("Emerging", format="%.1f"),
                     "average_alpha_signal_score": st.column_config.NumberColumn("Alpha", format="%.1f"),
                     "average_hype_score": st.column_config.NumberColumn("Hype", format="%.1f"),
@@ -814,6 +836,18 @@ def build_corpus_frames(db_path: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
     long_df["trust_status"] = long_df.apply(classifier_trust_label, axis=1)
 
     summary_df = build_ticker_summaries(long_df)
+    if not summary_df.empty:
+        raw_acceleration = summary_df["acceleration_score"].astype(float).copy()
+        summary_df["coverage_adjusted_acceleration_score"] = 0.0
+        summary_df["acceleration_score"] = 0.0
+        summary_df["emerging_ticker_score"] = (
+            summary_df["emerging_ticker_score"].astype(float) - raw_acceleration * 0.45
+        ).clip(lower=0, upper=100).round(2)
+        summary_df["trend_reliability"] = "Corpus evidence"
+        summary_df["trend_reliability_reason"] = (
+            "Combined corpus has no single scrape denominator; use Measurement run comparisons for proper acceleration."
+        )
+        summary_df["coverage_reliability"] = 0.0
     long_df = apply_ticker_flags_to_mentions(long_df, summary_df) if not summary_df.empty else long_df
     bucket_df = build_time_bucket_summary(long_df) if not long_df.empty else pd.DataFrame()
     summary = build_run_summary(long_df, summary_df)
@@ -857,6 +891,7 @@ def selected_run_source_ids(run_record: dict[str, Any]) -> list[int]:
 
 def build_source_health_frame(
     activity_df: pd.DataFrame,
+    coverage_df: pd.DataFrame,
     run_record: dict[str, Any],
     source_lookup: dict[int, str],
 ) -> pd.DataFrame:
@@ -872,6 +907,51 @@ def build_source_health_frame(
         return pd.DataFrame()
 
     base = pd.DataFrame(records)
+    if coverage_df.empty:
+        base["posts_returned"] = 0
+        base["comments_returned"] = 0
+        base["coverage_reliability"] = 0.0
+        base["reliability_label"] = "Legacy"
+        base["hit_rss_cap"] = False
+        base["hit_post_cap"] = False
+        base["coverage_reason"] = "No saved scrape coverage metadata."
+        base["oldest_seen_at"] = ""
+        base["newest_seen_at"] = ""
+    else:
+        coverage = coverage_df.copy()
+        coverage["source_id"] = coverage["source_id"].fillna(-1).astype(int)
+        reason_column = "reliability_reason_json" if "reliability_reason_json" in coverage.columns else "reliability_reason"
+        coverage["coverage_reason"] = coverage[reason_column].map(
+            lambda value: "; ".join(coverage_reason_list(value)[:2])
+        ) if reason_column in coverage.columns else ""
+        base = base.merge(
+            coverage[
+                [
+                    "source_id",
+                    "posts_returned",
+                    "comments_returned",
+                    "coverage_reliability",
+                    "reliability_label",
+                    "hit_rss_cap",
+                    "hit_post_cap",
+                    "coverage_reason",
+                    "oldest_seen_at",
+                    "newest_seen_at",
+                ]
+            ],
+            on="source_id",
+            how="left",
+        )
+        for column in ("posts_returned", "comments_returned"):
+            base[column] = base[column].fillna(0).astype(int)
+        base["coverage_reliability"] = base["coverage_reliability"].fillna(0).astype(float)
+        base["reliability_label"] = base["reliability_label"].fillna("Low")
+        base["hit_rss_cap"] = base["hit_rss_cap"].fillna(False).astype(bool)
+        base["hit_post_cap"] = base["hit_post_cap"].fillna(False).astype(bool)
+        base["coverage_reason"] = base["coverage_reason"].fillna("")
+        base["oldest_seen_at"] = base["oldest_seen_at"].fillna("")
+        base["newest_seen_at"] = base["newest_seen_at"].fillna("")
+
     if activity_df.empty:
         base["items_analyzed"] = 0
         base["ticker_mentions"] = 0
@@ -888,7 +968,8 @@ def build_source_health_frame(
         base["ticker_mentions"] = base["ticker_mentions"].fillna(0).astype(int)
         base["newest_item_time"] = base["newest_item_time"].fillna("")
     base["status"] = base.apply(
-        lambda row: "No items" if int(row["items_analyzed"]) == 0 else (
+        lambda row: "No scrape" if int(row["posts_returned"]) == 0 and int(row["items_analyzed"]) == 0 else (
+            "No items" if int(row["items_analyzed"]) == 0 else
             "No tickers" if int(row["ticker_mentions"]) == 0 else "Active"
         ),
         axis=1,
@@ -906,28 +987,54 @@ def render_source_health(
 ) -> None:
     source_health = build_source_health_frame(
         load_run_source_activity(db_path, run_id),
+        load_run_source_coverage(db_path, run_id),
         run_record,
         source_lookup,
     )
     if source_health.empty:
         return
 
-    active_count = int((source_health["items_analyzed"] > 0).sum())
+    active_count = int((source_health["posts_returned"] > 0).sum())
     ticker_count = int((source_health["ticker_mentions"] > 0).sum())
     total_count = len(source_health)
+    low_count = int((source_health["reliability_label"] == "Low").sum())
     with st.expander(
-        f"Source coverage: {active_count}/{total_count} returned items, {ticker_count}/{total_count} produced ticker mentions",
+        f"Source coverage: {active_count}/{total_count} returned posts, {ticker_count}/{total_count} produced ticker mentions, {low_count} low reliability",
         expanded=expanded,
     ):
         st.dataframe(
-            source_health[["source_name", "status", "items_analyzed", "ticker_mentions", "newest_item_time"]],
+            source_health[
+                [
+                    "source_name",
+                    "status",
+                    "reliability_label",
+                    "coverage_reliability",
+                    "posts_returned",
+                    "comments_returned",
+                    "items_analyzed",
+                    "ticker_mentions",
+                    "hit_rss_cap",
+                    "hit_post_cap",
+                    "oldest_seen_at",
+                    "newest_seen_at",
+                    "coverage_reason",
+                ]
+            ],
             use_container_width=True,
             hide_index=True,
             column_config={
                 "source_name": st.column_config.TextColumn("Source"),
-                "items_analyzed": st.column_config.NumberColumn("Items", format="%d"),
+                "reliability_label": st.column_config.TextColumn("Reliability"),
+                "coverage_reliability": st.column_config.NumberColumn("Coverage", format="%.2f"),
+                "posts_returned": st.column_config.NumberColumn("Posts", format="%d"),
+                "comments_returned": st.column_config.NumberColumn("Comments", format="%d"),
+                "items_analyzed": st.column_config.NumberColumn("Analysed", format="%d"),
                 "ticker_mentions": st.column_config.NumberColumn("Ticker mentions", format="%d"),
-                "newest_item_time": st.column_config.TextColumn("Newest item"),
+                "hit_rss_cap": st.column_config.CheckboxColumn("RSS cap"),
+                "hit_post_cap": st.column_config.CheckboxColumn("Post cap"),
+                "oldest_seen_at": st.column_config.TextColumn("Oldest"),
+                "newest_seen_at": st.column_config.TextColumn("Newest"),
+                "coverage_reason": st.column_config.TextColumn("Reason", width="large"),
             },
         )
 
@@ -960,6 +1067,261 @@ def latest_matching_run(
     return None
 
 
+def coerce_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value in (None, ""):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def coerce_int(value: Any, default: int = 0) -> int:
+    try:
+        if value in (None, ""):
+            return default
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def coverage_reason_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return [str(item) for item in parsed if str(item).strip()]
+        except json.JSONDecodeError:
+            return [value]
+    return []
+
+
+def summarize_source_coverage(coverage_df: pd.DataFrame) -> dict[str, Any]:
+    if coverage_df.empty:
+        return {
+            "sources": 0,
+            "posts_returned": 0,
+            "comments_returned": 0,
+            "threads_returned": 0,
+            "authors_returned": 0,
+            "coverage_reliability": 0.0,
+            "reliability_label": "Legacy",
+            "low_reliability_sources": 0,
+            "rss_capped_sources": 0,
+            "post_capped_sources": 0,
+            "rate_limited_sources": 0,
+            "reasons": ["No saved source coverage metadata is available for this run."],
+        }
+
+    working = coverage_df.copy()
+    for column in (
+        "posts_returned",
+        "comments_returned",
+        "threads_returned",
+        "authors_returned",
+        "coverage_reliability",
+    ):
+        if column not in working.columns:
+            working[column] = 0
+    weights = working["posts_returned"].fillna(0).astype(float).clip(lower=1)
+    reliability = (
+        float((working["coverage_reliability"].fillna(0).astype(float) * weights).sum() / weights.sum())
+        if float(weights.sum()) > 0
+        else 0.0
+    )
+    label = "High" if reliability >= 0.8 else ("Medium" if reliability >= 0.5 else "Low")
+    reasons: list[str] = []
+    reason_column = "reliability_reason_json" if "reliability_reason_json" in working.columns else "reliability_reason"
+    if reason_column in working.columns:
+        for value in working[reason_column].tolist():
+            reasons.extend(coverage_reason_list(value))
+    reasons = list(dict.fromkeys(reasons))[:5]
+    return {
+        "sources": int(len(working)),
+        "posts_returned": int(working["posts_returned"].fillna(0).sum()),
+        "comments_returned": int(working["comments_returned"].fillna(0).sum()),
+        "threads_returned": int(working["threads_returned"].fillna(0).sum()),
+        "authors_returned": int(working["authors_returned"].fillna(0).sum()),
+        "coverage_reliability": round(reliability, 3),
+        "reliability_label": label,
+        "low_reliability_sources": int((working.get("reliability_label", "") == "Low").sum()) if "reliability_label" in working.columns else 0,
+        "rss_capped_sources": int(working.get("hit_rss_cap", pd.Series(dtype=bool)).fillna(False).astype(bool).sum()),
+        "post_capped_sources": int(working.get("hit_post_cap", pd.Series(dtype=bool)).fillna(False).astype(bool).sum()),
+        "rate_limited_sources": int(working.get("rate_limited", pd.Series(dtype=bool)).fillna(False).astype(bool).sum()),
+        "reasons": reasons or ["Comparable source sample."],
+    }
+
+
+def latest_previous_measurement_run(
+    db_path: Path,
+    *,
+    source_ids: list[int],
+    data_mode: str,
+) -> dict[str, Any] | None:
+    runs = load_analysis_runs(db_path)
+    if runs.empty:
+        return None
+
+    normalized_source_ids = sorted(int(source_id) for source_id in source_ids)
+    for row in runs.to_dict(orient="records"):
+        if row.get("status") != "completed" or row.get("data_mode") != data_mode:
+            continue
+        if str(row.get("run_type", RUN_TYPE_DISCOVERY)).lower() != RUN_TYPE_MEASUREMENT:
+            continue
+        if not bool(row.get("canonical_trend_run", False)):
+            continue
+        if int((row.get("summary_json") or {}).get("items_analyzed", 0)) <= 0:
+            continue
+        row_source_ids = sorted(int(source_id) for source_id in row.get("selected_source_ids", []))
+        if row_source_ids == normalized_source_ids:
+            return row
+    return None
+
+
+def bounded_rate_growth(current_rate: float, previous_rate: float) -> float:
+    if previous_rate <= 0:
+        if current_rate <= 0:
+            return 0.0
+        return min(current_rate / 0.25, 4.0)
+    return max(min((current_rate - previous_rate) / previous_rate, 4.0), -1.0)
+
+
+def apply_coverage_adjusted_trend_metrics(
+    *,
+    db_path: Path,
+    run_config: dict[str, Any],
+    ticker_summary_df: pd.DataFrame,
+    coverage_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    coverage_summary = summarize_source_coverage(coverage_df)
+    if ticker_summary_df.empty:
+        return ticker_summary_df, coverage_summary
+
+    working = ticker_summary_df.copy()
+    current_posts = max(int(coverage_summary["posts_returned"]), 0)
+    current_threads = max(int(coverage_summary["threads_returned"]), current_posts, 1)
+    current_authors = max(int(coverage_summary["authors_returned"]), 1)
+    working["total_posts_scraped"] = current_posts
+    working["mention_rate_per_100_posts"] = working["total_mentions"].map(
+        lambda value: round(coerce_float(value) / max(current_posts, 1) * 100, 3)
+    )
+    working["thread_rate_per_100_posts"] = working["unique_threads"].map(
+        lambda value: round(coerce_float(value) / max(current_threads, 1) * 100, 3)
+    )
+    working["author_rate_per_100_posts"] = working["unique_authors"].map(
+        lambda value: round(coerce_float(value) / max(current_authors, 1) * 100, 3)
+    )
+    working["coverage_reliability"] = float(coverage_summary["coverage_reliability"])
+    working["matched_source_count"] = int(coverage_summary["sources"])
+    working["previous_posts_scraped"] = 0
+
+    original_acceleration = working["acceleration_score"].astype(float).copy()
+    run_type = str(run_config.get("run_type", RUN_TYPE_DISCOVERY)).lower()
+    canonical_trend_run = bool(run_config.get("canonical_trend_run", False))
+    if run_type != RUN_TYPE_MEASUREMENT or not canonical_trend_run:
+        reason = "Discovery scrape is excluded from proper acceleration; use it for ticker discovery and evidence review."
+        working["coverage_adjusted_acceleration_score"] = 0.0
+        working["acceleration_score"] = 0.0
+        working["trend_reliability"] = "Discovery"
+        working["trend_reliability_reason"] = reason
+        working["emerging_ticker_score"] = (
+            working["emerging_ticker_score"].astype(float) - original_acceleration * 0.45
+        ).clip(lower=0, upper=100).round(2)
+        coverage_summary["trend_note"] = reason
+        return working, coverage_summary
+
+    previous_run = latest_previous_measurement_run(
+        db_path,
+        source_ids=[int(source_id) for source_id in run_config.get("selected_source_ids", [])],
+        data_mode=str(run_config.get("data_mode", "live")),
+    )
+    if not previous_run:
+        reason = "No previous measurement scrape exists for this exact source set yet."
+        working["coverage_adjusted_acceleration_score"] = 0.0
+        working["acceleration_score"] = 0.0
+        working["trend_reliability"] = "Needs baseline"
+        working["trend_reliability_reason"] = reason
+        working["emerging_ticker_score"] = (
+            working["emerging_ticker_score"].astype(float) - original_acceleration * 0.45
+        ).clip(lower=0, upper=100).round(2)
+        coverage_summary["trend_note"] = reason
+        return working, coverage_summary
+
+    previous_summary = load_run_ticker_summaries(db_path, str(previous_run["analysis_run_id"]))
+    previous_coverage_summary = summarize_source_coverage(
+        load_run_source_coverage(db_path, str(previous_run["analysis_run_id"]))
+    )
+    previous_posts = max(int(previous_coverage_summary["posts_returned"]), 0)
+    previous_by_ticker = {
+        str(row["ticker"]): row
+        for row in previous_summary.to_dict(orient="records")
+    } if not previous_summary.empty else {}
+
+    adjusted_scores: list[float] = []
+    reliability_labels: list[str] = []
+    reliability_reasons: list[str] = []
+    previous_post_counts: list[int] = []
+    coverage_reliabilities: list[float] = []
+    for row in working.to_dict(orient="records"):
+        ticker = str(row["ticker"])
+        previous_row = previous_by_ticker.get(ticker, {})
+        previous_mention_rate = coerce_float(previous_row.get("mention_rate_per_100_posts"))
+        previous_thread_rate = coerce_float(previous_row.get("thread_rate_per_100_posts"))
+        previous_author_rate = coerce_float(previous_row.get("author_rate_per_100_posts"))
+        if previous_posts and previous_mention_rate <= 0 and previous_row:
+            previous_mention_rate = coerce_float(previous_row.get("total_mentions")) / previous_posts * 100
+
+        mention_growth = bounded_rate_growth(coerce_float(row.get("mention_rate_per_100_posts")), previous_mention_rate)
+        thread_growth = bounded_rate_growth(coerce_float(row.get("thread_rate_per_100_posts")), previous_thread_rate)
+        author_growth = bounded_rate_growth(coerce_float(row.get("author_rate_per_100_posts")), previous_author_rate)
+        growth_blend = (0.45 * mention_growth) + (0.30 * thread_growth) + (0.25 * author_growth)
+        raw_score = max(min(growth_blend * 35, 100), 0)
+
+        reliability = min(
+            coerce_float(coverage_summary["coverage_reliability"]),
+            coerce_float(previous_coverage_summary["coverage_reliability"]),
+        )
+        reasons = [*coverage_summary.get("reasons", [])[:2]]
+        if previous_posts < 30 or current_posts < 30:
+            reliability = min(reliability, 0.3)
+            reasons.append("Current or previous measurement sample is below 30 posts.")
+        if not previous_row:
+            reasons.append("Ticker was not present in the previous matched measurement run.")
+        if previous_coverage_summary.get("rss_capped_sources"):
+            reasons.append("Previous measurement had at least one RSS-capped source.")
+        if coverage_summary.get("rss_capped_sources"):
+            reasons.append("Current measurement had at least one RSS-capped source.")
+
+        hype_penalty = max(0.45, 1 - max(coerce_float(row.get("average_hype_score")) - 4, 0) * 0.07)
+        repetition_penalty = max(0.55, 1 - coerce_float(row.get("repetition_score")) * 0.04)
+        final_score = round(max(min(raw_score * reliability * hype_penalty * repetition_penalty, 100), 0), 2)
+        label = "High" if reliability >= 0.8 else ("Medium" if reliability >= 0.5 else "Low")
+
+        adjusted_scores.append(final_score)
+        reliability_labels.append(label)
+        reliability_reasons.append("; ".join(list(dict.fromkeys(reasons))[:4]))
+        previous_post_counts.append(previous_posts)
+        coverage_reliabilities.append(round(reliability, 3))
+
+    working["coverage_adjusted_acceleration_score"] = adjusted_scores
+    working["acceleration_score"] = working["coverage_adjusted_acceleration_score"]
+    working["trend_reliability"] = reliability_labels
+    working["trend_reliability_reason"] = reliability_reasons
+    working["previous_posts_scraped"] = previous_post_counts
+    working["coverage_reliability"] = coverage_reliabilities
+    working["emerging_ticker_score"] = (
+        working["emerging_ticker_score"].astype(float)
+        - original_acceleration * 0.45
+        + working["coverage_adjusted_acceleration_score"].astype(float) * 0.45
+    ).clip(lower=0, upper=100).round(2)
+    coverage_summary["trend_note"] = f"Compared against previous measurement run {previous_run['analysis_run_id']}."
+    coverage_summary["previous_run_id"] = str(previous_run["analysis_run_id"])
+    coverage_summary["previous_posts_returned"] = previous_posts
+    return working, coverage_summary
+
+
 def save_run_artifacts(
     *,
     artifacts_dir: Path,
@@ -968,6 +1330,7 @@ def save_run_artifacts(
     summary: dict[str, Any],
     items: list[dict[str, Any]],
     classifications: list[dict[str, Any]],
+    source_coverage_df: pd.DataFrame,
     mentions_df: pd.DataFrame,
     ticker_summary_df: pd.DataFrame,
     time_bucket_df: pd.DataFrame,
@@ -987,6 +1350,7 @@ def save_run_artifacts(
         encoding="utf-8",
     )
     mentions_df.to_csv(run_dir / "mentions.csv", index=False)
+    source_coverage_df.to_csv(run_dir / "source_coverage.csv", index=False)
     ticker_summary_df.to_csv(run_dir / "ticker_summary.csv", index=False)
     time_bucket_df.to_csv(run_dir / "ticker_time_buckets.csv", index=False)
 
@@ -1176,6 +1540,7 @@ def force_cancel_analysis_run(db_path: Path, analysis_run_id: str, reason: str) 
 
 def build_run_config(
     *,
+    run_type: str,
     model_name: str,
     ollama_url: str,
     selected_sources: list[dict[str, Any]],
@@ -1188,8 +1553,12 @@ def build_run_config(
     skip_previously_analyzed: bool,
     run_deeper_analysis: bool,
 ) -> dict[str, Any]:
+    normalized_run_type = str(run_type or RUN_TYPE_DISCOVERY).lower()
+    canonical_trend_run = normalized_run_type == RUN_TYPE_MEASUREMENT and not include_comments
     return {
         "data_mode": "live",
+        "run_type": normalized_run_type,
+        "canonical_trend_run": canonical_trend_run,
         "selected_source_ids": [int(source["source_id"]) for source in selected_sources],
         "selected_sources": [
             {
@@ -1462,7 +1831,8 @@ def build_run_display_label(run_record: dict[str, Any], source_lookup: dict[int,
     items_analyzed = int(summary.get("items_analyzed", 0))
     status = str(run_record.get("status", "")).upper()
     status_prefix = f"{status} | " if status and status != "COMPLETED" else ""
-    return f"{status_prefix}{timestamp} | {source_label} | {items_analyzed} items"
+    run_type_label = RUN_TYPE_LABELS.get(str(run_record.get("run_type", RUN_TYPE_DISCOVERY)).lower(), "Discovery")
+    return f"{status_prefix}{timestamp} | {run_type_label} | {source_label} | {items_analyzed} items"
 
 
 def run_has_analysed_items(run_record: dict[str, Any]) -> bool:
@@ -1945,6 +2315,7 @@ def run_analysis_pipeline(
     skipped_existing_count = 0
     fallback_count = 0
     run_completed = False
+    source_coverage_rows: list[dict[str, Any]] = []
 
     def failure_summary(stage: str, error: Exception | str) -> dict[str, Any]:
         runtime = (
@@ -1976,6 +2347,9 @@ def run_analysis_pipeline(
             "low_mentions_high_signal_count": 0,
             "newly_detected_tickers_count": 0,
             "fallback_count": fallback_count,
+            "coverage": summarize_source_coverage(pd.DataFrame(source_coverage_rows)),
+            "run_type": run_config.get("run_type", RUN_TYPE_DISCOVERY),
+            "canonical_trend_run": bool(run_config.get("canonical_trend_run", False)),
             "failed_stage": stage,
             "error_message": str(error),
             "runtime": runtime,
@@ -1999,6 +2373,9 @@ def run_analysis_pipeline(
             "low_mentions_high_signal_count": 0,
             "newly_detected_tickers_count": 0,
             "fallback_count": fallback_count,
+            "coverage": summarize_source_coverage(pd.DataFrame(source_coverage_rows)),
+            "run_type": run_config.get("run_type", RUN_TYPE_DISCOVERY),
+            "canonical_trend_run": bool(run_config.get("canonical_trend_run", False)),
             "no_new_items": True,
             "status_message": message,
             "runtime": {
@@ -2015,6 +2392,8 @@ def run_analysis_pipeline(
     def complete_empty_run(message: str) -> tuple[str, dict[str, Any]]:
         summary = empty_success_summary(message)
         empty_frame = pd.DataFrame()
+        source_coverage_df = pd.DataFrame(source_coverage_rows)
+        replace_run_source_coverage(db_path, run_id, source_coverage_rows)
         save_run_artifacts(
             artifacts_dir=artifacts_dir,
             run_id=run_id,
@@ -2022,6 +2401,7 @@ def run_analysis_pipeline(
             summary=summary,
             items=[],
             classifications=[],
+            source_coverage_df=source_coverage_df,
             mentions_df=empty_frame,
             ticker_summary_df=empty_frame,
             time_bucket_df=empty_frame,
@@ -2076,6 +2456,7 @@ def run_analysis_pipeline(
             max_posts_per_source=max_posts_per_source,
             max_comments_per_thread=max_comments_per_thread,
             include_comments=include_comments,
+            run_type=str(run_config.get("run_type", RUN_TYPE_DISCOVERY)),
             progress_callback=lambda payload: report(
                 stage="scraping",
                 message=str(payload.get("message", "Scraping Reddit sources...")),
@@ -2089,6 +2470,7 @@ def run_analysis_pipeline(
                 progress_total=int(payload.get("total", len(selected_sources)) or len(selected_sources) or 0),
                 progress_unit=str(payload.get("unit", "sources") or "sources"),
             ),
+            coverage_callback=lambda coverage: source_coverage_rows.append(coverage),
             checkpoint=checkpoint,
         )
         if not items:
@@ -2248,6 +2630,13 @@ def run_analysis_pipeline(
         ]
         long_df = pd.DataFrame(final_mentions)
         ticker_summary_df = build_ticker_summaries(long_df) if not long_df.empty else pd.DataFrame()
+        source_coverage_df = pd.DataFrame(source_coverage_rows)
+        ticker_summary_df, coverage_summary = apply_coverage_adjusted_trend_metrics(
+            db_path=db_path,
+            run_config=run_config,
+            ticker_summary_df=ticker_summary_df,
+            coverage_df=source_coverage_df,
+        )
         long_df = apply_ticker_flags_to_mentions(long_df, ticker_summary_df) if not long_df.empty else long_df
         time_bucket_df = build_time_bucket_summary(long_df) if not long_df.empty else pd.DataFrame()
         summary = build_run_summary(long_df, ticker_summary_df)
@@ -2261,6 +2650,9 @@ def run_analysis_pipeline(
         summary["neutral_items"] = item_sentiments.count("neutral")
         summary["irrelevant_items"] = item_sentiments.count("irrelevant")
         summary["fallback_count"] = fallback_count
+        summary["coverage"] = coverage_summary
+        summary["run_type"] = run_config.get("run_type", RUN_TYPE_DISCOVERY)
+        summary["canonical_trend_run"] = bool(run_config.get("canonical_trend_run", False))
 
         checkpoint()
         report(
@@ -2277,6 +2669,7 @@ def run_analysis_pipeline(
         replaceable_buckets = time_bucket_df.to_dict(orient="records") if not time_bucket_df.empty else []
         upsert_reddit_items(db_path, item_rows)
         replace_run_classifications(db_path, run_id, list(classification_rows.values()))
+        replace_run_source_coverage(db_path, run_id, source_coverage_rows)
         replace_run_mentions(db_path, run_id, replaceable_mentions)
         replace_run_ticker_summaries(db_path, run_id, replaceable_summaries)
         replace_run_time_buckets(db_path, run_id, replaceable_buckets)
@@ -2287,6 +2680,7 @@ def run_analysis_pipeline(
             summary=summary,
             items=item_rows,
             classifications=list(classification_rows.values()),
+            source_coverage_df=source_coverage_df,
             mentions_df=long_df,
             ticker_summary_df=ticker_summary_df,
             time_bucket_df=time_bucket_df,
@@ -2297,11 +2691,16 @@ def run_analysis_pipeline(
     except AnalysisRunCancelled as exc:
         summary = failure_summary("cancelled", exc)
         summary["cancelled"] = True
+        try:
+            replace_run_source_coverage(db_path, run_id, source_coverage_rows)
+        except Exception:
+            logging.exception("Failed to save source coverage for cancelled run %s", run_id)
         cancel_analysis_run_local(db_path, run_id, summary)
         raise
     except Exception as exc:
         if not run_completed:
             try:
+                replace_run_source_coverage(db_path, run_id, source_coverage_rows)
                 fail_analysis_run(db_path, run_id, failure_summary("collection_or_analysis", exc))
             except Exception:
                 logging.exception("Failed to mark analysis run %s as failed", run_id)
@@ -2361,6 +2760,7 @@ def start_background_analysis_run(
     ticker_path: Path,
     db_path: Path,
     artifacts_dir: Path,
+    run_type: str,
     model_name: str,
     ollama_url: str,
     selected_sources: list[dict[str, Any]],
@@ -2383,6 +2783,7 @@ def start_background_analysis_run(
             )
 
     run_config = build_run_config(
+        run_type=run_type,
         model_name=model_name,
         ollama_url=ollama_url,
         selected_sources=selected_sources,
@@ -2680,6 +3081,19 @@ def render_run_analysis_page(
             "A scrape is already running in the background. Pause, resume, or cancel it from the live run bar above."
         )
 
+    run_type_label = st.radio(
+        "Run type",
+        [RUN_TYPE_LABELS[RUN_TYPE_MEASUREMENT], RUN_TYPE_LABELS[RUN_TYPE_DISCOVERY]],
+        index=0,
+        horizontal=True,
+        help=(
+            "Measurement runs are controlled posts-only samples used for coverage-adjusted trends. "
+            "Discovery runs can include comments and flexible depth, but are down-weighted for acceleration."
+        ),
+    )
+    run_type = RUN_TYPE_MEASUREMENT if run_type_label == RUN_TYPE_LABELS[RUN_TYPE_MEASUREMENT] else RUN_TYPE_DISCOVERY
+    measurement_run = run_type == RUN_TYPE_MEASUREMENT
+
     selected_source_ids = st.multiselect(
         "Active sources to include",
         active_sources["source_id"].tolist(),
@@ -2728,7 +3142,7 @@ def render_run_analysis_page(
             "Max posts per source",
             min_value=1,
             max_value=REDDIT_SUBREDDIT_RSS_LIMIT,
-            value=25,
+            value=30 if measurement_run else 25,
             step=5,
             help=(
                 "Public Reddit RSS can return up to roughly the newest "
@@ -2742,12 +3156,20 @@ def render_run_analysis_page(
             "Max comments per thread",
             min_value=0,
             max_value=100,
-            value=4,
+            value=0 if measurement_run else 4,
             step=1,
             help="Comments multiply the number of items sent to Ollama. Set this to 0 for faster posts-only runs.",
+            disabled=measurement_run,
         )
     )
-    item_scope = st.radio("Analyse scope", ["Posts + comments", "Posts only"], horizontal=True)
+    item_scope = st.radio(
+        "Analyse scope",
+        ["Posts + comments", "Posts only"],
+        index=1 if measurement_run else 0,
+        horizontal=True,
+        disabled=measurement_run,
+        help="Measurement runs stay posts-only so ticker acceleration is based on comparable independent attention events.",
+    )
     include_comments = item_scope == "Posts + comments"
     selected_source_count = len(selected_source_ids)
     estimated_items = selected_source_count * max_posts_per_source
@@ -2764,6 +3186,8 @@ def render_run_analysis_page(
             f"{REDDIT_SUBREDDIT_RSS_LIMIT} is the current per-subreddit ceiling for the public RSS collector. "
             "For deeper history than that, run smaller rolling windows or add Reddit API pagination later."
         )
+    if measurement_run and max_posts_per_source < 30:
+        st.warning("Measurement runs below 30 posts per source will be marked lower reliability for acceleration.")
     if estimated_items >= 500:
         st.warning(
             "This is a large local Ollama run. It can work, but leave the terminal and Ollama running, "
@@ -2822,6 +3246,7 @@ def render_run_analysis_page(
                 ticker_path=ticker_path,
                 db_path=db_path,
                 artifacts_dir=artifacts_dir,
+                run_type=run_type,
                 model_name=model_name,
                 ollama_url=ollama_url,
                 selected_sources=selected_sources,
@@ -2857,6 +3282,17 @@ def render_run_summary_cards(summary: dict[str, Any]) -> None:
     extra[2].metric("Low-mention high-signal", summary.get("low_mentions_high_signal_count", 0))
     extra[3].metric("Newly detected tickers", summary.get("newly_detected_tickers_count", 0))
 
+    coverage = summary.get("coverage", {}) if isinstance(summary.get("coverage", {}), dict) else {}
+    if coverage:
+        coverage_cols = st.columns(4)
+        coverage_cols[0].metric("Run type", RUN_TYPE_LABELS.get(str(summary.get("run_type", RUN_TYPE_DISCOVERY)).lower(), "Discovery"))
+        coverage_cols[1].metric("Trend reliability", coverage.get("reliability_label", "Unknown"))
+        coverage_cols[2].metric("Posts scraped", coverage.get("posts_returned", 0))
+        coverage_cols[3].metric("RSS-capped sources", coverage.get("rss_capped_sources", 0))
+        trend_note = str(coverage.get("trend_note", "") or "")
+        if trend_note:
+            st.caption(trend_note)
+
     top_cols = st.columns(2)
     with top_cols[0]:
         top_mentioned = [
@@ -2876,7 +3312,7 @@ def render_run_summary_cards(summary: dict[str, Any]) -> None:
         ]
         render_copyable_ticker_chips(
             [str(row.get("ticker", "")) for row in top_accelerating],
-            label="Top accelerating tickers",
+            label="Top adjusted acceleration",
             help_text="Click to copy ticker.",
             max_items=8,
         )
@@ -2927,7 +3363,7 @@ def render_corpus_summary_cards(summary: dict[str, Any]) -> None:
         ]
         render_copyable_ticker_chips(
             [str(row.get("ticker", "")) for row in top_accelerating],
-            label="Top accelerating tickers",
+            label="Top adjusted acceleration",
             help_text="Click to copy ticker.",
             max_items=8,
         )
@@ -3179,6 +3615,10 @@ def render_run_metadata(db_path: Path, run_id: str) -> None:
     ]
 
     with st.expander("Run metadata", expanded=False):
+        run_type = str(run_record.get("run_type", RUN_TYPE_DISCOVERY)).title()
+        trend_status = "Yes" if bool(run_record.get("canonical_trend_run", False)) else "No"
+        st.write(f"Run type: `{run_type}`")
+        st.write(f"Canonical trend sample: `{trend_status}`")
         st.write(f"Collected window: `{run_record['time_window_start']}` to `{run_record['time_window_end']}`")
         st.write(f"Started at: `{run_record['started_at']}`")
         if run_record.get("completed_at"):
@@ -3198,7 +3638,7 @@ ZERO_FILL_TREND_METRICS = {
 }
 WITHIN_RUN_METRICS = {
     "total_mentions": "Mentions",
-    "acceleration_score": "Acceleration score",
+    "acceleration_score": "Coverage-adjusted acceleration",
     "emerging_ticker_score": "Emerging ticker score",
     "average_alpha_signal_score": "Average alpha signal",
     "average_hype_adjusted_signal_score": "Average hype-adjusted signal",
@@ -3209,13 +3649,16 @@ HISTORY_METRICS = {
     "total_mentions": "Mentions per scrape",
     "mentions_this_period": "Mentions in scrape window",
     "mention_change": "Mention delta inside scrape",
-    "acceleration_score": "Acceleration score",
+    "mention_rate_per_100_posts": "Mentions per 100 posts",
+    "acceleration_score": "Coverage-adjusted acceleration",
     "emerging_ticker_score": "Emerging ticker score",
     "average_alpha_signal_score": "Average alpha signal",
     "source_diversity_score": "Source diversity",
+    "coverage_reliability": "Trend reliability",
 }
 METRIC_DOMAINS = {
     "acceleration_score": [0, 100],
+    "coverage_adjusted_acceleration_score": [0, 100],
     "emerging_ticker_score": [0, 100],
     "average_alpha_signal_score": [0, 100],
     "average_hype_adjusted_signal_score": [0, 100],
@@ -3223,6 +3666,7 @@ METRIC_DOMAINS = {
     "average_depth_score": [0, 10],
     "average_claim_specificity_score": [0, 10],
     "source_diversity_score": [0, 10],
+    "coverage_reliability": [0, 1],
     "controversy_score": [0, 10],
     "net_sentiment_score": [-1, 1],
 }
@@ -3230,7 +3674,9 @@ COMPARISON_COLUMNS = [
     "total_mentions",
     "mentions_this_period",
     "mention_change",
+    "mention_rate_per_100_posts",
     "acceleration_score",
+    "coverage_reliability",
     "emerging_ticker_score",
     "average_alpha_signal_score",
     "source_diversity_score",
@@ -3328,7 +3774,7 @@ def build_run_comparison_frame(
     merged["movement_score"] = merged[movement_columns].abs().sum(axis=1) if movement_columns else 0
     if "total_mentions_delta" in merged.columns and "acceleration_score_delta" in merged.columns:
         merged["movement"] = merged.apply(
-            lambda row: f"{format_delta(row['total_mentions_delta'])} mentions / {format_delta(row['acceleration_score_delta'], decimals=1)} accel",
+            lambda row: f"{format_delta(row['total_mentions_delta'])} mentions / {format_delta(row['acceleration_score_delta'], decimals=1)} adj. accel",
             axis=1,
         )
     return merged.sort_values(["movement_score", "ticker"], ascending=[False, True])
@@ -3387,9 +3833,9 @@ def render_change_summary(
         row = accel_jump.iloc[0]
         cards.append(
             {
-                "label": "Acceleration jump",
+                "label": "Adjusted acceleration",
                 "value": str(row["ticker"]),
-                "note": f"{format_delta(row.get('acceleration_score_delta'), decimals=1)} acceleration",
+                "note": f"{format_delta(row.get('acceleration_score_delta'), decimals=1)} coverage-adjusted acceleration",
             }
         )
     if not emerging.empty:
@@ -3487,7 +3933,7 @@ def render_ticker_focus(
         metric_cols = st.columns(5)
         metric_cols[0].metric("Mentions", int(ticker_row.get("total_mentions", 0)))
         metric_cols[1].metric("Emerging", f"{float(ticker_row.get('emerging_ticker_score', 0)):.1f}")
-        metric_cols[2].metric("Acceleration", f"{float(ticker_row.get('acceleration_score', 0)):.1f}")
+        metric_cols[2].metric("Adj. accel.", f"{float(ticker_row.get('acceleration_score', 0)):.1f}")
         metric_cols[3].metric("Alpha", f"{float(ticker_row.get('average_alpha_signal_score', 0)):.1f}")
         metric_cols[4].metric("Hype", f"{float(ticker_row.get('average_hype_score', 0)):.1f}")
 
@@ -3672,6 +4118,8 @@ def render_signal_map(summary_df: pd.DataFrame) -> None:
                 "total_mentions:Q",
                 "emerging_ticker_score:Q",
                 "acceleration_score:Q",
+                "mention_rate_per_100_posts:Q",
+                "trend_reliability:N",
                 "average_alpha_signal_score:Q",
                 "source_diversity_score:Q",
                 "net_sentiment_score:Q",
@@ -3698,7 +4146,7 @@ def render_acceleration_bar(summary_df: pd.DataFrame) -> None:
         alt.Chart(bar_df)
         .mark_bar()
         .encode(
-            x=alt.X("acceleration_score:Q", title="Acceleration score", scale=alt.Scale(domain=[0, 100], nice=True)),
+            x=alt.X("acceleration_score:Q", title="Coverage-adjusted acceleration", scale=alt.Scale(domain=[0, 100], nice=True)),
             y=alt.Y("ticker:N", title=None, sort=None),
             color=alt.Color(
                 "average_hype_score:Q",
@@ -3709,6 +4157,8 @@ def render_acceleration_bar(summary_df: pd.DataFrame) -> None:
                 "ticker:N",
                 "company_name:N",
                 "acceleration_score:Q",
+                "mention_rate_per_100_posts:Q",
+                "trend_reliability:N",
                 "mentions_this_period:Q",
                 "mentions_previous_period:Q",
                 "average_hype_score:Q",
@@ -3728,10 +4178,13 @@ def render_ticker_summary_table(summary_df: pd.DataFrame) -> None:
         "ticker",
         "company_name",
         "total_mentions",
+        "mention_rate_per_100_posts",
         "mentions_this_period",
         "mentions_previous_period",
         "mention_change",
         "acceleration_score",
+        "trend_reliability",
+        "coverage_reliability",
         "emerging_ticker_score",
         "average_alpha_signal_score",
         "average_hype_score",
@@ -3749,7 +4202,10 @@ def render_ticker_summary_table(summary_df: pd.DataFrame) -> None:
             "watched": st.column_config.CheckboxColumn("Watch"),
             "ticker": st.column_config.TextColumn("Ticker", width="small"),
             "company_name": st.column_config.TextColumn("Company", width="medium"),
-            "acceleration_score": st.column_config.NumberColumn("Acceleration", format="%.1f"),
+            "mention_rate_per_100_posts": st.column_config.NumberColumn("Mentions / 100 posts", format="%.2f"),
+            "acceleration_score": st.column_config.NumberColumn("Adj. accel.", format="%.1f"),
+            "trend_reliability": st.column_config.TextColumn("Reliability"),
+            "coverage_reliability": st.column_config.NumberColumn("Coverage", format="%.2f"),
             "emerging_ticker_score": st.column_config.NumberColumn("Emerging", format="%.1f"),
             "average_alpha_signal_score": st.column_config.NumberColumn("Alpha", format="%.1f"),
             "average_hype_score": st.column_config.NumberColumn("Hype", format="%.1f"),
@@ -3848,7 +4304,8 @@ def render_results_dashboard_page(db_path: Path, run_id: str | None) -> None:
         st.subheader(CORPUS_SCOPE_LABEL)
         st.caption(
             "This combines all completed live runs into one deduped item-level dataset. "
-            "If the same Reddit item/ticker appears in overlapping scrapes, the newest completed classification is kept."
+            "If the same Reddit item/ticker appears in overlapping scrapes, the newest completed classification is kept. "
+            "Coverage-adjusted acceleration is reserved for matched Measurement runs."
         )
         render_corpus_summary_cards(summary)
         if long_df.empty:
@@ -3905,7 +4362,8 @@ def render_ticker_trends_page(db_path: Path, run_id: str | None) -> None:
         long_df, summary_df, bucket_df, summary = build_corpus_frames(db_path)
         st.subheader(CORPUS_SCOPE_LABEL)
         st.caption(
-            "The combined timeline uses Reddit item dates across every completed live run, with overlapping item/ticker mentions counted once."
+            "The combined timeline uses Reddit item dates across every completed live run, with overlapping item/ticker mentions counted once. "
+            "Use individual Measurement runs for coverage-adjusted acceleration."
         )
         if summary_df.empty:
             st.info("No completed ticker history is available in the combined corpus yet.")
@@ -3915,7 +4373,7 @@ def render_ticker_trends_page(db_path: Path, run_id: str | None) -> None:
         metric_cols[0].metric("Runs", int(summary.get("runs_included", 0)))
         metric_cols[1].metric("Tickers", int(summary_df["ticker"].nunique()))
         metric_cols[2].metric("Mentions", int(summary_df["total_mentions"].sum()))
-        metric_cols[3].metric("Best acceleration", f"{float(summary_df['acceleration_score'].max()):.1f}")
+        metric_cols[3].metric("Best adj. accel.", f"{float(summary_df['acceleration_score'].max()):.1f}")
         metric_cols[4].metric("Overlap rows removed", int(summary.get("deduplicated_mentions_removed", 0)))
         render_all_tickers_panel(summary_df, long_df)
         render_metric_guide("Metric guide for Trends", expanded=False)
@@ -3973,7 +4431,7 @@ def render_ticker_trends_page(db_path: Path, run_id: str | None) -> None:
             with map_cols[0]:
                 render_signal_map(summary_df)
             with map_cols[1]:
-                st.write("Top acceleration")
+                st.write("Top adjusted acceleration")
                 render_acceleration_bar(summary_df)
 
         with table_tab:
@@ -4043,7 +4501,7 @@ def render_ticker_trends_page(db_path: Path, run_id: str | None) -> None:
     metric_cols[0].metric("Tickers", int(summary_df["ticker"].nunique()))
     metric_cols[1].metric("Mentions", int(summary_df["total_mentions"].sum()))
     metric_cols[2].metric("Top emerging", str(summary_df.iloc[0]["ticker"]))
-    metric_cols[3].metric("Best acceleration", f"{float(summary_df['acceleration_score'].max()):.1f}")
+    metric_cols[3].metric("Best adj. accel.", f"{float(summary_df['acceleration_score'].max()):.1f}")
     metric_cols[4].metric("Low-hype leads", int(summary_df["low_mentions_high_signal"].sum()))
     render_all_tickers_panel(summary_df, long_df)
     render_metric_guide("Metric guide for Trends", expanded=False)
@@ -4053,6 +4511,11 @@ def render_ticker_trends_page(db_path: Path, run_id: str | None) -> None:
         data_mode=str(run_record["data_mode"]),
         selected_source_ids_json=json.dumps(run_record.get("selected_source_ids", []), ensure_ascii=True),
     )
+    if str(run_record.get("run_type", RUN_TYPE_DISCOVERY)).lower() == RUN_TYPE_MEASUREMENT and not historical_summary_df.empty:
+        historical_summary_df = historical_summary_df[
+            (historical_summary_df["run_type"].astype(str).str.lower() == RUN_TYPE_MEASUREMENT)
+            & (historical_summary_df["canonical_trend_run"].fillna(False).astype(bool))
+        ].copy()
     history_df = prepare_historical_summary_frame(historical_summary_df, run_label_lookup)
     previous_run_id = previous_history_run_id(history_df, run_id)
     previous_label = run_label_lookup.get(str(previous_run_id), str(previous_run_id)) if previous_run_id else None
@@ -4174,9 +4637,9 @@ def render_ticker_trends_page(db_path: Path, run_id: str | None) -> None:
                         "total_mentions_baseline": st.column_config.NumberColumn("Base mentions", format="%d"),
                         "total_mentions_current": st.column_config.NumberColumn("Current mentions", format="%d"),
                         "total_mentions_delta": st.column_config.NumberColumn("Mention change", format="%+d"),
-                        "acceleration_score_baseline": st.column_config.NumberColumn("Base accel.", format="%.1f"),
-                        "acceleration_score_current": st.column_config.NumberColumn("Current accel.", format="%.1f"),
-                        "acceleration_score_delta": st.column_config.NumberColumn("Accel. change", format="%+.1f"),
+                        "acceleration_score_baseline": st.column_config.NumberColumn("Base adj. accel.", format="%.1f"),
+                        "acceleration_score_current": st.column_config.NumberColumn("Current adj. accel.", format="%.1f"),
+                        "acceleration_score_delta": st.column_config.NumberColumn("Adj. accel. change", format="%+.1f"),
                         "emerging_ticker_score_current": st.column_config.NumberColumn("Current emerging", format="%.1f"),
                         "emerging_ticker_score_delta": st.column_config.NumberColumn("Emerging change", format="%+.1f"),
                         "average_alpha_signal_score_current": st.column_config.NumberColumn("Current alpha", format="%.1f"),
@@ -4248,7 +4711,7 @@ def render_ticker_trends_page(db_path: Path, run_id: str | None) -> None:
         with map_cols[0]:
             render_signal_map(summary_df)
         with map_cols[1]:
-            st.write("Top acceleration")
+            st.write("Top adjusted acceleration")
             render_acceleration_bar(summary_df)
 
         focus_df = summary_df[summary_df["low_mentions_high_signal"] | summary_df["new_ticker_detected"]]
@@ -4428,6 +4891,8 @@ def render_settings_page(db_path: Path, ticker_path: Path, artifacts_dir: Path) 
             run_health["tickers_found"] = run_health["summary_json"].map(lambda value: int((value or {}).get("tickers_found", 0)))
             run_health["fallback_count"] = run_health["summary_json"].map(lambda value: int((value or {}).get("fallback_count", 0)))
             run_health["error_message"] = run_health["summary_json"].map(lambda value: str((value or {}).get("error_message", "")))
+            run_health["coverage_label"] = run_health["summary_json"].map(lambda value: str(((value or {}).get("coverage", {}) or {}).get("reliability_label", "")))
+            run_health["posts_returned"] = run_health["summary_json"].map(lambda value: int(((value or {}).get("coverage", {}) or {}).get("posts_returned", 0) or 0))
             run_health["elapsed_minutes"] = run_health.apply(lambda row: run_elapsed_minutes(row.to_dict()) or 0, axis=1)
             run_health["heartbeat_age_seconds"] = run_health.apply(lambda row: run_heartbeat_age_seconds(row.to_dict()), axis=1)
             run_health["elapsed"] = run_health.apply(
@@ -4459,11 +4924,15 @@ def render_settings_page(db_path: Path, ticker_path: Path, artifacts_dir: Path) 
                     [
                         "analysis_run_id",
                         "status",
+                        "run_type",
+                        "canonical_trend_run",
                         "started_at",
                         "completed_at",
                         "elapsed",
                         "time_window_label",
                         "items_scraped",
+                        "posts_returned",
+                        "coverage_label",
                         "items_skipped_existing",
                         "items_collected",
                         "items_analyzed",
@@ -4478,6 +4947,8 @@ def render_settings_page(db_path: Path, ticker_path: Path, artifacts_dir: Path) 
                 column_config={
                     "analysis_run_id": st.column_config.TextColumn("Run"),
                     "items_scraped": st.column_config.NumberColumn("Scraped", format="%d"),
+                    "posts_returned": st.column_config.NumberColumn("Posts", format="%d"),
+                    "coverage_label": st.column_config.TextColumn("Coverage"),
                     "items_skipped_existing": st.column_config.NumberColumn("Skipped existing", format="%d"),
                     "items_collected": st.column_config.NumberColumn("Collected", format="%d"),
                     "items_analyzed": st.column_config.NumberColumn("Analysed", format="%d"),

@@ -23,8 +23,11 @@ def init_db(db_path: str | Path, schema_path: str | Path) -> None:
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db_path) as conn:
+        if _table_exists(conn, "analysis_runs"):
+            _migrate_schema(conn)
         schema = Path(schema_path).read_text(encoding="utf-8")
         conn.executescript(schema)
+        _migrate_schema(conn)
         conn.commit()
 
 
@@ -121,12 +124,16 @@ def delete_sources(db_path: str | Path, source_ids: list[int]) -> None:
 
 def create_analysis_run(db_path: str | Path, config: dict[str, Any]) -> str:
     analysis_run_id = config.get("analysis_run_id") or f"run_{uuid.uuid4().hex[:12]}"
+    run_type = str(config.get("run_type", "discovery") or "discovery").lower()
+    canonical_trend_run = bool(config.get("canonical_trend_run", False))
     payload = (
         analysis_run_id,
         _now_iso(),
         None,
         "running",
         config.get("data_mode", "live"),
+        run_type,
+        int(canonical_trend_run),
         json.dumps(config.get("selected_source_ids", []), ensure_ascii=True),
         config.get("time_window_label", ""),
         config.get("time_window_start", ""),
@@ -144,11 +151,12 @@ def create_analysis_run(db_path: str | Path, config: dict[str, Any]) -> str:
             """
             INSERT INTO analysis_runs (
                 analysis_run_id, started_at, completed_at, status, data_mode,
+                run_type, canonical_trend_run,
                 selected_source_ids, time_window_label, time_window_start,
                 time_window_end, max_posts_per_source, max_comments_per_thread,
                 include_comments, run_deeper_analysis, ollama_model, ollama_url,
                 summary_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             payload,
         )
@@ -192,6 +200,8 @@ def load_analysis_runs(db_path: str | Path) -> pd.DataFrame:
                 completed_at,
                 status,
                 data_mode,
+                run_type,
+                canonical_trend_run,
                 selected_source_ids,
                 time_window_label,
                 time_window_start,
@@ -479,6 +489,16 @@ def replace_run_ticker_summaries(db_path: str | Path, analysis_run_id: str, rows
                     int(row["unique_thread_growth"]),
                     float(row["rolling_mention_average"]),
                     float(row["acceleration_score"]),
+                    float(row.get("coverage_adjusted_acceleration_score", row["acceleration_score"])),
+                    float(row.get("mention_rate_per_100_posts", 0)),
+                    float(row.get("thread_rate_per_100_posts", 0)),
+                    float(row.get("author_rate_per_100_posts", 0)),
+                    float(row.get("coverage_reliability", 0)),
+                    str(row.get("trend_reliability", "Legacy")),
+                    str(row.get("trend_reliability_reason", "")),
+                    int(row.get("matched_source_count", 0)),
+                    int(row.get("total_posts_scraped", 0)),
+                    int(row.get("previous_posts_scraped", 0)),
                     float(row["emerging_ticker_score"]),
                     int(bool(row["low_mentions_high_signal"])),
                     int(bool(row["new_ticker_detected"])),
@@ -502,9 +522,65 @@ def replace_run_ticker_summaries(db_path: str | Path, analysis_run_id: str, rows
                     mention_growth_rate, bullish_change, bullish_growth_rate,
                     unique_author_growth, unique_thread_growth,
                     rolling_mention_average, acceleration_score,
+                    coverage_adjusted_acceleration_score,
+                    mention_rate_per_100_posts, thread_rate_per_100_posts,
+                    author_rate_per_100_posts, coverage_reliability,
+                    trend_reliability, trend_reliability_reason,
+                    matched_source_count, total_posts_scraped,
+                    previous_posts_scraped,
                     emerging_ticker_score, low_mentions_high_signal,
                     new_ticker_detected, mega_popularity_penalty
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                payload,
+            )
+        conn.commit()
+
+
+def replace_run_source_coverage(db_path: str | Path, analysis_run_id: str, rows: list[dict[str, Any]]) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DELETE FROM scrape_source_coverage WHERE analysis_run_id = ?", (analysis_run_id,))
+        if rows:
+            payload = [
+                (
+                    analysis_run_id,
+                    row.get("source_id"),
+                    str(row.get("source_name", "")),
+                    str(row.get("source_type", "")),
+                    str(row.get("scrape_mode", "")),
+                    float(row.get("lookback_hours", 0)),
+                    int(row.get("posts_requested", 0)),
+                    int(row.get("posts_returned", 0)),
+                    int(row.get("comments_requested", 0)),
+                    int(row.get("comments_returned", 0)),
+                    int(row.get("threads_returned", 0)),
+                    int(row.get("authors_returned", 0)),
+                    str(row.get("oldest_seen_at", "")),
+                    str(row.get("newest_seen_at", "")),
+                    int(bool(row.get("hit_post_cap", False))),
+                    int(bool(row.get("hit_rss_cap", False))),
+                    int(bool(row.get("rate_limited", False))),
+                    str(row.get("collection_error", "")),
+                    int(bool(row.get("collection_completed", True))),
+                    int(bool(row.get("canonical_trend_run", False))),
+                    float(row.get("coverage_reliability", 0)),
+                    str(row.get("reliability_label", "Low")),
+                    json.dumps(row.get("reliability_reason", row.get("reliability_reason_json", [])), ensure_ascii=True),
+                )
+                for row in rows
+            ]
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO scrape_source_coverage (
+                    analysis_run_id, source_id, source_name, source_type,
+                    scrape_mode, lookback_hours, posts_requested, posts_returned,
+                    comments_requested, comments_returned, threads_returned,
+                    authors_returned, oldest_seen_at, newest_seen_at, hit_post_cap,
+                    hit_rss_cap, rate_limited, collection_error,
+                    collection_completed, canonical_trend_run,
+                    coverage_reliability, reliability_label,
+                    reliability_reason_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 payload,
             )
@@ -589,6 +665,8 @@ def load_completed_mentions(db_path: str | Path, *, data_mode: str = "live") -> 
             ar.time_window_start AS run_time_window_start,
             ar.time_window_end AS run_time_window_end,
             ar.selected_source_ids AS selected_source_ids,
+            ar.run_type AS run_type,
+            ar.canonical_trend_run AS canonical_trend_run,
             c.classifier_mode,
             c.model_name,
             c.analyzed_at
@@ -634,6 +712,8 @@ def load_historical_ticker_summaries(
             ar.started_at,
             ar.completed_at,
             ar.data_mode,
+            ar.run_type,
+            ar.canonical_trend_run,
             ar.selected_source_ids,
             ar.summary_json
         FROM ticker_summaries ts
@@ -702,6 +782,19 @@ def load_run_source_activity(db_path: str | Path, analysis_run_id: str) -> pd.Da
     )
 
 
+def load_run_source_coverage(db_path: str | Path, analysis_run_id: str) -> pd.DataFrame:
+    return _load_table(
+        db_path,
+        """
+        SELECT *
+        FROM scrape_source_coverage
+        WHERE analysis_run_id = ?
+        ORDER BY coverage_reliability ASC, source_name
+        """,
+        (analysis_run_id,),
+    )
+
+
 def load_run_summary(db_path: str | Path, analysis_run_id: str) -> dict[str, Any]:
     runs = _load_table(
         db_path,
@@ -749,10 +842,68 @@ def _decode_json_columns(frame: pd.DataFrame) -> pd.DataFrame:
             working[column] = working[column].fillna("[]").apply(_decode_json_cell)
         elif column.endswith("_json"):
             working[column] = working[column].fillna("{}").apply(_decode_json_cell)
-    for flag_column in ("active", "include_comments", "run_deeper_analysis", "needs_deeper_analysis", "low_mentions_high_signal", "new_ticker_detected"):
+    for flag_column in (
+        "active",
+        "canonical_trend_run",
+        "collection_completed",
+        "hit_post_cap",
+        "hit_rss_cap",
+        "include_comments",
+        "rate_limited",
+        "run_deeper_analysis",
+        "needs_deeper_analysis",
+        "low_mentions_high_signal",
+        "new_ticker_detected",
+    ):
         if flag_column in working.columns:
             working[flag_column] = working[flag_column].fillna(0).astype(bool)
     return working
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    if _table_exists(conn, "analysis_runs"):
+        _add_missing_columns(
+            conn,
+            "analysis_runs",
+            {
+                "run_type": "TEXT NOT NULL DEFAULT 'discovery'",
+                "canonical_trend_run": "INTEGER NOT NULL DEFAULT 0",
+            },
+        )
+    if _table_exists(conn, "ticker_summaries"):
+        _add_missing_columns(
+            conn,
+            "ticker_summaries",
+            {
+                "coverage_adjusted_acceleration_score": "REAL NOT NULL DEFAULT 0",
+                "mention_rate_per_100_posts": "REAL NOT NULL DEFAULT 0",
+                "thread_rate_per_100_posts": "REAL NOT NULL DEFAULT 0",
+                "author_rate_per_100_posts": "REAL NOT NULL DEFAULT 0",
+                "coverage_reliability": "REAL NOT NULL DEFAULT 0",
+                "trend_reliability": "TEXT NOT NULL DEFAULT 'Legacy'",
+                "trend_reliability_reason": "TEXT NOT NULL DEFAULT ''",
+                "matched_source_count": "INTEGER NOT NULL DEFAULT 0",
+                "total_posts_scraped": "INTEGER NOT NULL DEFAULT 0",
+                "previous_posts_scraped": "INTEGER NOT NULL DEFAULT 0",
+            },
+        )
+
+
+def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone() is not None
+
+
+def _add_missing_columns(conn: sqlite3.Connection, table_name: str, columns: dict[str, str]) -> None:
+    existing = {
+        str(row[1])
+        for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+    for column_name, column_sql in columns.items():
+        if column_name not in existing:
+            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
 
 
 def _decode_json_cell(value: Any) -> Any:

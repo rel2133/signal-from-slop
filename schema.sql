@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS analysis_runs (
     completed_at TEXT,
     status TEXT NOT NULL,
     data_mode TEXT NOT NULL,
+    run_type TEXT NOT NULL DEFAULT 'discovery',
+    canonical_trend_run INTEGER NOT NULL DEFAULT 0,
     selected_source_ids TEXT NOT NULL,
     time_window_label TEXT NOT NULL,
     time_window_start TEXT NOT NULL,
@@ -27,6 +29,35 @@ CREATE TABLE IF NOT EXISTS analysis_runs (
     ollama_model TEXT NOT NULL,
     ollama_url TEXT NOT NULL,
     summary_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS scrape_source_coverage (
+    analysis_run_id TEXT NOT NULL,
+    source_id INTEGER,
+    source_name TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    scrape_mode TEXT NOT NULL,
+    lookback_hours REAL NOT NULL,
+    posts_requested INTEGER NOT NULL,
+    posts_returned INTEGER NOT NULL,
+    comments_requested INTEGER NOT NULL,
+    comments_returned INTEGER NOT NULL,
+    threads_returned INTEGER NOT NULL,
+    authors_returned INTEGER NOT NULL,
+    oldest_seen_at TEXT NOT NULL,
+    newest_seen_at TEXT NOT NULL,
+    hit_post_cap INTEGER NOT NULL DEFAULT 0,
+    hit_rss_cap INTEGER NOT NULL DEFAULT 0,
+    rate_limited INTEGER NOT NULL DEFAULT 0,
+    collection_error TEXT NOT NULL DEFAULT '',
+    collection_completed INTEGER NOT NULL DEFAULT 1,
+    canonical_trend_run INTEGER NOT NULL DEFAULT 0,
+    coverage_reliability REAL NOT NULL DEFAULT 0,
+    reliability_label TEXT NOT NULL DEFAULT 'Low',
+    reliability_reason_json TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (analysis_run_id, source_id),
+    FOREIGN KEY (analysis_run_id) REFERENCES analysis_runs(analysis_run_id),
+    FOREIGN KEY (source_id) REFERENCES sources(source_id)
 );
 
 CREATE TABLE IF NOT EXISTS reddit_items (
@@ -172,6 +203,16 @@ CREATE TABLE IF NOT EXISTS ticker_summaries (
     unique_thread_growth INTEGER NOT NULL,
     rolling_mention_average REAL NOT NULL,
     acceleration_score REAL NOT NULL,
+    coverage_adjusted_acceleration_score REAL NOT NULL DEFAULT 0,
+    mention_rate_per_100_posts REAL NOT NULL DEFAULT 0,
+    thread_rate_per_100_posts REAL NOT NULL DEFAULT 0,
+    author_rate_per_100_posts REAL NOT NULL DEFAULT 0,
+    coverage_reliability REAL NOT NULL DEFAULT 0,
+    trend_reliability TEXT NOT NULL DEFAULT 'Legacy',
+    trend_reliability_reason TEXT NOT NULL DEFAULT '',
+    matched_source_count INTEGER NOT NULL DEFAULT 0,
+    total_posts_scraped INTEGER NOT NULL DEFAULT 0,
+    previous_posts_scraped INTEGER NOT NULL DEFAULT 0,
     emerging_ticker_score REAL NOT NULL,
     low_mentions_high_signal INTEGER NOT NULL,
     new_ticker_detected INTEGER NOT NULL,
@@ -211,6 +252,8 @@ CREATE TABLE IF NOT EXISTS ticker_time_buckets (
 
 CREATE INDEX IF NOT EXISTS idx_sources_active ON sources(active);
 CREATE INDEX IF NOT EXISTS idx_runs_completed ON analysis_runs(completed_at);
+CREATE INDEX IF NOT EXISTS idx_runs_type ON analysis_runs(run_type, canonical_trend_run);
+CREATE INDEX IF NOT EXISTS idx_source_coverage_run ON scrape_source_coverage(analysis_run_id);
 CREATE INDEX IF NOT EXISTS idx_mentions_run_time ON item_ticker_mentions(analysis_run_id, created_time);
 CREATE INDEX IF NOT EXISTS idx_mentions_run_ticker ON item_ticker_mentions(analysis_run_id, ticker);
 CREATE INDEX IF NOT EXISTS idx_buckets_run_ticker ON ticker_time_buckets(analysis_run_id, ticker);
