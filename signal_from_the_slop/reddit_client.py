@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from html import unescape
+from math import ceil
 from typing import Any
 from urllib.parse import urlparse
 
@@ -20,6 +21,8 @@ ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
 DEFAULT_REDDIT_USER_AGENT = "script:signal-from-the-slop:0.1"
 REDDIT_REQUEST_DELAY_SECONDS = 0.25
 REDDIT_SUBREDDIT_RSS_LIMIT = 100
+REDDIT_RATE_LIMIT_BUFFER_SECONDS = 2.0
+REDDIT_RATE_LIMIT_RETRY_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -33,6 +36,9 @@ class SourceCandidate:
 
 class RedditClient:
     """Reddit RSS collection layer with source-aware filtering."""
+
+    def __init__(self) -> None:
+        self._next_request_not_before = 0.0
 
     def collect_live_items(
         self,
@@ -324,17 +330,65 @@ class RedditClient:
         return comments[:max_comments_per_thread]
 
     def _fetch_rss_entries(self, session: requests.Session, url: str) -> list[ET.Element]:
-        time.sleep(REDDIT_REQUEST_DELAY_SECONDS)
-        response = session.get(url, timeout=20)
-        if response.status_code == 429:
-            raise RuntimeError("Reddit rate-limited the public scraper. Wait a few minutes and try a smaller run.")
-        if response.status_code == 403:
-            raise RuntimeError(
-                "Reddit blocked the public scraper request. Try again later or lower the run size."
+        for attempt in range(1, REDDIT_RATE_LIMIT_RETRY_ATTEMPTS + 1):
+            self._wait_for_request_window()
+            response = session.get(url, timeout=20)
+            wait_seconds = self._update_request_window(response)
+
+            if response.status_code == 429:
+                if attempt >= REDDIT_RATE_LIMIT_RETRY_ATTEMPTS:
+                    retry_hint = (
+                        f" Reddit asked this client to wait about {ceil(wait_seconds)} seconds before the next RSS request."
+                        if wait_seconds > 0
+                        else ""
+                    )
+                    raise RuntimeError(
+                        "Reddit rate-limited the public scraper."
+                        f"{retry_hint} This is a temporary Reddit cooldown, not an app weekly quota."
+                    )
+                continue
+
+            if response.status_code == 403:
+                raise RuntimeError(
+                    "Reddit blocked the public scraper request. Try again later or lower the run size."
+                )
+
+            response.raise_for_status()
+            root = ET.fromstring(response.text)
+            return root.findall("atom:entry", ATOM_NS)
+
+        raise RuntimeError("Reddit rate-limited the public scraper. Please retry later.")
+
+    def _wait_for_request_window(self) -> None:
+        wait_seconds = max(REDDIT_REQUEST_DELAY_SECONDS, self._next_request_not_before - time.monotonic(), 0.0)
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+
+    def _update_request_window(self, response: requests.Response) -> float:
+        retry_after_seconds = self._parse_float_header(response.headers.get("retry-after"))
+        remaining = self._parse_float_header(response.headers.get("x-ratelimit-remaining"), default=None)
+        reset_seconds = self._parse_float_header(response.headers.get("x-ratelimit-reset"))
+        wait_seconds = max(retry_after_seconds, 0.0)
+
+        if wait_seconds <= 0 and (
+            response.status_code == 429 or (remaining is not None and remaining <= 0 and reset_seconds > 0)
+        ):
+            wait_seconds = reset_seconds
+
+        if wait_seconds > 0:
+            self._next_request_not_before = max(
+                self._next_request_not_before,
+                time.monotonic() + wait_seconds + REDDIT_RATE_LIMIT_BUFFER_SECONDS,
             )
-        response.raise_for_status()
-        root = ET.fromstring(response.text)
-        return root.findall("atom:entry", ATOM_NS)
+        return wait_seconds
+
+    def _parse_float_header(self, value: str | None, *, default: float | None = 0.0) -> float | None:
+        if value is None:
+            return default
+        try:
+            return float(str(value).strip())
+        except (TypeError, ValueError):
+            return default
 
     def _rss_entry_to_item(self, entry: ET.Element, source: dict[str, Any], *, item_type: str) -> dict[str, Any]:
         entry_id = self._entry_id(entry)

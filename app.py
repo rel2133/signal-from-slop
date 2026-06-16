@@ -3807,7 +3807,8 @@ def render_run_analysis_page(
             help=(
                 "Public Reddit RSS can return up to roughly the newest "
                 f"{REDDIT_SUBREDDIT_RSS_LIMIT} posts per subreddit request. "
-                "Use a larger number for overnight runs."
+                "This setting trims how many posts we keep from that feed; it does not reduce the initial subreddit "
+                "request count. Use a larger number for overnight runs."
             ),
         )
     )
@@ -3818,7 +3819,10 @@ def render_run_analysis_page(
             max_value=100,
             value=0 if measurement_run else 4,
             step=1,
-            help="Comments multiply the number of items sent to Ollama. Set this to 0 for faster posts-only runs.",
+            help=(
+                "Comments multiply both the number of items sent to Ollama and the number of Reddit RSS requests. "
+                "Set this to 0 for faster posts-only runs."
+            ),
             disabled=measurement_run,
         )
     )
@@ -3831,6 +3835,7 @@ def render_run_analysis_page(
         help="Measurement runs stay posts-only so ticker acceleration is based on comparable independent attention events.",
     )
     include_comments = item_scope == "Posts + comments"
+    selected_source_frame = sources[sources["source_id"].isin(selected_source_ids)].copy()
     selected_source_count = len(selected_source_ids)
     estimated_items = selected_source_count * max_posts_per_source
     if include_comments:
@@ -3841,6 +3846,14 @@ def render_run_analysis_page(
         + (f" x up to {max_comments_per_thread} comment(s)" if include_comments and max_comments_per_thread else "")
         + "). Actual count may be lower if Reddit RSS has fewer posts in the selected window."
     )
+    if include_comments and max_comments_per_thread:
+        subreddit_source_count = int((selected_source_frame["source_type"] == "subreddit").sum())
+        thread_source_count = int((selected_source_frame["source_type"] == "thread_url").sum())
+        estimated_rss_requests = thread_source_count + subreddit_source_count + (subreddit_source_count * max_posts_per_source)
+        st.info(
+            "Comments also multiply Reddit RSS requests. A run like this can take longer because Reddit may enforce "
+            f"cooldowns between about `{estimated_rss_requests}` feed requests."
+        )
     if max_posts_per_source >= REDDIT_SUBREDDIT_RSS_LIMIT:
         st.info(
             f"{REDDIT_SUBREDDIT_RSS_LIMIT} is the current per-subreddit ceiling for the public RSS collector. "
