@@ -3817,7 +3817,7 @@ def render_run_analysis_page(
             "Max comments per thread",
             min_value=0,
             max_value=100,
-            value=0 if measurement_run else 4,
+            value=0,
             step=1,
             help=(
                 "Comments multiply both the number of items sent to Ollama and the number of Reddit RSS requests. "
@@ -3829,7 +3829,7 @@ def render_run_analysis_page(
     item_scope = st.radio(
         "Analyse scope",
         ["Posts + comments", "Posts only"],
-        index=1 if measurement_run else 0,
+        index=1,
         horizontal=True,
         disabled=measurement_run,
         help="Measurement runs stay posts-only so ticker acceleration is based on comparable independent attention events.",

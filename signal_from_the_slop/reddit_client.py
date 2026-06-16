@@ -23,6 +23,8 @@ REDDIT_REQUEST_DELAY_SECONDS = 0.25
 REDDIT_SUBREDDIT_RSS_LIMIT = 100
 REDDIT_RATE_LIMIT_BUFFER_SECONDS = 2.0
 REDDIT_RATE_LIMIT_RETRY_ATTEMPTS = 3
+REDDIT_RATE_LIMIT_PROGRESS_SECONDS = 5.0
+REDDIT_REQUEST_TIMEOUT_SECONDS = 30
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,10 @@ class RedditClient:
                         include_comments=include_comments,
                         scrape_mode=scrape_mode,
                         canonical_trend_run=canonical_trend_run,
+                        progress_callback=progress_callback,
+                        checkpoint=checkpoint,
+                        source_index=source_index,
+                        total_sources=total_sources,
                     )
                 elif source["source_type"] == "subreddit":
                     items, coverage = self._collect_scraped_subreddit(
@@ -183,7 +189,15 @@ class RedditClient:
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         subreddit = normalize_subreddit_name(str(source["normalized_value"]))
         feed_url = f"https://www.reddit.com/r/{subreddit}/new/.rss?limit={REDDIT_SUBREDDIT_RSS_LIMIT}"
-        entries = self._fetch_rss_entries(session, feed_url)
+        entries = self._fetch_rss_entries(
+            session,
+            feed_url,
+            progress_callback=progress_callback,
+            checkpoint=checkpoint,
+            progress_message=f"Waiting for Reddit before scraping {source['display_name']}",
+            progress_current=source_index - 1,
+            progress_total=total_sources,
+        )
         items: list[dict[str, Any]] = []
         feed_posts: list[tuple[ET.Element, datetime]] = [
             (entry, self._entry_timestamp(entry))
@@ -230,6 +244,10 @@ class RedditClient:
                     window_start=window_start,
                     window_end=window_end,
                     max_comments_per_thread=max_comments_per_thread,
+                    progress_callback=progress_callback,
+                    checkpoint=checkpoint,
+                    progress_current=source_index - 1,
+                    progress_total=total_sources,
                 )
                 items.extend(comments)
                 if progress_callback is not None:
@@ -276,8 +294,20 @@ class RedditClient:
         include_comments: bool,
         scrape_mode: str = "posts_only",
         canonical_trend_run: bool = False,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        checkpoint: Callable[[], None] | None = None,
+        source_index: int = 1,
+        total_sources: int = 1,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        entries = self._fetch_rss_entries(session, self._thread_rss_url(str(source["url"])))
+        entries = self._fetch_rss_entries(
+            session,
+            self._thread_rss_url(str(source["url"])),
+            progress_callback=progress_callback,
+            checkpoint=checkpoint,
+            progress_message=f"Waiting for Reddit before scraping {source['display_name']}",
+            progress_current=source_index - 1,
+            progress_total=total_sources,
+        )
         items: list[dict[str, Any]] = []
         for entry in entries:
             entry_id = self._entry_id(entry)
@@ -319,20 +349,76 @@ class RedditClient:
         window_start: datetime,
         window_end: datetime,
         max_comments_per_thread: int,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        checkpoint: Callable[[], None] | None = None,
+        progress_current: int = 0,
+        progress_total: int = 1,
     ) -> list[dict[str, Any]]:
         comments = [
             self._rss_entry_to_item(entry, source, item_type="comment")
-            for entry in self._fetch_rss_entries(session, self._thread_rss_url(thread_url))
+            for entry in self._fetch_rss_entries(
+                session,
+                self._thread_rss_url(thread_url),
+                progress_callback=progress_callback,
+                checkpoint=checkpoint,
+                progress_message=f"Waiting for Reddit before fetching comments for {source['display_name']}",
+                progress_current=progress_current,
+                progress_total=progress_total,
+            )
             if self._entry_id(entry).startswith("t1_")
             and window_start <= self._entry_timestamp(entry) <= window_end
         ]
         comments.sort(key=lambda row: row["created_time"], reverse=True)
         return comments[:max_comments_per_thread]
 
-    def _fetch_rss_entries(self, session: requests.Session, url: str) -> list[ET.Element]:
+    def _fetch_rss_entries(
+        self,
+        session: requests.Session,
+        url: str,
+        *,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        checkpoint: Callable[[], None] | None = None,
+        progress_message: str = "Waiting for Reddit before continuing",
+        progress_current: int = 0,
+        progress_total: int = 1,
+    ) -> list[ET.Element]:
         for attempt in range(1, REDDIT_RATE_LIMIT_RETRY_ATTEMPTS + 1):
-            self._wait_for_request_window()
-            response = session.get(url, timeout=20)
+            self._wait_for_request_window(
+                progress_callback=progress_callback,
+                checkpoint=checkpoint,
+                progress_message=progress_message,
+                progress_current=progress_current,
+                progress_total=progress_total,
+            )
+            try:
+                response = session.get(url, timeout=REDDIT_REQUEST_TIMEOUT_SECONDS)
+            except requests.Timeout as exc:
+                if attempt >= REDDIT_RATE_LIMIT_RETRY_ATTEMPTS:
+                    raise RuntimeError(
+                        "Reddit public scraper request timed out after repeated attempts. "
+                        "Try posts-only, fewer sources, or retry later."
+                    ) from exc
+                self._sleep_with_progress(
+                    REDDIT_RATE_LIMIT_PROGRESS_SECONDS,
+                    progress_callback=progress_callback,
+                    checkpoint=checkpoint,
+                    progress_message="Reddit request timed out; retrying shortly",
+                    progress_current=progress_current,
+                    progress_total=progress_total,
+                )
+                continue
+            except requests.RequestException as exc:
+                if attempt >= REDDIT_RATE_LIMIT_RETRY_ATTEMPTS:
+                    raise RuntimeError(f"Reddit public scraper request failed: {exc}") from exc
+                self._sleep_with_progress(
+                    REDDIT_RATE_LIMIT_PROGRESS_SECONDS,
+                    progress_callback=progress_callback,
+                    checkpoint=checkpoint,
+                    progress_message="Reddit request failed; retrying shortly",
+                    progress_current=progress_current,
+                    progress_total=progress_total,
+                )
+                continue
             wait_seconds = self._update_request_window(response)
 
             if response.status_code == 429:
@@ -359,10 +445,55 @@ class RedditClient:
 
         raise RuntimeError("Reddit rate-limited the public scraper. Please retry later.")
 
-    def _wait_for_request_window(self) -> None:
-        wait_seconds = max(REDDIT_REQUEST_DELAY_SECONDS, self._next_request_not_before - time.monotonic(), 0.0)
-        if wait_seconds > 0:
-            time.sleep(wait_seconds)
+    def _wait_for_request_window(
+        self,
+        *,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        checkpoint: Callable[[], None] | None = None,
+        progress_message: str = "Waiting for Reddit before continuing",
+        progress_current: int = 0,
+        progress_total: int = 1,
+    ) -> None:
+        cooldown_seconds = max(self._next_request_not_before - time.monotonic(), 0.0)
+        if cooldown_seconds > 0:
+            self._sleep_with_progress(
+                cooldown_seconds,
+                progress_callback=progress_callback,
+                checkpoint=checkpoint,
+                progress_message=progress_message,
+                progress_current=progress_current,
+                progress_total=progress_total,
+            )
+            return
+        time.sleep(REDDIT_REQUEST_DELAY_SECONDS)
+
+    def _sleep_with_progress(
+        self,
+        wait_seconds: float,
+        *,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        checkpoint: Callable[[], None] | None = None,
+        progress_message: str = "Waiting for Reddit before continuing",
+        progress_current: int = 0,
+        progress_total: int = 1,
+    ) -> None:
+        wait_until = time.monotonic() + max(wait_seconds, 0.0)
+        while True:
+            remaining = wait_until - time.monotonic()
+            if remaining <= 0:
+                return
+            if checkpoint is not None:
+                checkpoint()
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "message": f"{progress_message} ({ceil(remaining)}s cooldown remaining)",
+                        "current": progress_current,
+                        "total": progress_total,
+                        "unit": "sources",
+                    }
+                )
+            time.sleep(min(remaining, REDDIT_RATE_LIMIT_PROGRESS_SECONDS))
 
     def _update_request_window(self, response: requests.Response) -> float:
         retry_after_seconds = self._parse_float_header(response.headers.get("retry-after"))
