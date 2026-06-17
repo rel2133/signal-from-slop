@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -54,6 +55,8 @@ from signal_from_the_slop.database import (
     load_signal_outcomes,
     load_signal_random_benchmarks,
     load_sources,
+    load_ticker_consensus_cache,
+    load_ticker_history,
     replace_run_classifications,
     replace_run_mentions,
     replace_run_source_coverage,
@@ -61,6 +64,7 @@ from signal_from_the_slop.database import (
     replace_run_time_buckets,
     upsert_signal_label,
     update_sources,
+    upsert_ticker_consensus_cache,
     upsert_reddit_items,
 )
 try:
@@ -126,10 +130,11 @@ PAGE_STEPS = [
     {"page": "Sources", "label": "Sources", "step": "01", "context": "Reddit pages"},
     {"page": "Run Analysis", "label": "Scrape", "step": "02", "context": "Collect and classify"},
     {"page": "Results Dashboard", "label": "Results", "step": "03", "context": "Review mentions"},
-    {"page": "Ticker Trends", "label": "Trends", "step": "04", "context": "Compare scrapes"},
-    {"page": "Signal Validation", "label": "Signals", "step": "05", "context": "Freeze and review"},
-    {"page": "Export Data", "label": "Export", "step": "06", "context": "Download data"},
-    {"page": "Settings", "label": "Settings", "step": "07", "context": "Storage and model"},
+    {"page": "Ticker Explorer", "label": "Explore", "step": "04", "context": "Search tickers"},
+    {"page": "Ticker Trends", "label": "Trends", "step": "05", "context": "Compare scrapes"},
+    {"page": "Signal Validation", "label": "Signals", "step": "06", "context": "Freeze and review"},
+    {"page": "Export Data", "label": "Export", "step": "07", "context": "Download data"},
+    {"page": "Settings", "label": "Settings", "step": "08", "context": "Storage and model"},
 ]
 PAGES = [step["page"] for step in PAGE_STEPS]
 PAGE_LABELS = {step["page"]: step["label"] for step in PAGE_STEPS}
@@ -148,6 +153,13 @@ RUN_HEARTBEAT_STALE_SECONDS = 45
 RUN_ORPHANED_CANCEL_SECONDS = 90
 RUN_WORKERS: dict[str, threading.Thread] = {}
 RUN_WORKERS_LOCK = threading.Lock()
+TICKER_EXPLORER_WINDOWS = {
+    "Last 7d": 7,
+    "Last 30d": 30,
+    "Last 90d": 90,
+    "All": None,
+}
+TICKER_CONSENSUS_EVIDENCE_LIMIT = 10
 
 LOCALHOST_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
 FILTER_PRESETS = {
@@ -509,6 +521,45 @@ st.markdown(
             font-size: 0.86rem;
             margin-top: 0.25rem;
             opacity: 0.76;
+        }
+        .ticker-hero {
+            border: 1px solid rgba(128, 128, 128, 0.22);
+            border-radius: 8px;
+            background: linear-gradient(180deg, rgba(128, 128, 128, 0.08), rgba(128, 128, 128, 0.03));
+            margin: 0.35rem 0 0.85rem;
+            padding: 0.9rem 1rem;
+        }
+        .ticker-hero-title {
+            font-size: 1.65rem;
+            font-weight: 780;
+            line-height: 1.1;
+            margin: 0;
+        }
+        .ticker-hero-meta {
+            font-size: 0.9rem;
+            margin-top: 0.25rem;
+            opacity: 0.74;
+        }
+        .consensus-card {
+            border: 1px solid rgba(128, 128, 128, 0.22);
+            border-radius: 8px;
+            background: rgba(128, 128, 128, 0.045);
+            margin: 0.4rem 0 0.9rem;
+            padding: 0.95rem 1rem;
+        }
+        .consensus-card h3 {
+            font-size: 1.05rem;
+            margin: 0 0 0.45rem;
+        }
+        .consensus-card p {
+            margin-bottom: 0.35rem;
+        }
+        .compact-list {
+            margin: 0.15rem 0 0.6rem 1.05rem;
+            padding: 0;
+        }
+        .compact-list li {
+            margin: 0.18rem 0;
         }
         .top-signal-title {
             font-size: 0.92rem;
@@ -2074,6 +2125,7 @@ def build_run_config(
 ) -> dict[str, Any]:
     normalized_run_type = str(run_type or RUN_TYPE_DISCOVERY).lower()
     canonical_trend_run = normalized_run_type == RUN_TYPE_MEASUREMENT and not include_comments
+    effective_skip_previously_analyzed = bool(skip_previously_analyzed) and not canonical_trend_run
     return {
         "data_mode": "live",
         "run_type": normalized_run_type,
@@ -2094,7 +2146,7 @@ def build_run_config(
         "max_posts_per_source": max_posts_per_source,
         "max_comments_per_thread": max_comments_per_thread,
         "include_comments": include_comments,
-        "skip_previously_analyzed": skip_previously_analyzed,
+        "skip_previously_analyzed": effective_skip_previously_analyzed,
         "run_deeper_analysis": run_deeper_analysis,
         "ollama_model": model_name,
         "ollama_url": ollama_url,
@@ -3122,7 +3174,11 @@ def run_analysis_pipeline(
             run_completed = True
             return complete_empty_run(message)
         scraped_items_count = len(items)
-        if skip_previously_analyzed:
+        effective_skip_previously_analyzed = (
+            bool(run_config.get("skip_previously_analyzed", skip_previously_analyzed))
+            and not bool(run_config.get("canonical_trend_run", False))
+        )
+        if effective_skip_previously_analyzed:
             previously_analyzed = load_previously_analyzed_item_ids(db_path, data_mode="live")
             items = [item for item in items if str(item["item_id"]) not in previously_analyzed]
             skipped_existing_count = scraped_items_count - len(items)
@@ -3494,7 +3550,7 @@ def start_background_analysis_run(
             "max_posts_per_source": max_posts_per_source,
             "max_comments_per_thread": max_comments_per_thread,
             "include_comments": include_comments,
-            "skip_previously_analyzed": skip_previously_analyzed,
+            "skip_previously_analyzed": bool(run_config.get("skip_previously_analyzed", skip_previously_analyzed)),
             "run_deeper_analysis": run_deeper_analysis,
         },
         name=f"analysis-{run_id}",
@@ -3868,12 +3924,15 @@ def render_run_analysis_page(
         )
     skip_previously_analyzed = st.toggle(
         "Skip already analysed Reddit items",
-        value=True,
+        value=not measurement_run,
+        disabled=measurement_run,
         help=(
             "When enabled, items that already have a completed classification in an earlier run are not classified again. "
-            "Turn this off when you intentionally want a full overlapping-window re-analysis."
+            "Measurement runs always re-analyse the full window so trend rates are comparable."
         ),
     )
+    if measurement_run:
+        skip_previously_analyzed = False
     run_deeper_analysis = st.toggle("Run deeper analysis for qualifying items", value=True)
     ollama_url = st.text_input(
         "Ollama URL",
@@ -4405,6 +4464,7 @@ def navigate_to_page(page_name: str, *, run_id: str | None = None, ticker: str |
 
 def render_ticker_navigation_buttons(*, current_page: str, run_id: str, ticker: str) -> None:
     buttons = [
+        ("Ticker Explorer", "Open Explorer"),
         ("Results Dashboard", "Open Results"),
         ("Ticker Trends", "Open Trends"),
         ("Signal Validation", "Open Signals"),
@@ -4804,6 +4864,579 @@ def render_ticker_focus(
 
         with verification_tab:
             render_evidence_checklist(selected_ticker, extract_claims_for_ticker(long_df, selected_ticker))
+
+
+def list_cell_values(value: Any, *, limit: int | None = None) -> list[str]:
+    if isinstance(value, list):
+        values = [str(item).strip() for item in value if str(item).strip()]
+    elif str(value or "").strip():
+        values = [str(value).strip()]
+    else:
+        values = []
+    deduped = list(dict.fromkeys(values))
+    return deduped[:limit] if limit is not None else deduped
+
+
+def filter_ticker_window_mentions(mentions_df: pd.DataFrame, ticker: str, window_days: int | None) -> pd.DataFrame:
+    if mentions_df.empty:
+        return mentions_df
+    working = mentions_df[mentions_df["ticker"].astype(str).str.upper() == ticker].copy()
+    if working.empty:
+        return working
+    working["created_time_dt"] = pd.to_datetime(working["created_time"], errors="coerce", utc=True)
+    working = working.dropna(subset=["created_time_dt"])
+    if working.empty:
+        return working
+    if window_days is not None:
+        anchor = working["created_time_dt"].max()
+        working = working[working["created_time_dt"] >= anchor - pd.Timedelta(days=window_days)].copy()
+    return working.sort_values(["created_time_dt", "alpha_signal_score"], ascending=[False, False])
+
+
+def build_ticker_explorer_stats(ticker_mentions: pd.DataFrame, ticker_summary_row: dict[str, Any]) -> dict[str, Any]:
+    if ticker_mentions.empty:
+        return {
+            "mentions": 0,
+            "items": 0,
+            "authors": 0,
+            "threads": 0,
+            "sources": 0,
+            "bullish_mentions": 0,
+            "bearish_mentions": 0,
+            "neutral_mentions": 0,
+            "average_hype": 0.0,
+            "average_evidence_quality": 0.0,
+            "average_alpha": 0.0,
+            "fallback_mentions": 0,
+            "ollama_mentions": 0,
+            "first_seen": "",
+            "last_seen": "",
+            "latest_run_id": "",
+        }
+
+    working = ticker_mentions.copy()
+    modes = working["classifier_mode"].fillna("unknown").astype(str).str.lower() if "classifier_mode" in working.columns else pd.Series([], dtype=str)
+    latest_run_id = ""
+    if "run_completed_at" in working.columns and "analysis_run_id" in working.columns:
+        run_order = working[["analysis_run_id", "run_completed_at"]].dropna().drop_duplicates().copy()
+        run_order["run_completed_at_dt"] = pd.to_datetime(run_order["run_completed_at"], errors="coerce", utc=True)
+        run_order = run_order.dropna(subset=["run_completed_at_dt"]).sort_values("run_completed_at_dt")
+        if not run_order.empty:
+            latest_run_id = str(run_order.iloc[-1]["analysis_run_id"])
+    if not latest_run_id and "analysis_run_id" in working.columns:
+        latest_run_id = str(working.iloc[0].get("analysis_run_id", ""))
+
+    return {
+        "mentions": int(len(working)),
+        "items": int(working["item_id"].nunique()) if "item_id" in working.columns else int(len(working)),
+        "authors": int(working["author_hash"].nunique()) if "author_hash" in working.columns else 0,
+        "threads": int(working["thread_id"].nunique()) if "thread_id" in working.columns else 0,
+        "sources": int(working["source_name"].nunique()) if "source_name" in working.columns else 0,
+        "bullish_mentions": int((working["sentiment"] == "bullish").sum()) if "sentiment" in working.columns else 0,
+        "bearish_mentions": int((working["sentiment"] == "bearish").sum()) if "sentiment" in working.columns else 0,
+        "neutral_mentions": int((working["sentiment"] == "neutral").sum()) if "sentiment" in working.columns else 0,
+        "average_hype": round(coerce_float(ticker_summary_row.get("average_hype_score", working.get("hype_score", pd.Series([0])).mean())), 2),
+        "average_evidence_quality": round(coerce_float(ticker_summary_row.get("average_evidence_quality_numeric", working.get("evidence_quality_numeric", pd.Series([0])).mean())), 2),
+        "average_alpha": round(coerce_float(ticker_summary_row.get("average_alpha_signal_score", working.get("alpha_signal_score", pd.Series([0])).mean())), 2),
+        "fallback_mentions": int((modes == "fallback").sum()) if not modes.empty else 0,
+        "ollama_mentions": int((modes == "ollama").sum()) if not modes.empty else 0,
+        "first_seen": str(working["created_time"].min()) if "created_time" in working.columns else "",
+        "last_seen": str(working["created_time"].max()) if "created_time" in working.columns else "",
+        "latest_run_id": latest_run_id,
+    }
+
+
+def select_representative_mentions(ticker_mentions: pd.DataFrame, limit: int = TICKER_CONSENSUS_EVIDENCE_LIMIT) -> pd.DataFrame:
+    if ticker_mentions.empty:
+        return ticker_mentions
+    working = ticker_mentions.copy()
+    if "created_time_dt" not in working.columns:
+        working["created_time_dt"] = pd.to_datetime(working["created_time"], errors="coerce", utc=True)
+    selected: dict[str, dict[str, Any]] = {}
+
+    def add_rows(frame: pd.DataFrame, max_rows: int) -> None:
+        for row in frame.head(max_rows).to_dict(orient="records"):
+            key = str(row.get("item_id", "")) or f"row_{len(selected)}"
+            if key not in selected:
+                selected[key] = row
+            if len(selected) >= limit:
+                return
+
+    add_rows(working.sort_values(["alpha_signal_score", "confidence"], ascending=False), 4)
+    add_rows(working.sort_values("created_time_dt", ascending=False), 3)
+    if "sentiment" in working.columns:
+        add_rows(working[working["sentiment"] == "bullish"].sort_values("alpha_signal_score", ascending=False), 2)
+        add_rows(working[working["sentiment"] == "bearish"].sort_values("alpha_signal_score", ascending=False), 2)
+    if "red_flag_count" in working.columns:
+        add_rows(working[working["red_flag_count"].fillna(0).astype(float) > 0].sort_values("hype_score", ascending=False), 2)
+    if len(selected) < limit:
+        add_rows(working.sort_values(["evidence_quality_numeric", "alpha_signal_score"], ascending=False), limit - len(selected))
+
+    evidence = pd.DataFrame(selected.values())
+    if evidence.empty:
+        return evidence
+    return evidence.sort_values(["alpha_signal_score", "created_time_dt"], ascending=[False, False]).head(limit)
+
+
+def evidence_records_for_packet(evidence_df: pd.DataFrame) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for row in evidence_df.to_dict(orient="records"):
+        records.append(
+            {
+                "item_id": str(row.get("item_id", "")),
+                "created_time": str(row.get("created_time", ""))[:19],
+                "source": str(row.get("source_name", "")),
+                "sentiment": str(row.get("sentiment", "")),
+                "confidence": round(coerce_float(row.get("confidence")), 2),
+                "alpha": round(coerce_float(row.get("alpha_signal_score")), 1),
+                "hype": round(coerce_float(row.get("hype_score")), 1),
+                "evidence_quality": str(row.get("evidence_quality", "")),
+                "title": str(row.get("thread_title", ""))[:180],
+                "summary": str(row.get("summary", ""))[:260],
+                "claims_to_verify": list_cell_values(row.get("claims_to_verify"), limit=3),
+                "red_flags": list_cell_values(row.get("red_flags"), limit=3),
+            }
+        )
+    return records
+
+
+def build_ticker_deterministic_shift(history_df: pd.DataFrame, ticker: str) -> str:
+    if history_df.empty:
+        return "No prior run history is available for this ticker yet."
+    ticker_history = history_df[history_df["ticker"].astype(str).str.upper() == ticker].sort_values("run_completed_at").copy()
+    if len(ticker_history) < 2:
+        return "Only one completed run contains this ticker, so there is no clean before/after yet."
+    previous = ticker_history.iloc[-2]
+    current = ticker_history.iloc[-1]
+    mention_delta = coerce_float(current.get("total_mentions")) - coerce_float(previous.get("total_mentions"))
+    sentiment_delta = coerce_float(current.get("net_sentiment_score")) - coerce_float(previous.get("net_sentiment_score"))
+    hype_delta = coerce_float(current.get("average_hype_score")) - coerce_float(previous.get("average_hype_score"))
+    return (
+        f"Latest run moved {format_delta(mention_delta)} mentions, "
+        f"{format_delta(sentiment_delta, decimals=2)} net sentiment, "
+        f"and {format_delta(hype_delta, decimals=1)} hype versus the previous completed run."
+    )
+
+
+def build_ticker_consensus_packet(
+    *,
+    ticker: str,
+    company_name: str,
+    window_label: str,
+    stats: dict[str, Any],
+    ticker_mentions: pd.DataFrame,
+    evidence_df: pd.DataFrame,
+    history_df: pd.DataFrame,
+) -> dict[str, Any]:
+    claims = extract_claims_for_ticker(ticker_mentions, ticker)
+    bullish_claims = list_cell_values(
+        ticker_mentions.loc[ticker_mentions["sentiment"] == "bullish", "bull_case"].dropna().head(6).tolist()
+        if "sentiment" in ticker_mentions.columns and "bull_case" in ticker_mentions.columns
+        else [],
+        limit=5,
+    )
+    bearish_claims = list_cell_values(
+        ticker_mentions.loc[ticker_mentions["sentiment"] == "bearish", "bear_case"].dropna().head(6).tolist()
+        if "sentiment" in ticker_mentions.columns and "bear_case" in ticker_mentions.columns
+        else [],
+        limit=5,
+    )
+    return {
+        "ticker": ticker,
+        "company_name": company_name,
+        "window": window_label,
+        "stats": stats,
+        "deterministic_shift": build_ticker_deterministic_shift(history_df, ticker),
+        "claims_to_verify": claims,
+        "bull_claims": bullish_claims,
+        "bear_claims": bearish_claims,
+        "evidence": evidence_records_for_packet(evidence_df),
+    }
+
+
+def ticker_consensus_signature(
+    *,
+    ticker: str,
+    window_label: str,
+    stats: dict[str, Any],
+    evidence_df: pd.DataFrame,
+) -> str:
+    signature_payload = {
+        "ticker": ticker,
+        "window": window_label,
+        "latest_run_id": stats.get("latest_run_id", ""),
+        "mentions": stats.get("mentions", 0),
+        "last_seen": stats.get("last_seen", ""),
+        "evidence_item_ids": sorted(evidence_df["item_id"].astype(str).tolist()) if not evidence_df.empty and "item_id" in evidence_df.columns else [],
+    }
+    return hashlib.sha1(json.dumps(signature_payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()[:20]
+
+
+def render_compact_list(title: str, values: list[str], *, empty: str = "None in this window.") -> None:
+    st.markdown(f"**{title}**")
+    clean_values = [str(value).strip() for value in values if str(value).strip()]
+    if not clean_values:
+        st.caption(empty)
+        return
+    items = "".join(f"<li>{escape(value)}</li>" for value in clean_values[:5])
+    st.markdown(f'<ul class="compact-list">{items}</ul>', unsafe_allow_html=True)
+
+
+def render_ticker_hero(ticker: str, company_name: str, window_label: str, stats: dict[str, Any], cache_label: str) -> None:
+    last_seen = format_timestamp_with_relative(stats.get("last_seen"))
+    st.markdown(
+        f"""
+        <div class="ticker-hero">
+            <div class="ticker-hero-title">{escape(ticker)} <span style="font-size: 1rem; opacity: 0.7;">{escape(company_name)}</span></div>
+            <div class="ticker-hero-meta">{escape(window_label)} · {escape(str(stats.get("mentions", 0)))} mention rows · last seen {escape(last_seen)} · {escape(cache_label)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_ticker_metric_strip(stats: dict[str, Any]) -> None:
+    metric_cols = st.columns(6)
+    metric_cols[0].metric("Mentions", int(stats.get("mentions", 0)), help="Ticker mention rows in the selected window.")
+    metric_cols[1].metric("Authors", int(stats.get("authors", 0)), help="Distinct author hashes.")
+    metric_cols[2].metric("Threads", int(stats.get("threads", 0)), help="Distinct Reddit threads.")
+    metric_cols[3].metric("Bull / Bear", f"{int(stats.get('bullish_mentions', 0))} / {int(stats.get('bearish_mentions', 0))}")
+    metric_cols[4].metric("Avg hype", f"{coerce_float(stats.get('average_hype')):.1f}")
+    metric_cols[5].metric("Fallback", int(stats.get("fallback_mentions", 0)), help="Mentions classified without a usable Ollama response.")
+
+
+def render_consensus_summary(
+    *,
+    payload: dict[str, Any],
+    classifier_mode: str,
+    generated_at: str,
+    cache_label: str,
+) -> None:
+    summary = str(payload.get("consensus_summary") or "No consensus summary was generated.").strip()
+    st.markdown(
+        f"""
+        <div class="consensus-card">
+            <h3>Current consensus</h3>
+            <p>{escape(summary)}</p>
+            <div class="ticker-hero-meta">{escape(cache_label)} · generated {escape(format_timestamp_with_relative(generated_at))}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    render_status_chips(
+        [
+            str(payload.get("stance", "unclear")).title(),
+            f"Confidence: {str(payload.get('confidence', 'low')).title()}",
+            str(classifier_mode or "unknown"),
+        ]
+    )
+    case_cols = st.columns(2)
+    with case_cols[0]:
+        render_compact_list("Bull case", list_cell_values(payload.get("bull_case"), limit=4))
+        render_compact_list("Catalysts", list_cell_values(payload.get("catalysts"), limit=4))
+    with case_cols[1]:
+        render_compact_list("Bear case", list_cell_values(payload.get("bear_case"), limit=4))
+        render_compact_list("Risks", list_cell_values(payload.get("risks"), limit=4))
+
+
+def render_narrative_and_claims(ticker: str, payload: dict[str, Any], ticker_mentions: pd.DataFrame) -> None:
+    narrative_cols = st.columns([1.15, 0.85])
+    with narrative_cols[0]:
+        st.subheader("Narrative shift")
+        st.write(str(payload.get("narrative_shift") or "No narrative shift is available yet."))
+        red_flags = list_cell_values(payload.get("red_flags"), limit=5)
+        if red_flags:
+            render_status_chips(red_flags)
+    with narrative_cols[1]:
+        st.subheader("Claims")
+        claims = list_cell_values(payload.get("claims_to_verify"), limit=6) or extract_claims_for_ticker(ticker_mentions, ticker)
+        render_compact_list("To verify", claims, empty="No checkable claims were extracted.")
+        with st.expander("Checklist", expanded=False):
+            render_evidence_checklist(ticker, claims)
+
+
+def build_ticker_bucket_chart_frame(ticker_mentions: pd.DataFrame) -> pd.DataFrame:
+    if ticker_mentions.empty:
+        return pd.DataFrame()
+    bucket_df = build_time_bucket_summary(ticker_mentions)
+    if bucket_df.empty:
+        return bucket_df
+    sentiment = (
+        ticker_mentions.groupby(["ticker", "time_bucket"], as_index=False)["sentiment_numeric"]
+        .mean()
+        .rename(columns={"sentiment_numeric": "net_sentiment_score"})
+        if "sentiment_numeric" in ticker_mentions.columns
+        else pd.DataFrame()
+    )
+    if not sentiment.empty:
+        bucket_df = bucket_df.merge(sentiment, on=["ticker", "time_bucket"], how="left")
+    bucket_df["bucket_start_dt"] = pd.to_datetime(bucket_df["bucket_start"], errors="coerce", utc=True)
+    return bucket_df.dropna(subset=["bucket_start_dt"])
+
+
+def render_ticker_explorer_charts(ticker: str, ticker_mentions: pd.DataFrame, history_df: pd.DataFrame) -> None:
+    st.subheader("Charts")
+    chart_cols = st.columns([1.05, 0.95])
+    bucket_chart_df = build_ticker_bucket_chart_frame(ticker_mentions)
+    with chart_cols[0]:
+        st.write("Mentions over time")
+        if bucket_chart_df.empty:
+            st.info("No bucketed timeline is available for this ticker/window.")
+        else:
+            render_time_line_chart(
+                bucket_chart_df,
+                x_column="bucket_start_dt",
+                y_column="total_mentions",
+                color_column="ticker",
+                y_title="Mentions",
+                x_title="Week",
+                tooltip_columns=["ticker", "total_mentions", "unique_authors", "unique_threads"],
+                height=300,
+            )
+    with chart_cols[1]:
+        metric_options = {
+            "net_sentiment_score": "Net sentiment",
+            "average_hype_score": "Hype",
+            "average_evidence_quality_numeric": "Evidence quality",
+            "average_alpha_signal_score": "Alpha",
+        }
+        selected_metric = st.selectbox(
+            "Trend metric",
+            [metric for metric in metric_options if metric in bucket_chart_df.columns],
+            format_func=lambda value: metric_options[value],
+            key=f"explorer_bucket_metric_{ticker}",
+        ) if not bucket_chart_df.empty else ""
+        if selected_metric:
+            render_time_line_chart(
+                bucket_chart_df,
+                x_column="bucket_start_dt",
+                y_column=selected_metric,
+                color_column="ticker",
+                y_title=metric_options[selected_metric],
+                x_title="Week",
+                tooltip_columns=["ticker", selected_metric, "total_mentions"],
+                height=300,
+            )
+
+    if not history_df.empty:
+        st.write("Run history")
+        history_metric = st.selectbox(
+            "Run metric",
+            [metric for metric in HISTORY_METRICS if metric in history_df.columns],
+            format_func=lambda value: HISTORY_METRICS[value],
+            key=f"explorer_history_metric_{ticker}",
+        )
+        render_history_chart(history_df, [ticker], history_metric)
+
+
+def render_ticker_evidence_drawers(ticker_mentions: pd.DataFrame, evidence_df: pd.DataFrame) -> None:
+    with st.expander("Top evidence", expanded=False):
+        if evidence_df.empty:
+            st.caption("No representative evidence rows are available.")
+        else:
+            display = evidence_df.copy()
+            for column in ("claims_to_verify", "red_flags"):
+                if column in display.columns:
+                    display[column] = display[column].map(lambda value: ", ".join(list_cell_values(value, limit=4)))
+            columns = [
+                "created_time",
+                "source_name",
+                "sentiment",
+                "confidence",
+                "alpha_signal_score",
+                "hype_score",
+                "evidence_quality",
+                "thread_title",
+                "summary",
+                "claims_to_verify",
+                "red_flags",
+                "permalink",
+            ]
+            st.dataframe(
+                display[[column for column in columns if column in display.columns]],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "permalink": st.column_config.LinkColumn("permalink"),
+                    "thread_title": st.column_config.TextColumn("Title", width="large"),
+                    "summary": st.column_config.TextColumn("Summary", width="large"),
+                },
+            )
+
+    with st.expander("Raw mentions", expanded=False):
+        if ticker_mentions.empty:
+            st.caption("No raw mention rows are available.")
+            return
+        raw = ticker_mentions.copy()
+        for column in ("claims_to_verify", "red_flags"):
+            if column in raw.columns:
+                raw[column] = raw[column].map(lambda value: ", ".join(list_cell_values(value, limit=5)))
+        raw_columns = [
+            "created_time",
+            "analysis_run_id",
+            "source_name",
+            "sentiment",
+            "confidence",
+            "classifier_mode",
+            "alpha_signal_score",
+            "hype_score",
+            "evidence_quality",
+            "thread_title",
+            "summary",
+            "body_text",
+            "permalink",
+        ]
+        st.dataframe(
+            raw[[column for column in raw_columns if column in raw.columns]].head(300),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "permalink": st.column_config.LinkColumn("permalink"),
+                "thread_title": st.column_config.TextColumn("Title", width="large"),
+                "body_text": st.column_config.TextColumn("Text", width="large"),
+            },
+        )
+
+
+def render_ticker_explorer_page(db_path: Path) -> None:
+    st.header("Ticker Explorer")
+    long_df, summary_df, _, corpus_summary = build_corpus_frames(db_path)
+    if summary_df.empty or long_df.empty:
+        st.info("No completed ticker corpus is available yet. Run a scrape that finds ticker mentions, then return here.")
+        return
+
+    summary_df = summary_df.sort_values(["total_mentions", "emerging_ticker_score"], ascending=[False, False]).copy()
+    ticker_options = summary_df["ticker"].dropna().astype(str).tolist()
+    company_lookup = dict(zip(summary_df["ticker"].astype(str), summary_df["company_name"].astype(str), strict=False))
+    focused = normalize_ticker(str(st.session_state.get("ticker_focus", "")))
+    default_ticker = focused if focused in ticker_options else ticker_options[0]
+    default_index = ticker_options.index(default_ticker)
+
+    search_cols = st.columns([1.35, 0.95, 0.7])
+    selected_ticker = search_cols[0].selectbox(
+        "Ticker",
+        ticker_options,
+        index=default_index,
+        format_func=lambda value: f"{value} · {company_lookup.get(value, 'Unknown')}",
+        key="ticker_explorer_search",
+        help="Search any ticker found in completed runs.",
+    )
+    st.session_state["ticker_focus"] = selected_ticker
+    window_label = search_cols[1].radio(
+        "Window",
+        list(TICKER_EXPLORER_WINDOWS.keys()),
+        index=1,
+        horizontal=True,
+        key="ticker_explorer_window",
+        help="Windows are anchored to the ticker's latest collected mention.",
+    )
+    refresh_clicked = search_cols[2].button("Refresh", use_container_width=True, help="Regenerate the cached consensus for this ticker/window.")
+
+    with st.expander("Consensus settings", expanded=False):
+        setting_cols = st.columns(2)
+        model_name = setting_cols[0].text_input("Ollama model", DEFAULT_MODEL, key="ticker_explorer_model")
+        ollama_url = setting_cols[1].text_input("Ollama URL", DEFAULT_OLLAMA_URL, key="ticker_explorer_ollama_url")
+
+    window_mentions = filter_ticker_window_mentions(long_df, selected_ticker, TICKER_EXPLORER_WINDOWS[window_label])
+    if window_mentions.empty:
+        st.info(f"No `{selected_ticker}` mentions matched `{window_label}`.")
+        return
+
+    window_summary_df = build_ticker_summaries(window_mentions)
+    ticker_summary_row = window_summary_df.iloc[0].to_dict() if not window_summary_df.empty else {}
+    company_name = str(ticker_summary_row.get("company_name") or company_lookup.get(selected_ticker) or "Unknown")
+    stats = build_ticker_explorer_stats(window_mentions, ticker_summary_row)
+
+    sources = load_sources(db_path)
+    source_lookup = {
+        int(row["source_id"]): str(row["display_name"])
+        for row in sources.to_dict(orient="records")
+    } if not sources.empty else {}
+    history_raw = load_ticker_history(db_path, selected_ticker, data_mode="live")
+    run_label_lookup = {
+        str(row["analysis_run_id"]): build_run_display_label(row, source_lookup)
+        for row in load_analysis_runs(db_path).to_dict(orient="records")
+    }
+    history_df = prepare_historical_summary_frame(history_raw, run_label_lookup) if not history_raw.empty else pd.DataFrame()
+
+    evidence_df = select_representative_mentions(window_mentions)
+    packet = build_ticker_consensus_packet(
+        ticker=selected_ticker,
+        company_name=company_name,
+        window_label=window_label,
+        stats=stats,
+        ticker_mentions=window_mentions,
+        evidence_df=evidence_df,
+        history_df=history_df,
+    )
+    scope_key = f"ticker_explorer:{window_label.lower().replace(' ', '_')}"
+    evidence_signature = ticker_consensus_signature(
+        ticker=selected_ticker,
+        window_label=window_label,
+        stats=stats,
+        evidence_df=evidence_df,
+    )
+    cached = load_ticker_consensus_cache(
+        db_path,
+        ticker=selected_ticker,
+        scope_key=scope_key,
+        model_name=model_name,
+    )
+    cache_current = bool(cached and cached.get("evidence_signature") == evidence_signature)
+    generated_now = False
+    if refresh_clicked or not cache_current:
+        with st.spinner("Generating compact consensus..."):
+            consensus_result = OllamaClassifier(model=model_name, endpoint=ollama_url, timeout=45, retries=0).summarize_ticker_consensus(packet)
+        generated_now = True
+        generated_at = analysis_run_now_iso()
+        consensus_payload = consensus_result.payload
+        classifier_mode = consensus_result.mode
+        upsert_ticker_consensus_cache(
+            db_path,
+            {
+                "ticker": selected_ticker,
+                "scope_key": scope_key,
+                "model_name": model_name,
+                "ollama_url": ollama_url,
+                "latest_run_id": stats.get("latest_run_id", ""),
+                "evidence_signature": evidence_signature,
+                "summary_json": consensus_payload,
+                "classifier_mode": classifier_mode,
+                "evidence_item_ids": evidence_df["item_id"].astype(str).tolist() if not evidence_df.empty and "item_id" in evidence_df.columns else [],
+                "generated_at": generated_at,
+            },
+        )
+    else:
+        consensus_payload = cached.get("summary_json", {}) if cached else {}
+        classifier_mode = str(cached.get("classifier_mode", "")) if cached else ""
+        generated_at = str(cached.get("generated_at", "")) if cached else ""
+
+    cache_label = "Generated now" if generated_now else "Fresh cache" if cache_current else "Needs refresh"
+    render_ticker_hero(selected_ticker, company_name, window_label, stats, cache_label)
+    watchlist = get_watchlist()
+    pin_cols = st.columns([0.7, 4.3])
+    if selected_ticker in watchlist:
+        if pin_cols[0].button("Unpin", key=f"explorer_unpin_{selected_ticker}"):
+            update_watchlist([ticker for ticker in watchlist if ticker != selected_ticker])
+            st.rerun()
+    elif pin_cols[0].button("Pin", key=f"explorer_pin_{selected_ticker}"):
+        update_watchlist([*watchlist, selected_ticker])
+        st.rerun()
+    pin_cols[1].caption(
+        f"Corpus scope: {int(corpus_summary.get('runs_included', 0) or 0)} completed run(s), "
+        f"{int(corpus_summary.get('ticker_mentions', 0) or 0)} ticker mention rows."
+    )
+
+    render_ticker_metric_strip(stats)
+    render_consensus_summary(
+        payload=consensus_payload,
+        classifier_mode=classifier_mode,
+        generated_at=generated_at,
+        cache_label=cache_label,
+    )
+    render_ticker_explorer_charts(selected_ticker, window_mentions, history_df)
+    render_narrative_and_claims(selected_ticker, consensus_payload, window_mentions)
+    render_ticker_evidence_drawers(window_mentions, evidence_df)
 
 
 def build_spike_notes(bucket_df: pd.DataFrame, long_df: pd.DataFrame, selected_tickers: list[str]) -> pd.DataFrame:
@@ -6255,6 +6888,8 @@ elif page == "Run Analysis":
     )
 elif page == "Results Dashboard":
     render_results_dashboard_page(DEFAULT_DB_PATH, selected_run_id)
+elif page == "Ticker Explorer":
+    render_ticker_explorer_page(DEFAULT_DB_PATH)
 elif page == "Ticker Trends":
     render_ticker_trends_page(DEFAULT_DB_PATH, selected_run_id)
 elif page == "Signal Validation":

@@ -84,6 +84,35 @@ DEEPER_ANALYSIS_SCHEMA = {
     "additionalProperties": False,
 }
 
+TICKER_CONSENSUS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "consensus_summary": {"type": "string"},
+        "stance": {"type": "string", "enum": ["bullish", "bearish", "mixed", "neutral", "unclear"]},
+        "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+        "bull_case": {"type": "array", "items": {"type": "string"}},
+        "bear_case": {"type": "array", "items": {"type": "string"}},
+        "catalysts": {"type": "array", "items": {"type": "string"}},
+        "risks": {"type": "array", "items": {"type": "string"}},
+        "narrative_shift": {"type": "string"},
+        "claims_to_verify": {"type": "array", "items": {"type": "string"}},
+        "red_flags": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": [
+        "consensus_summary",
+        "stance",
+        "confidence",
+        "bull_case",
+        "bear_case",
+        "catalysts",
+        "risks",
+        "narrative_shift",
+        "claims_to_verify",
+        "red_flags",
+    ],
+    "additionalProperties": False,
+}
+
 
 @dataclass
 class ClassifierResult:
@@ -127,6 +156,27 @@ class OllamaClassifier:
                 mode="fallback",
             )
         return ClassifierResult(payload=self._normalize_deeper_payload(payload, classification_payload), mode="ollama")
+
+    def summarize_ticker_consensus(self, packet: dict[str, Any]) -> ClassifierResult:
+        payload = self._call_ollama(
+            schema=TICKER_CONSENSUS_SCHEMA,
+            system_prompt=(
+                "Summarize a compact packet of Reddit ticker evidence. Return strict JSON only. "
+                "Stay concise, avoid financial advice, and use only the supplied stats and evidence. "
+                "If the evidence is thin, say so in confidence and red_flags."
+            ),
+            user_payload=json.dumps(
+                {
+                    "task": "Summarize current ticker consensus and what changed.",
+                    "required_output_schema": TICKER_CONSENSUS_SCHEMA,
+                    "packet": packet,
+                },
+                ensure_ascii=True,
+            ),
+        )
+        if payload is None:
+            return ClassifierResult(payload=self._heuristic_ticker_consensus(packet), mode="fallback")
+        return ClassifierResult(payload=self._normalize_ticker_consensus_payload(payload), mode="ollama")
 
     def list_available_models(self) -> list[str]:
         response = requests.get(self._tags_endpoint(), timeout=10)
@@ -239,8 +289,6 @@ class OllamaClassifier:
         result["red_flags"] = self._coerce_string_list(result.get("red_flags"))
         result["claims_to_verify"] = self._coerce_string_list(result.get("claims_to_verify"))
 
-        if not result["tickers"]:
-            result["tickers"] = extraction["tickers"]
         company_by_ticker = dict(zip(extraction["tickers"], extraction["company_names"], strict=False))
         result["company_names"] = [company_by_ticker.get(ticker, "Unknown") for ticker in result["tickers"]]
         if not result["claim_specificity_score"]:
@@ -266,6 +314,64 @@ class OllamaClassifier:
         normalized["bear_thesis"] = str(normalized.get("bear_thesis") or classification_payload.get("bear_case") or "").strip()
         return normalized
 
+    def _normalize_ticker_consensus_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        stance = str(payload.get("stance") or "unclear").strip().lower()
+        if stance not in {"bullish", "bearish", "mixed", "neutral", "unclear"}:
+            stance = "unclear"
+        confidence = str(payload.get("confidence") or "low").strip().lower()
+        if confidence not in {"low", "medium", "high"}:
+            confidence = "low"
+        return {
+            "consensus_summary": str(payload.get("consensus_summary") or "").strip()[:700],
+            "stance": stance,
+            "confidence": confidence,
+            "bull_case": self._coerce_string_list(payload.get("bull_case"))[:5],
+            "bear_case": self._coerce_string_list(payload.get("bear_case"))[:5],
+            "catalysts": self._coerce_string_list(payload.get("catalysts"))[:5],
+            "risks": self._coerce_string_list(payload.get("risks"))[:5],
+            "narrative_shift": str(payload.get("narrative_shift") or "").strip()[:500],
+            "claims_to_verify": self._coerce_string_list(payload.get("claims_to_verify"))[:6],
+            "red_flags": self._coerce_string_list(payload.get("red_flags"))[:6],
+        }
+
+    def _heuristic_ticker_consensus(self, packet: dict[str, Any]) -> dict[str, Any]:
+        stats = packet.get("stats", {}) if isinstance(packet.get("stats"), dict) else {}
+        bullish = int(stats.get("bullish_mentions", 0) or 0)
+        bearish = int(stats.get("bearish_mentions", 0) or 0)
+        mentions = int(stats.get("mentions", 0) or 0)
+        hype = float(stats.get("average_hype", 0) or 0)
+        evidence = float(stats.get("average_evidence_quality", 0) or 0)
+        stance = "mixed"
+        if bullish > bearish * 1.35 and bullish:
+            stance = "bullish"
+        elif bearish > bullish * 1.35 and bearish:
+            stance = "bearish"
+        elif not bullish and not bearish:
+            stance = "neutral"
+        confidence = "medium" if mentions >= 8 and evidence >= 5 else "low"
+        red_flags = []
+        if mentions < 3:
+            red_flags.append("thin ticker evidence")
+        if hype >= 6:
+            red_flags.append("elevated hype language")
+        if int(stats.get("fallback_mentions", 0) or 0):
+            red_flags.append("some fallback-classified evidence")
+        return {
+            "consensus_summary": (
+                f"{packet.get('ticker', 'Ticker')} has {mentions} mention(s) in this window. "
+                f"The deterministic read is {stance}, with average hype {hype:.1f} and evidence quality {evidence:.1f}."
+            ),
+            "stance": stance,
+            "confidence": confidence,
+            "bull_case": list(dict.fromkeys(packet.get("bull_claims", []) or []))[:5],
+            "bear_case": list(dict.fromkeys(packet.get("bear_claims", []) or []))[:5],
+            "catalysts": [],
+            "risks": [],
+            "narrative_shift": str(packet.get("deterministic_shift", "") or "Not enough prior-window evidence to describe a shift."),
+            "claims_to_verify": list(dict.fromkeys(packet.get("claims_to_verify", []) or []))[:6],
+            "red_flags": red_flags,
+        }
+
     def _heuristic_classification(self, item: dict[str, Any], extraction: dict[str, list[str]]) -> dict[str, Any]:
         text = " ".join([item.get("thread_title", ""), item.get("body_text", "")]).lower()
         result = dict(DEFAULT_SENTIMENT)
@@ -286,9 +392,9 @@ class OllamaClassifier:
 
         if not extraction["tickers"] and not extraction["company_names"]:
             result["sentiment"] = "irrelevant"
-            result["confidence"] = 0.85
+            result["confidence"] = 0.35
             result["summary"] = "No confident stock ticker or company reference was identified."
-            result["red_flags"] = ["unknown ticker/company"]
+            result["red_flags"] = ["fallback classifier", "unknown ticker/company"]
             return result
 
         if bullish_hits > bearish_hits:
@@ -298,10 +404,10 @@ class OllamaClassifier:
         else:
             result["sentiment"] = "neutral"
 
-        result["confidence"] = 0.68
+        result["confidence"] = 0.45
         result["bull_case"] = "Post argues for improving fundamentals, upside, or business momentum." if bullish_hits else ""
         result["bear_case"] = "Post points to downside risk, dilution, or execution concerns." if bearish_hits else ""
-        result["evidence_quality"] = "high" if result["claim_specificity_score"] >= 6 else "medium" if bullish_hits or bearish_hits else "low"
+        result["evidence_quality"] = "medium" if bullish_hits or bearish_hits or result["claim_specificity_score"] >= 6 else "low"
         result["depth_score"] = min(2 + bullish_hits + bearish_hits + (result["claim_specificity_score"] // 2), 10)
         result["hype_score"] = min(hype_hits * 3, 10)
         result["needs_deeper_analysis"] = (
@@ -309,7 +415,7 @@ class OllamaClassifier:
             or result["evidence_quality"] == "high"
             or result["claim_specificity_score"] >= 7
         )
-        red_flags = []
+        red_flags = ["fallback classifier"]
         if hype_hits:
             red_flags.append("pump language")
         if result["evidence_quality"] == "low":

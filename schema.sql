@@ -250,6 +250,20 @@ CREATE TABLE IF NOT EXISTS ticker_time_buckets (
     FOREIGN KEY (analysis_run_id) REFERENCES analysis_runs(analysis_run_id)
 );
 
+CREATE TABLE IF NOT EXISTS ticker_consensus_cache (
+    ticker TEXT NOT NULL,
+    scope_key TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    ollama_url TEXT NOT NULL DEFAULT '',
+    latest_run_id TEXT NOT NULL DEFAULT '',
+    evidence_signature TEXT NOT NULL,
+    summary_json TEXT NOT NULL DEFAULT '{}',
+    classifier_mode TEXT NOT NULL DEFAULT '',
+    evidence_item_ids TEXT NOT NULL DEFAULT '[]',
+    generated_at TEXT NOT NULL,
+    PRIMARY KEY (ticker, scope_key, model_name)
+);
+
 CREATE TABLE IF NOT EXISTS ticker_signal_events (
     signal_id TEXT PRIMARY KEY,
     ticker TEXT NOT NULL,

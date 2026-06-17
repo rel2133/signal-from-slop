@@ -19,6 +19,7 @@ JSON_COLUMNS = {
     "top_evidence_item_ids",
     "top_evidence_titles",
     "top_evidence_excerpts",
+    "evidence_item_ids",
 }
 
 
@@ -732,6 +733,90 @@ def load_historical_ticker_summaries(
     )
 
 
+def load_ticker_history(db_path: str | Path, ticker: str, *, data_mode: str = "live") -> pd.DataFrame:
+    return _load_table(
+        db_path,
+        """
+        SELECT
+            ts.*,
+            ar.started_at,
+            ar.completed_at,
+            ar.data_mode,
+            ar.run_type,
+            ar.canonical_trend_run,
+            ar.selected_source_ids,
+            ar.summary_json
+        FROM ticker_summaries ts
+        JOIN analysis_runs ar
+            ON ar.analysis_run_id = ts.analysis_run_id
+        WHERE ar.status = 'completed'
+          AND ar.data_mode = ?
+          AND ts.ticker = ?
+        ORDER BY ar.completed_at, ar.started_at
+        """,
+        (data_mode, str(ticker).upper()),
+    )
+
+
+def load_ticker_consensus_cache(
+    db_path: str | Path,
+    *,
+    ticker: str,
+    scope_key: str,
+    model_name: str,
+) -> dict[str, Any] | None:
+    frame = _load_table(
+        db_path,
+        """
+        SELECT *
+        FROM ticker_consensus_cache
+        WHERE ticker = ?
+          AND scope_key = ?
+          AND model_name = ?
+        LIMIT 1
+        """,
+        (str(ticker).upper(), scope_key, model_name),
+    )
+    if frame.empty:
+        return None
+    return frame.iloc[0].to_dict()
+
+
+def upsert_ticker_consensus_cache(db_path: str | Path, row: dict[str, Any]) -> None:
+    payload = (
+        str(row.get("ticker", "")).upper(),
+        str(row.get("scope_key", "")),
+        str(row.get("model_name", "")),
+        str(row.get("ollama_url", "")),
+        str(row.get("latest_run_id", "")),
+        str(row.get("evidence_signature", "")),
+        json.dumps(row.get("summary_json", {}), ensure_ascii=True),
+        str(row.get("classifier_mode", "")),
+        json.dumps(row.get("evidence_item_ids", []), ensure_ascii=True),
+        str(row.get("generated_at", _now_iso())),
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO ticker_consensus_cache (
+                ticker, scope_key, model_name, ollama_url, latest_run_id,
+                evidence_signature, summary_json, classifier_mode,
+                evidence_item_ids, generated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(ticker, scope_key, model_name) DO UPDATE SET
+                ollama_url=excluded.ollama_url,
+                latest_run_id=excluded.latest_run_id,
+                evidence_signature=excluded.evidence_signature,
+                summary_json=excluded.summary_json,
+                classifier_mode=excluded.classifier_mode,
+                evidence_item_ids=excluded.evidence_item_ids,
+                generated_at=excluded.generated_at
+            """,
+            payload,
+        )
+        conn.commit()
+
+
 def load_run_time_buckets(db_path: str | Path, analysis_run_id: str) -> pd.DataFrame:
     return _load_table(
         db_path,
@@ -1293,6 +1378,23 @@ def _decode_json_columns(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def _migrate_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ticker_consensus_cache (
+            ticker TEXT NOT NULL,
+            scope_key TEXT NOT NULL,
+            model_name TEXT NOT NULL,
+            ollama_url TEXT NOT NULL DEFAULT '',
+            latest_run_id TEXT NOT NULL DEFAULT '',
+            evidence_signature TEXT NOT NULL,
+            summary_json TEXT NOT NULL DEFAULT '{}',
+            classifier_mode TEXT NOT NULL DEFAULT '',
+            evidence_item_ids TEXT NOT NULL DEFAULT '[]',
+            generated_at TEXT NOT NULL,
+            PRIMARY KEY (ticker, scope_key, model_name)
+        )
+        """
+    )
     if _table_exists(conn, "analysis_runs"):
         _add_missing_columns(
             conn,

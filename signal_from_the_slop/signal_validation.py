@@ -32,12 +32,17 @@ except ImportError:  # pragma: no cover - optional dependency at runtime
 
 LOGGER = logging.getLogger(__name__)
 
-SIGNAL_SCORING_VERSION = "signal_validation_v1"
+SIGNAL_SCORING_VERSION = "signal_validation_v2"
 DEFAULT_BENCHMARK_TICKER = "SPY"
 DEFAULT_TICKER_UNIVERSE_NAME = "local_ticker_catalog"
 AUTO_SIGNAL_TOP_N = 5
 AUTO_SIGNAL_MIN_EMERGING = 60.0
 AUTO_SIGNAL_MIN_ACCELERATION = 20.0
+AUTO_SIGNAL_MIN_COVERAGE_RELIABILITY = 0.5
+AUTO_SIGNAL_MIN_MENTIONS = 3
+AUTO_SIGNAL_MIN_UNIQUE_AUTHORS = 2
+AUTO_SIGNAL_MIN_UNIQUE_THREADS = 2
+AUTO_SIGNAL_ALLOWED_TREND_RELIABILITY = {"Medium", "High"}
 SIGNAL_COOLDOWN_HOURS = 24
 MATERIAL_SIGNAL_DELTA = 12.0
 RANDOM_BENCHMARK_SAMPLE_SIZE = 12
@@ -232,10 +237,16 @@ def freeze_signal_events_for_run(
         if not ticker or ticker == "UNKNOWN":
             continue
         manual_signal = ticker in manual_set
-        qualifies_automatic = allow_automatic_signals and (
+        automatic_score_qualifies = (
             index <= AUTO_SIGNAL_TOP_N
             or _coerce_float(row.get("emerging_ticker_score")) >= AUTO_SIGNAL_MIN_EMERGING
             or _coerce_float(row.get("acceleration_score")) >= AUTO_SIGNAL_MIN_ACCELERATION
+        )
+        evidence_stats = _ticker_evidence_stats(mentions_working, row, ticker)
+        qualifies_automatic = (
+            allow_automatic_signals
+            and automatic_score_qualifies
+            and _automatic_signal_quality_passes(row, evidence_stats)
         )
         if not manual_signal and not qualifies_automatic:
             continue
@@ -557,6 +568,45 @@ def _build_top_evidence(mentions_df: pd.DataFrame, ticker: str) -> dict[str, lis
         "titles": titles,
         "excerpts": excerpts,
     }
+
+
+def _ticker_evidence_stats(mentions_df: pd.DataFrame, row: dict[str, Any], ticker: str) -> dict[str, Any]:
+    stats = {
+        "total_mentions": int(_coerce_float(row.get("total_mentions"))),
+        "unique_authors": int(_coerce_float(row.get("unique_authors"))),
+        "unique_threads": int(_coerce_float(row.get("unique_threads"))),
+        "has_non_fallback_mention": False,
+    }
+    if mentions_df.empty:
+        return stats
+
+    ticker_mentions = mentions_df[mentions_df["ticker"] == ticker].copy()
+    if ticker_mentions.empty:
+        return stats
+
+    stats["total_mentions"] = max(stats["total_mentions"], len(ticker_mentions))
+    if "author_hash" in ticker_mentions.columns:
+        stats["unique_authors"] = max(stats["unique_authors"], int(ticker_mentions["author_hash"].nunique()))
+    if "thread_id" in ticker_mentions.columns:
+        stats["unique_threads"] = max(stats["unique_threads"], int(ticker_mentions["thread_id"].nunique()))
+    if "classifier_mode" in ticker_mentions.columns:
+        modes = ticker_mentions["classifier_mode"].fillna("").astype(str).str.lower().str.strip()
+        stats["has_non_fallback_mention"] = bool(modes.eq("ollama").any())
+    return stats
+
+
+def _automatic_signal_quality_passes(row: dict[str, Any], evidence_stats: dict[str, Any]) -> bool:
+    if _coerce_float(row.get("coverage_reliability")) < AUTO_SIGNAL_MIN_COVERAGE_RELIABILITY:
+        return False
+    if str(row.get("trend_reliability", "")).strip().title() not in AUTO_SIGNAL_ALLOWED_TREND_RELIABILITY:
+        return False
+    if int(evidence_stats.get("total_mentions", 0)) < AUTO_SIGNAL_MIN_MENTIONS:
+        return False
+    if int(evidence_stats.get("unique_authors", 0)) < AUTO_SIGNAL_MIN_UNIQUE_AUTHORS:
+        return False
+    if int(evidence_stats.get("unique_threads", 0)) < AUTO_SIGNAL_MIN_UNIQUE_THREADS:
+        return False
+    return bool(evidence_stats.get("has_non_fallback_mention", False))
 
 
 def _should_create_signal_event(candidate: dict[str, Any], recent_events: pd.DataFrame, *, manual_signal: bool) -> bool:
