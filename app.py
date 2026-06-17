@@ -979,12 +979,12 @@ def render_app_bar(
     action_cols = st.columns([1, 1, 5])
     if action_cols[0].button("New Run", type="primary", use_container_width=True):
         st.session_state["page"] = "Collect"
-        st.session_state["collect_view"] = "New Run"
+        st.session_state["pending_collect_view"] = "New Run"
         st.rerun()
     if action_cols[1].button("Review", use_container_width=True):
         st.session_state["page"] = "Review"
         if run_id:
-            st.session_state[f"review_view_{run_id}"] = "Signals"
+            st.session_state[f"pending_review_view_{run_id}"] = "Signals"
         st.rerun()
 
 
@@ -1336,23 +1336,38 @@ def render_low_reliability_warning(summary: dict[str, Any] | None) -> None:
     trend_note = str(coverage.get("trend_note", "") or "")
     run_type = str(summary.get("run_type", RUN_TYPE_DISCOVERY)).lower()
     rss_capped_sources = int(coverage.get("rss_capped_sources", 0) or 0)
-    warnings: list[str] = []
+
+    details: list[str] = []
     if run_type == RUN_TYPE_DISCOVERY:
-        warnings.append(
-            "This is a Discovery run. Use it for idea finding and evidence review, not as a clean acceleration benchmark. "
-            "Run a Measurement scrape on the same source set to unlock acceleration."
+        details.append(
+            "This is a Discovery run, so it is best for idea finding and evidence review. "
+            "Use a Measurement run on the same source set for comparable acceleration."
         )
     if reliability_label == "Low":
-        reason_text = "; ".join(str(reason) for reason in reasons[:3]) if reasons else "Source coverage came back weak."
-        warnings.append(f"Trend reliability is low for this run. {reason_text}")
+        details.extend(str(reason) for reason in reasons[:4] if str(reason).strip())
+        if not details:
+            details.append("Source coverage came back weak.")
     if rss_capped_sources > 0:
-        warnings.append(
-            f"{rss_capped_sources} source(s) hit the RSS cap, so the run may be missing older posts in the selected window."
+        source_word = "source" if rss_capped_sources == 1 else "sources"
+        details.append(
+            f"{rss_capped_sources} {source_word} hit the RSS cap, so older posts in the requested window may be missing."
         )
     if trend_note and "baseline" in trend_note.lower():
-        warnings.append(trend_note)
-    if warnings:
-        st.warning(" ".join(dict.fromkeys(warnings)))
+        details.append(trend_note)
+    details = list(dict.fromkeys(details))
+    if not details:
+        return
+
+    if reliability_label == "Low":
+        st.warning("Trend trust is low for this run. Use it for evidence review, not acceleration or run-to-run comparison.")
+    elif run_type == RUN_TYPE_DISCOVERY:
+        st.info("Discovery run: good for finding leads, not for clean acceleration comparison.")
+    else:
+        st.warning("Scrape coverage has limits for this run.")
+
+    with st.expander("Why trend trust is low", expanded=False):
+        for detail in details:
+            st.markdown(f"- {detail}")
 
 
 def build_page_context_metrics(summary: dict[str, Any]) -> list[dict[str, str]]:
@@ -3828,11 +3843,11 @@ def build_sidebar_state(db_path: Path) -> tuple[str, str | None, pd.DataFrame, p
     pending_page = st.session_state.pop("pending_page", None)
     if pending_page:
         if pending_page == "Run Analysis":
-            st.session_state["collect_view"] = "New Run"
+            st.session_state["pending_collect_view"] = "New Run"
         elif pending_page == "Sources":
-            st.session_state["collect_view"] = "Sources"
+            st.session_state["pending_collect_view"] = "Sources"
         elif pending_page == "Export Data":
-            st.session_state["library_view"] = "Exports"
+            st.session_state["pending_library_view"] = "Exports"
         st.session_state["page"] = canonical_page_name(pending_page)
     pending_run_id = st.session_state.pop("pending_selected_run_id", None)
     if pending_run_id and not runs.empty and pending_run_id in runs["analysis_run_id"].tolist():
@@ -4235,7 +4250,7 @@ def render_run_analysis_page(
                 run_deeper_analysis=run_deeper_analysis,
             )
             track_background_run(run_id)
-            st.session_state["collect_view"] = "Run Progress"
+            st.session_state["pending_collect_view"] = "Run Progress"
             st.rerun()
         except RuntimeError as exc:
             st.error(str(exc))
@@ -4712,7 +4727,7 @@ def navigate_to_page(page_name: str, *, run_id: str | None = None, ticker: str |
         else:
             review_view = "Ticker Detail" if ticker else "Signals"
         if run_id:
-            st.session_state[f"review_view_{run_id}"] = review_view
+            st.session_state[f"pending_review_view_{run_id}"] = review_view
     st.session_state["page"] = target_page
     st.rerun()
 
@@ -6676,7 +6691,7 @@ def render_today_page(db_path: Path, run_id: str | None, source_lookup: dict[int
     if st.button(action_label, type="primary", use_container_width=True):
         st.session_state["page"] = target_page
         if target_page == "Collect":
-            st.session_state["collect_view"] = "Sources" if action_label == "Add sources" else "Run Progress" if active_run else "New Run"
+            st.session_state["pending_collect_view"] = "Sources" if action_label == "Add sources" else "Run Progress" if active_run else "New Run"
         st.rerun()
 
 
@@ -6685,9 +6700,13 @@ def render_collect_page(db_path: Path, artifacts_dir: Path, ticker_path: Path, s
         "Collect",
         "Choose sources, set the run purpose, preview request load, then start the background scrape.",
     )
+    collect_sections = ["Sources", "New Run", "Run Progress", "History"]
+    pending_collect_view = st.session_state.pop("pending_collect_view", None)
+    if pending_collect_view in collect_sections:
+        st.session_state["collect_view"] = pending_collect_view
     collect_view = st.radio(
         "Collect section",
-        ["Sources", "New Run", "Run Progress", "History"],
+        collect_sections,
         horizontal=True,
         label_visibility="collapsed",
         key="collect_view",
@@ -6745,12 +6764,17 @@ def render_review_page(db_path: Path, run_id: str | None) -> None:
         run_rows = runs[runs["analysis_run_id"].astype(str) == str(run_id)] if not runs.empty else pd.DataFrame()
         run_record = run_rows.iloc[0].to_dict() if not run_rows.empty else None
 
+    review_sections = ["Signals", "Ticker Detail", "Evidence", "Trends"]
+    review_view_key = f"review_view_{run_id}"
+    pending_review_view = st.session_state.pop(f"pending_review_view_{run_id}", None)
+    if pending_review_view in review_sections:
+        st.session_state[review_view_key] = pending_review_view
     review_view = st.radio(
         "Review section",
-        ["Signals", "Ticker Detail", "Evidence", "Trends"],
+        review_sections,
         horizontal=True,
         label_visibility="collapsed",
-        key=f"review_view_{run_id}",
+        key=review_view_key,
     )
     if review_view == "Signals":
         if is_corpus_scope(run_id):
@@ -6918,9 +6942,13 @@ def render_library_page(db_path: Path, ticker_path: Path, artifacts_dir: Path, r
         "Library",
         "Runs, artifacts, exports, watchlist, and the ticker catalog.",
     )
+    library_sections = ["Runs", "Artifacts", "Exports", "Watchlist", "Ticker Catalog"]
+    pending_library_view = st.session_state.pop("pending_library_view", None)
+    if pending_library_view in library_sections:
+        st.session_state["library_view"] = pending_library_view
     library_view = st.radio(
         "Library section",
-        ["Runs", "Artifacts", "Exports", "Watchlist", "Ticker Catalog"],
+        library_sections,
         horizontal=True,
         label_visibility="collapsed",
         key="library_view",
