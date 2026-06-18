@@ -745,15 +745,13 @@ def _market_data_is_sufficient(frame: pd.DataFrame, start_date: date, end_date: 
         return False
     min_date = working["date_dt"].min().date()
     max_date = working["date_dt"].max().date()
-    latest_fetch = pd.to_datetime(working["fetched_at"], errors="coerce", utc=True).max()
     if min_date > start_date:
         return False
     if max_date >= end_date:
         return True
-    if latest_fetch is pd.NaT or latest_fetch is None:
-        return False
     today = datetime.now(UTC).date()
-    return max_date >= min(end_date, today) - timedelta(days=4)
+    required_end = min(end_date, today)
+    return max_date >= required_end
 
 
 def _normalize_market_rows(frame: pd.DataFrame, *, ticker: str) -> list[dict[str, Any]]:

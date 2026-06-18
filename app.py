@@ -7051,17 +7051,25 @@ def render_signal_validation_page(db_path: Path, ticker_path: Path, run_id: str 
 
     render_metric_guide("Metric guide for Validate", expanded=False, context="signals")
 
-    metric_cols = st.columns(4)
+    metric_cols = st.columns(5)
     labelled_count = int(review_df["user_label"].fillna("").astype(str).str.len().gt(0).sum()) if "user_label" in review_df.columns else 0
     useful_count = int(
         review_df["user_label"].fillna("").isin(["Useful lead", "Worth deeper research", "Avoided hype trap"]).sum()
     ) if "user_label" in review_df.columns else 0
-    avg_excess_7d = review_df["excess_return_7d"].dropna().mean() if "excess_return_7d" in review_df.columns else None
+    return_7d_series = review_df["return_7d"].dropna() if "return_7d" in review_df.columns else pd.Series(dtype=float)
+    excess_7d_series = review_df["excess_return_7d"].dropna() if "excess_return_7d" in review_df.columns else pd.Series(dtype=float)
+    avg_return_7d = return_7d_series.mean() if not return_7d_series.empty else None
+    avg_excess_7d = excess_7d_series.mean() if not excess_7d_series.empty else None
     avg_attention_14d = review_df["attention_spread_14d"].dropna().mean() if "attention_spread_14d" in review_df.columns else None
     metric_cols[0].metric("Frozen signals", len(review_df))
     metric_cols[1].metric("Labelled", labelled_count)
     metric_cols[2].metric("Useful / deeper", useful_count)
-    metric_cols[3].metric("Avg excess 7d", f"{avg_excess_7d:+.2%}" if pd.notna(avg_excess_7d) else "n/a")
+    metric_cols[3].metric("Avg ticker 7d", f"{avg_return_7d:+.2%}" if pd.notna(avg_return_7d) else "n/a")
+    metric_cols[4].metric("Avg excess 7d", f"{avg_excess_7d:+.2%}" if pd.notna(avg_excess_7d) else "n/a")
+    st.caption(
+        f"7d market outcomes available for {len(return_7d_series)}/{len(review_df)} signal(s); "
+        f"SPY-relative excess returns available for {len(excess_7d_series)}/{len(review_df)}."
+    )
     if pd.notna(avg_attention_14d):
         st.caption(f"Average 14d attention spread: {float(avg_attention_14d):.1f}")
     render_status_chips([market_cache_status_label(review_df)])
