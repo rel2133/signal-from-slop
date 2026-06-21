@@ -20,6 +20,7 @@ JSON_COLUMNS = {
     "top_evidence_titles",
     "top_evidence_excerpts",
     "evidence_item_ids",
+    "warning_flags",
 }
 
 
@@ -1009,6 +1010,8 @@ def upsert_market_prices(db_path: str | Path, rows: Iterable[dict[str, Any]]) ->
             _nullable_float(row.get("volume")),
             str(row.get("data_source", "yfinance")),
             str(row.get("fetched_at", _now_iso())),
+            int(bool(row.get("price_available", True))),
+            str(row.get("missing_reason", "") or ""),
         )
         for row in rows
         if str(row.get("ticker", "")).strip() and str(row.get("date", "")).strip()
@@ -1020,8 +1023,8 @@ def upsert_market_prices(db_path: str | Path, rows: Iterable[dict[str, Any]]) ->
             """
             INSERT INTO ticker_market_prices (
                 ticker, date, open, high, low, close, adjusted_close, volume,
-                data_source, fetched_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                data_source, fetched_at, price_available, missing_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(ticker, date) DO UPDATE SET
                 open=excluded.open,
                 high=excluded.high,
@@ -1030,7 +1033,28 @@ def upsert_market_prices(db_path: str | Path, rows: Iterable[dict[str, Any]]) ->
                 adjusted_close=excluded.adjusted_close,
                 volume=excluded.volume,
                 data_source=excluded.data_source,
-                fetched_at=excluded.fetched_at
+                fetched_at=excluded.fetched_at,
+                price_available=excluded.price_available,
+                missing_reason=excluded.missing_reason
+            """,
+            payload,
+        )
+        conn.executemany(
+            """
+            INSERT INTO ticker_price_history (
+                ticker, date, open, high, low, close, adjusted_close, volume,
+                source, fetch_timestamp, price_available, missing_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(ticker, date, source) DO UPDATE SET
+                open=excluded.open,
+                high=excluded.high,
+                low=excluded.low,
+                close=excluded.close,
+                adjusted_close=excluded.adjusted_close,
+                volume=excluded.volume,
+                fetch_timestamp=excluded.fetch_timestamp,
+                price_available=excluded.price_available,
+                missing_reason=excluded.missing_reason
             """,
             payload,
         )
@@ -1147,6 +1171,100 @@ def load_signal_outcomes(db_path: str | Path, *, signal_id: str | None = None) -
         params = (signal_id,)
     query += " ORDER BY outcome_last_updated DESC"
     return _load_table(db_path, query, params)
+
+
+def create_correlation_run(db_path: str | Path, row: dict[str, Any]) -> int:
+    payload = (
+        str(row.get("run_name", "") or ""),
+        str(row.get("created_at", _now_iso())),
+        str(row.get("ticker_scope", "") or ""),
+        str(row.get("date_start", "") or ""),
+        str(row.get("date_end", "") or ""),
+        str(row.get("bucket_type", "") or ""),
+        str(row.get("correlation_method", "") or ""),
+        str(row.get("return_type", "") or ""),
+        str(row.get("benchmark", "") or ""),
+        int(row.get("min_sample_size", 0) or 0),
+    )
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO correlation_runs (
+                run_name, created_at, ticker_scope, date_start, date_end,
+                bucket_type, correlation_method, return_type, benchmark,
+                min_sample_size
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            payload,
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+
+
+def replace_correlation_results(
+    db_path: str | Path,
+    correlation_run_id: int,
+    rows: Iterable[dict[str, Any]],
+) -> None:
+    payload = [
+        (
+            int(correlation_run_id),
+            str(row.get("ticker", "") or ""),
+            str(row.get("signal_variable", "") or ""),
+            str(row.get("outcome_variable", "") or ""),
+            str(row.get("lag_window", "") or ""),
+            str(row.get("correlation_method", "") or ""),
+            _nullable_float(row.get("correlation_value")),
+            _nullable_float(row.get("p_value")),
+            int(row.get("sample_size", 0) or 0),
+            _nullable_float(row.get("confidence_interval_low")),
+            _nullable_float(row.get("confidence_interval_high")),
+            int(row.get("missing_count", 0) or 0),
+            str(row.get("reliability_label", "") or ""),
+            json.dumps(row.get("warning_flags", []), ensure_ascii=True),
+        )
+        for row in rows
+        if str(row.get("signal_variable", "")).strip()
+        and str(row.get("outcome_variable", "")).strip()
+    ]
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "DELETE FROM correlation_results WHERE correlation_run_id = ?",
+            (int(correlation_run_id),),
+        )
+        if payload:
+            conn.executemany(
+                """
+                INSERT INTO correlation_results (
+                    correlation_run_id, ticker, signal_variable, outcome_variable,
+                    lag_window, correlation_method, correlation_value, p_value,
+                    sample_size, confidence_interval_low, confidence_interval_high,
+                    missing_count, reliability_label, warning_flags
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                payload,
+            )
+        conn.commit()
+
+
+def load_correlation_runs(db_path: str | Path, *, limit: int | None = 20) -> pd.DataFrame:
+    query = "SELECT * FROM correlation_runs ORDER BY created_at DESC, id DESC"
+    if limit is not None:
+        query += f" LIMIT {max(int(limit), 0)}"
+    return _load_table(db_path, query)
+
+
+def load_correlation_results(db_path: str | Path, correlation_run_id: int) -> pd.DataFrame:
+    return _load_table(
+        db_path,
+        """
+        SELECT *
+        FROM correlation_results
+        WHERE correlation_run_id = ?
+        ORDER BY ABS(COALESCE(correlation_value, 0)) DESC, signal_variable, outcome_variable
+        """,
+        (int(correlation_run_id),),
+    )
 
 
 def upsert_signal_attention_outcomes(db_path: str | Path, rows: Iterable[dict[str, Any]]) -> None:
@@ -1336,6 +1454,9 @@ def db_overview(db_path: str | Path) -> dict[str, int]:
             "item_ticker_mentions": _count_rows(conn, "item_ticker_mentions"),
             "ticker_signal_events": _count_rows(conn, "ticker_signal_events"),
             "ticker_market_prices": _count_rows(conn, "ticker_market_prices"),
+            "ticker_price_history": _count_rows(conn, "ticker_price_history"),
+            "correlation_runs": _count_rows(conn, "correlation_runs"),
+            "correlation_results": _count_rows(conn, "correlation_results"),
         }
 
 
@@ -1366,6 +1487,7 @@ def _decode_json_columns(frame: pd.DataFrame) -> pd.DataFrame:
         "hit_rss_cap",
         "include_comments",
         "manual_signal",
+        "price_available",
         "rate_limited",
         "run_deeper_analysis",
         "needs_deeper_analysis",
@@ -1395,6 +1517,68 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ticker_price_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT NOT NULL,
+            date TEXT NOT NULL,
+            open REAL,
+            high REAL,
+            low REAL,
+            close REAL,
+            adjusted_close REAL,
+            volume INTEGER,
+            source TEXT NOT NULL DEFAULT 'yfinance',
+            fetch_timestamp TEXT NOT NULL,
+            price_available INTEGER NOT NULL DEFAULT 1,
+            missing_reason TEXT NOT NULL DEFAULT '',
+            UNIQUE(ticker, date, source)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS correlation_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_name TEXT,
+            created_at TEXT NOT NULL,
+            ticker_scope TEXT,
+            date_start TEXT,
+            date_end TEXT,
+            bucket_type TEXT,
+            correlation_method TEXT,
+            return_type TEXT,
+            benchmark TEXT,
+            min_sample_size INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS correlation_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            correlation_run_id INTEGER NOT NULL,
+            ticker TEXT,
+            signal_variable TEXT NOT NULL,
+            outcome_variable TEXT NOT NULL,
+            lag_window TEXT NOT NULL,
+            correlation_method TEXT NOT NULL,
+            correlation_value REAL,
+            p_value REAL,
+            sample_size INTEGER,
+            confidence_interval_low REAL,
+            confidence_interval_high REAL,
+            missing_count INTEGER,
+            reliability_label TEXT,
+            warning_flags TEXT NOT NULL DEFAULT '[]',
+            FOREIGN KEY(correlation_run_id) REFERENCES correlation_runs(id)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_price_history_ticker_date ON ticker_price_history(ticker, date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_correlation_runs_created ON correlation_runs(created_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_correlation_results_run ON correlation_results(correlation_run_id)")
     if _table_exists(conn, "analysis_runs"):
         _add_missing_columns(
             conn,
@@ -1420,6 +1604,27 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
                 "total_posts_scraped": "INTEGER NOT NULL DEFAULT 0",
                 "previous_posts_scraped": "INTEGER NOT NULL DEFAULT 0",
             },
+        )
+    if _table_exists(conn, "ticker_market_prices"):
+        _add_missing_columns(
+            conn,
+            "ticker_market_prices",
+            {
+                "price_available": "INTEGER NOT NULL DEFAULT 1",
+                "missing_reason": "TEXT NOT NULL DEFAULT ''",
+            },
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO ticker_price_history (
+                ticker, date, open, high, low, close, adjusted_close, volume,
+                source, fetch_timestamp, price_available, missing_reason
+            )
+            SELECT
+                ticker, date, open, high, low, close, adjusted_close, volume,
+                data_source, fetched_at, price_available, missing_reason
+            FROM ticker_market_prices
+            """
         )
 
 

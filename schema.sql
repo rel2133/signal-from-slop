@@ -308,7 +308,59 @@ CREATE TABLE IF NOT EXISTS ticker_market_prices (
     volume REAL,
     data_source TEXT NOT NULL DEFAULT 'yfinance',
     fetched_at TEXT NOT NULL,
+    price_available INTEGER NOT NULL DEFAULT 1,
+    missing_reason TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (ticker, date)
+);
+
+CREATE TABLE IF NOT EXISTS ticker_price_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,
+    date TEXT NOT NULL,
+    open REAL,
+    high REAL,
+    low REAL,
+    close REAL,
+    adjusted_close REAL,
+    volume INTEGER,
+    source TEXT NOT NULL DEFAULT 'yfinance',
+    fetch_timestamp TEXT NOT NULL,
+    price_available INTEGER NOT NULL DEFAULT 1,
+    missing_reason TEXT NOT NULL DEFAULT '',
+    UNIQUE(ticker, date, source)
+);
+
+CREATE TABLE IF NOT EXISTS correlation_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_name TEXT,
+    created_at TEXT NOT NULL,
+    ticker_scope TEXT,
+    date_start TEXT,
+    date_end TEXT,
+    bucket_type TEXT,
+    correlation_method TEXT,
+    return_type TEXT,
+    benchmark TEXT,
+    min_sample_size INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS correlation_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    correlation_run_id INTEGER NOT NULL,
+    ticker TEXT,
+    signal_variable TEXT NOT NULL,
+    outcome_variable TEXT NOT NULL,
+    lag_window TEXT NOT NULL,
+    correlation_method TEXT NOT NULL,
+    correlation_value REAL,
+    p_value REAL,
+    sample_size INTEGER,
+    confidence_interval_low REAL,
+    confidence_interval_high REAL,
+    missing_count INTEGER,
+    reliability_label TEXT,
+    warning_flags TEXT NOT NULL DEFAULT '[]',
+    FOREIGN KEY(correlation_run_id) REFERENCES correlation_runs(id)
 );
 
 CREATE TABLE IF NOT EXISTS ticker_signal_outcomes (
@@ -405,4 +457,7 @@ CREATE INDEX IF NOT EXISTS idx_buckets_run_ticker ON ticker_time_buckets(analysi
 CREATE INDEX IF NOT EXISTS idx_signal_events_ticker_time ON ticker_signal_events(ticker, signal_time DESC);
 CREATE INDEX IF NOT EXISTS idx_signal_events_run ON ticker_signal_events(analysis_run_id, signal_time DESC);
 CREATE INDEX IF NOT EXISTS idx_market_prices_ticker_date ON ticker_market_prices(ticker, date);
+CREATE INDEX IF NOT EXISTS idx_price_history_ticker_date ON ticker_price_history(ticker, date);
+CREATE INDEX IF NOT EXISTS idx_correlation_runs_created ON correlation_runs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_correlation_results_run ON correlation_results(correlation_run_id);
 CREATE INDEX IF NOT EXISTS idx_signal_random_signal ON ticker_signal_random_benchmarks(signal_id);
