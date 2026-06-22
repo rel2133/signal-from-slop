@@ -725,6 +725,75 @@ st.markdown(
         [data-testid="stPopover"] button[data-testid="stPopoverButton"] > div > div[aria-hidden="true"] {
             display: none;
         }
+        .review-header {
+            align-items: end;
+            display: flex;
+            gap: 0.75rem;
+            justify-content: space-between;
+            margin: 0.1rem 0 0.7rem;
+        }
+        .review-title {
+            font-size: 1.38rem;
+            font-weight: 790;
+            line-height: 1.1;
+        }
+        .review-scope {
+            font-size: 0.78rem;
+            font-weight: 700;
+            opacity: 0.72;
+            text-align: right;
+        }
+        .review-kpi-grid {
+            display: grid;
+            gap: 0.65rem;
+            grid-template-columns: repeat(4, minmax(110px, 1fr));
+            margin: 0 0 0.8rem;
+        }
+        .review-kpi {
+            border: 1px solid rgba(128, 128, 128, 0.20);
+            border-radius: 8px;
+            padding: 0.58rem 0.68rem;
+        }
+        .review-kpi-label {
+            font-size: 0.72rem;
+            font-weight: 760;
+            opacity: 0.68;
+            text-transform: uppercase;
+        }
+        .review-kpi-value {
+            font-size: 1.42rem;
+            font-weight: 800;
+            line-height: 1.08;
+            margin-top: 0.18rem;
+        }
+        .review-scrape-card {
+            border: 1px solid rgba(128, 128, 128, 0.20);
+            border-radius: 8px;
+            margin-bottom: 0.55rem;
+            padding: 0.58rem 0.66rem;
+        }
+        .review-scrape-date {
+            font-size: 0.9rem;
+            font-weight: 760;
+            line-height: 1.15;
+        }
+        .review-scrape-meta {
+            font-size: 0.76rem;
+            margin-top: 0.16rem;
+            opacity: 0.72;
+        }
+        @media (max-width: 840px) {
+            .review-header {
+                align-items: start;
+                flex-direction: column;
+            }
+            .review-scope {
+                text-align: left;
+            }
+            .review-kpi-grid {
+                grid-template-columns: repeat(2, minmax(120px, 1fr));
+            }
+        }
         .ticker-hero {
             border: 1px solid rgba(128, 128, 128, 0.22);
             border-radius: 8px;
@@ -1085,7 +1154,7 @@ def render_app_bar(
     source_lookup: dict[int, str],
     current_page: str,
 ) -> None:
-    if canonical_page_name(current_page) == "Today":
+    if canonical_page_name(current_page) in {"Today", "Review"}:
         return
     status_label, status_detail = compact_run_status_label(runs)
     latest_run = latest_completed_run(runs)
@@ -3594,6 +3663,154 @@ def render_dashboard_top_signals(
                         navigate_to_page("Validate", run_id=run_id, ticker=ticker)
 
 
+def review_scope_label(db_path: Path, run_id: str | None, runs: pd.DataFrame, summary: dict[str, Any]) -> str:
+    if is_corpus_scope(run_id):
+        return "Combined corpus"
+    if run_id and not runs.empty:
+        sources = load_sources(db_path)
+        source_lookup = {
+            int(row["source_id"]): str(row["display_name"])
+            for row in sources.to_dict(orient="records")
+        } if not sources.empty else {}
+        match = runs[runs["analysis_run_id"].astype(str) == str(run_id)]
+        if not match.empty:
+            return build_run_display_label(match.iloc[0].to_dict(), source_lookup)
+    return str(summary.get("time_window_label", "") or run_id or "")
+
+
+def review_kpi_values(summary: dict[str, Any], summary_df: pd.DataFrame) -> list[dict[str, str]]:
+    ticker_count = int(summary_df["ticker"].nunique()) if not summary_df.empty and "ticker" in summary_df.columns else int(summary.get("tickers_found", 0) or 0)
+    ticker_mentions = int(summary.get("ticker_mentions", 0) or 0)
+    if not ticker_mentions and not summary_df.empty and "total_mentions" in summary_df.columns:
+        ticker_mentions = int(pd.to_numeric(summary_df["total_mentions"], errors="coerce").fillna(0).sum())
+    return [
+        {"label": "Runs", "value": str(int(summary.get("runs_included", 1) or 1))},
+        {"label": "Unique items", "value": str(int(summary.get("items_analyzed", 0) or 0))},
+        {"label": "Tickers mentioned", "value": str(ticker_mentions)},
+        {"label": "Overlaps removed", "value": str(int(summary.get("deduplicated_mentions_removed", 0) or 0))},
+    ] if ticker_count or summary else [
+        {"label": "Runs", "value": "0"},
+        {"label": "Unique items", "value": "0"},
+        {"label": "Tickers mentioned", "value": "0"},
+        {"label": "Overlaps removed", "value": "0"},
+    ]
+
+
+def render_review_kpis(summary: dict[str, Any], summary_df: pd.DataFrame) -> None:
+    cards = []
+    for item in review_kpi_values(summary, summary_df):
+        cards.append(
+            (
+                '<div class="review-kpi">'
+                f'<div class="review-kpi-label">{escape(item["label"])}</div>'
+                f'<div class="review-kpi-value">{escape(item["value"])}</div>'
+                "</div>"
+            )
+        )
+    st.markdown(f'<div class="review-kpi-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+
+def review_window_duration_label(run_record: dict[str, Any]) -> str:
+    start_raw = str(run_record.get("time_window_start") or "").strip()
+    end_raw = str(run_record.get("time_window_end") or "").strip()
+    if not start_raw or not end_raw:
+        return str(run_record.get("time_window_label", "") or "")
+    try:
+        start = parse_created_time(start_raw)
+        end = parse_created_time(end_raw)
+    except Exception:
+        return str(run_record.get("time_window_label", "") or "")
+    seconds = max(int((end - start).total_seconds()), 0)
+    days = seconds / 86400
+    if days >= 1:
+        rounded = int(round(days))
+        return f"{rounded}d"
+    hours = max(int(round(seconds / 3600)), 1)
+    return f"{hours}h"
+
+
+def build_review_scrape_timeline(runs: pd.DataFrame) -> list[dict[str, str]]:
+    if runs.empty:
+        return []
+    completed = runs[
+        (runs["status"].astype(str).str.lower() == "completed")
+        & (runs["data_mode"].astype(str) == "live")
+        & (runs.apply(lambda row: run_has_analysed_items(row.to_dict()), axis=1))
+    ].copy()
+    if completed.empty:
+        return []
+    rows: list[dict[str, str]] = []
+    for row in completed.head(12).to_dict(orient="records"):
+        completed_at = str(row.get("completed_at") or row.get("started_at") or "")
+        summary = row.get("summary_json", {}) or {}
+        rows.append(
+            {
+                "run_id": str(row.get("analysis_run_id", "")),
+                "date": completed_at[:10] if completed_at else "Unknown",
+                "relative": relative_time_label(completed_at) or "",
+                "period": review_window_duration_label(row),
+                "items": str(int(summary.get("items_analyzed", 0) or 0)),
+                "tickers": str(int(summary.get("tickers_found", 0) or 0)),
+            }
+        )
+    return rows
+
+
+def render_review_scrape_timeline(runs: pd.DataFrame, *, current_run_id: str | None) -> None:
+    rows = build_review_scrape_timeline(runs)
+    if not rows:
+        st.caption("No completed scrapes")
+        return
+    for row in rows:
+        active = row["run_id"] == str(current_run_id or "")
+        border = "border-color: rgba(57, 132, 255, 0.48);" if active else ""
+        st.markdown(
+            (
+                f'<div class="review-scrape-card" style="{border}">'
+                f'<div class="review-scrape-date">{escape(row["relative"] or row["date"])}</div>'
+                f'<div class="review-scrape-meta">{escape(row["date"])} · {escape(row["period"])} · {escape(row["items"])} items · {escape(row["tickers"])} tickers</div>'
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
+
+
+def render_review_summary_table(summary_df: pd.DataFrame) -> None:
+    if summary_df.empty:
+        st.info("No ticker rows.")
+        return
+    display = summary_df.copy()
+    for column in ("emerging_ticker_score", "acceleration_score", "total_mentions", "average_alpha_signal_score"):
+        if column not in display.columns:
+            display[column] = 0
+        display[column] = pd.to_numeric(display[column], errors="coerce").fillna(0)
+    display = display.sort_values(["emerging_ticker_score", "average_alpha_signal_score"], ascending=[False, False])
+    columns = [
+        "ticker",
+        "company_name",
+        "total_mentions",
+        "emerging_ticker_score",
+        "acceleration_score",
+        "average_alpha_signal_score",
+        "average_hype_score",
+    ]
+    columns = [column for column in columns if column in display.columns]
+    st.dataframe(
+        display[columns],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "ticker": st.column_config.TextColumn("Ticker", width="small"),
+            "company_name": st.column_config.TextColumn("Company", width="medium"),
+            "total_mentions": st.column_config.NumberColumn("Mentions", format="%d"),
+            "emerging_ticker_score": st.column_config.NumberColumn("Emerging", format="%.1f"),
+            "acceleration_score": st.column_config.NumberColumn("Accel", format="%.1f"),
+            "average_alpha_signal_score": st.column_config.NumberColumn("Alpha", format="%.1f"),
+            "average_hype_score": st.column_config.NumberColumn("Hype", format="%.1f"),
+        },
+    )
+
+
 def seed_sources_from_file(db_path: Path, sources_path: Path) -> int:
     sources = json.loads(sources_path.read_text(encoding="utf-8"))
     for source in sources:
@@ -4413,17 +4630,10 @@ def build_sidebar_state(db_path: Path) -> tuple[str, str | None, pd.DataFrame, p
                 key="selected_run_id",
                 format_func=lambda value: run_label_lookup.get(str(value), str(value)),
             )
-            selected_rows = selectable_runs[selectable_runs["analysis_run_id"] == run_id] if not is_corpus_scope(run_id) else pd.DataFrame()
-            if is_corpus_scope(run_id):
-                st.caption(f"Scope: all completed live runs with analysed ticker mentions. Overlapping item/ticker rows are counted once.")
-            if not selected_rows.empty:
-                selected_record = selected_rows.iloc[0].to_dict()
-                st.caption(f"Sources: {format_source_names(selected_record, source_lookup)}")
-                st.caption(f"Completed: `{run_completed_label(selected_record)}`")
         else:
             st.info("No analysis runs saved yet.")
 
-        if run_id and page in {"Review", "Validate"}:
+        if run_id and page == "Validate":
             render_sidebar_quick_search(db_path, run_id)
 
     return page, run_id, sources, runs
@@ -7160,75 +7370,114 @@ def render_collect_page(db_path: Path, artifacts_dir: Path, ticker_path: Path, s
 
 
 def render_review_page(db_path: Path, run_id: str | None) -> None:
-    render_page_header(
-        "Review",
-        "Rank signals, inspect ticker detail, read evidence, and check trend reliability.",
-    )
     if not run_id:
-        st.info("Select or create an analysis scope before reviewing signals.")
+        st.info("Select an analysis scope.")
         return
 
+    runs = load_analysis_runs(db_path)
+    if not runs.empty:
+        runs = runs[runs["data_mode"] == "live"].copy()
     if is_corpus_scope(run_id):
-        long_df, summary_df, _, summary = build_corpus_frames(db_path)
+        long_df, summary_df, bucket_df, summary = build_corpus_frames(db_path)
         run_record = None
     else:
         long_df = load_run_mentions(db_path, run_id)
         long_df = attach_quality_columns(long_df, load_run_classification_quality(db_path, run_id))
         summary_df = load_run_ticker_summaries(db_path, run_id)
+        bucket_df = load_run_time_buckets(db_path, run_id)
         summary = load_run_summary(db_path, run_id)
-        runs = load_analysis_runs(db_path)
         run_rows = runs[runs["analysis_run_id"].astype(str) == str(run_id)] if not runs.empty else pd.DataFrame()
         run_record = run_rows.iloc[0].to_dict() if not run_rows.empty else None
 
-    review_sections = ["Signals", "Ticker Detail", "Evidence", "Trends"]
+    scope_label = review_scope_label(db_path, run_id, runs, summary)
+    st.markdown(
+        f"""
+        <div class="review-header">
+            <div class="review-title">Review</div>
+            <div class="review-scope">{escape(scope_label[:110])}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    render_review_kpis(summary, summary_df)
+
+    review_sections = ["Signal map", "Timeline", "Table"]
     review_view_key = f"review_view_{run_id}"
     pending_review_view = st.session_state.pop(f"pending_review_view_{run_id}", None)
+    pending_map = {
+        "Signals": "Signal map",
+        "Ticker Detail": "Table",
+        "Evidence": "Table",
+        "Trends": "Timeline",
+    }
+    pending_review_view = pending_map.get(str(pending_review_view), pending_review_view)
     if pending_review_view in review_sections:
         st.session_state[review_view_key] = pending_review_view
-    review_view = st.radio(
-        "Review section",
-        review_sections,
-        horizontal=True,
-        label_visibility="collapsed",
-        key=review_view_key,
-    )
-    if review_view == "Signals":
-        if is_corpus_scope(run_id):
-            render_corpus_summary_cards(summary)
-        elif summary:
-            render_run_summary_cards(summary)
-            render_run_metadata(db_path, run_id)
-            if run_record:
-                sources = load_sources(db_path)
-                source_lookup = {
-                    int(row["source_id"]): str(row["display_name"])
-                    for row in sources.to_dict(orient="records")
-                } if not sources.empty else {}
-                render_source_health(
-                    db_path=db_path,
-                    run_id=run_id,
-                    run_record=run_record,
-                    source_lookup=source_lookup,
+    if st.session_state.get(review_view_key) not in review_sections:
+        st.session_state[review_view_key] = "Signal map"
+    timeline_open_key = f"review_timeline_open_{run_id}"
+    if timeline_open_key not in st.session_state:
+        st.session_state[timeline_open_key] = True
+
+    controls = st.columns([1, 1, 1, 4, 0.45])
+    for index, section in enumerate(review_sections):
+        if controls[index].button(
+            section,
+            key=f"review_mode_{run_id}_{section}",
+            type="primary" if st.session_state[review_view_key] == section else "secondary",
+            use_container_width=True,
+        ):
+            st.session_state[review_view_key] = section
+            st.rerun()
+    if controls[4].button(
+        " ",
+        key=f"review_timeline_toggle_{run_id}",
+        icon=":material/chevron_right:" if st.session_state[timeline_open_key] else ":material/chevron_left:",
+        help="Hide scrapes" if st.session_state[timeline_open_key] else "Show scrapes",
+        use_container_width=True,
+    ):
+        st.session_state[timeline_open_key] = not bool(st.session_state[timeline_open_key])
+        st.rerun()
+
+    review_view = st.session_state[review_view_key]
+    timeline_open = bool(st.session_state[timeline_open_key])
+    if timeline_open:
+        main_col, timeline_col = st.columns([3.25, 1.05])
+    else:
+        main_col = st.container()
+        timeline_col = None
+
+    with main_col:
+        if review_view == "Signal map":
+            render_signal_map(summary_df)
+        elif review_view == "Timeline":
+            if bucket_df.empty or summary_df.empty:
+                st.info("No timeline rows.")
+            else:
+                timeline_controls = st.columns([2, 1])
+                default_tickers = summary_df["ticker"].head(min(8, len(summary_df))).tolist()
+                selected_tickers = timeline_controls[0].multiselect(
+                    "Tickers",
+                    summary_df["ticker"].tolist(),
+                    default=default_tickers,
+                    key=f"review_timeline_tickers_{run_id}",
                 )
+                timeline_metric = timeline_controls[1].selectbox(
+                    "Metric",
+                    list(WITHIN_RUN_METRICS.keys()),
+                    format_func=lambda value: WITHIN_RUN_METRICS[value],
+                    key=f"review_timeline_metric_{run_id}",
+                )
+                if selected_tickers:
+                    render_within_run_chart(bucket_df, selected_tickers, timeline_metric)
+                else:
+                    st.info("Select a ticker.")
+        elif review_view == "Table":
+            render_review_summary_table(summary_df)
 
-        if summary_df.empty:
-            st.info("No ticker summary rows are available for this scope.")
-        else:
-            render_top_signal_cards(summary_df, run_id=run_id, current_page="Review")
-            render_ticker_summary_table(summary_df, run_id=run_id, current_page="Review")
-
-    elif review_view == "Ticker Detail":
-        st.caption("Ticker Detail uses the completed corpus so a ticker profile can include evidence across runs.")
-        render_ticker_explorer_page(db_path, embedded=True)
-
-    elif review_view == "Evidence":
-        if long_df.empty:
-            st.info("No evidence rows are available for this scope.")
-        else:
-            render_results_mentions_review(long_df, summary_df, run_id)
-
-    elif review_view == "Trends":
-        render_ticker_trends_page(db_path, run_id, embedded=True)
+    if timeline_col is not None:
+        with timeline_col:
+            render_review_scrape_timeline(runs, current_run_id=None if is_corpus_scope(run_id) else run_id)
 
 
 def render_toms_correlation_page(db_path: Path) -> None:
@@ -9841,7 +10090,7 @@ render_app_bar(
 )
 page = render_workflow_navigation()
 render_background_run_banner(DEFAULT_DB_PATH, source_lookup)
-if page in {"Review", "Validate"}:
+if page == "Validate":
     render_persistent_run_context(DEFAULT_DB_PATH, selected_run_id)
     render_body_quick_jump(DEFAULT_DB_PATH, selected_run_id, page)
 
