@@ -510,6 +510,29 @@ st.markdown(
             border-radius: 8px;
             padding: 0.45rem 0.6rem;
         }
+        .sidebar-brand {
+            border-bottom: 1px solid rgba(128, 128, 128, 0.22);
+            margin: 0 0 0.8rem;
+            padding: 0.2rem 0 0.75rem;
+        }
+        .sidebar-brand-title {
+            font-size: 1.18rem;
+            font-weight: 790;
+            line-height: 1.15;
+        }
+        .sidebar-brand-subtitle {
+            font-size: 0.78rem;
+            margin-top: 0.18rem;
+            opacity: 0.68;
+        }
+        .sidebar-section-label {
+            font-size: 0.72rem;
+            font-weight: 750;
+            letter-spacing: 0;
+            margin: 0.85rem 0 0.25rem;
+            opacity: 0.68;
+            text-transform: uppercase;
+        }
         .app-shell-header {
             border-bottom: 1px solid rgba(128, 128, 128, 0.25);
             margin-bottom: 0.75rem;
@@ -602,6 +625,90 @@ st.markdown(
             font-size: 0.86rem;
             margin-top: 0.25rem;
             opacity: 0.76;
+        }
+        .dashboard-header {
+            align-items: end;
+            display: flex;
+            gap: 0.8rem;
+            justify-content: space-between;
+            margin: 0.1rem 0 0.8rem;
+        }
+        .dashboard-title {
+            font-size: 1.38rem;
+            font-weight: 790;
+            line-height: 1.1;
+        }
+        .dashboard-subtitle {
+            font-size: 0.84rem;
+            margin-top: 0.2rem;
+            opacity: 0.72;
+        }
+        .dashboard-scope {
+            font-size: 0.78rem;
+            font-weight: 700;
+            opacity: 0.72;
+            text-align: right;
+        }
+        .dashboard-kpi-label {
+            font-size: 0.76rem;
+            font-weight: 760;
+            opacity: 0.7;
+            text-transform: uppercase;
+        }
+        .dashboard-kpi-value {
+            font-size: 1.72rem;
+            font-weight: 800;
+            line-height: 1.08;
+            margin: 0.2rem 0 0.1rem;
+        }
+        .dashboard-kpi-note {
+            font-size: 0.86rem;
+            opacity: 0.76;
+        }
+        .dashboard-kpi-ticker {
+            font-size: 1.25rem;
+            font-weight: 800;
+            line-height: 1.15;
+            margin-top: 0.1rem;
+        }
+        .dashboard-panel-title {
+            font-size: 1rem;
+            font-weight: 780;
+            line-height: 1.2;
+            margin: 1.05rem 0 0.25rem;
+        }
+        .dashboard-panel-note {
+            font-size: 0.84rem;
+            margin-bottom: 0.35rem;
+            opacity: 0.72;
+        }
+        .dashboard-table-head {
+            border-bottom: 1px solid rgba(128, 128, 128, 0.22);
+            color: rgba(90, 90, 90, 0.96);
+            font-size: 0.73rem;
+            font-weight: 760;
+            padding: 0.15rem 0 0.25rem;
+            text-transform: uppercase;
+        }
+        .dashboard-ticker {
+            font-size: 0.98rem;
+            font-weight: 790;
+            line-height: 1.15;
+        }
+        .dashboard-company {
+            font-size: 0.78rem;
+            line-height: 1.2;
+            margin-top: 0.1rem;
+            opacity: 0.72;
+        }
+        .dashboard-number {
+            font-size: 0.96rem;
+            font-weight: 740;
+            line-height: 1.2;
+        }
+        .dashboard-number-note {
+            font-size: 0.76rem;
+            opacity: 0.68;
         }
         .ticker-hero {
             border: 1px solid rgba(128, 128, 128, 0.22);
@@ -963,6 +1070,8 @@ def render_app_bar(
     source_lookup: dict[int, str],
     current_page: str,
 ) -> None:
+    if canonical_page_name(current_page) == "Today":
+        return
     status_label, status_detail = compact_run_status_label(runs)
     latest_run = latest_completed_run(runs)
     latest_label = "No completed run"
@@ -2685,23 +2794,9 @@ def run_has_analysed_items(run_record: dict[str, Any]) -> bool:
 
 
 def render_workflow_navigation() -> str:
-    st.markdown('<div class="workflow-kicker">Workflow</div>', unsafe_allow_html=True)
     current_page = canonical_page_name(st.session_state.get("page", PAGES[0]))
     if st.session_state.get("page") != current_page:
         st.session_state["page"] = current_page
-
-    nav_cols = st.columns(len(PAGE_STEPS))
-    for column, step in zip(nav_cols, PAGE_STEPS):
-        with column:
-            if st.button(
-                step["label"],
-                key=f"workflow_nav_{step['page']}",
-                use_container_width=True,
-                type="primary" if current_page == step["page"] else "secondary",
-            ):
-                if current_page != step["page"]:
-                    st.session_state["page"] = step["page"]
-                    st.rerun()
     return current_page
 
 
@@ -3188,6 +3283,278 @@ def render_top_signal_cards(summary_df: pd.DataFrame, *, run_id: str, current_pa
             if st.button(review_label, key=f"top_signal_review_{run_id}_{ticker}", use_container_width=True):
                 navigate_to_page("Review", run_id=run_id, ticker=ticker)
             if current_canonical != "Validate" and st.button("Open Validate", key=f"top_signal_validate_{run_id}_{ticker}", use_container_width=True):
+                navigate_to_page("Validate", run_id=run_id, ticker=ticker)
+
+
+def dashboard_scope_label(run_id: str | None, runs: pd.DataFrame, source_lookup: dict[int, str]) -> str:
+    if is_corpus_scope(run_id):
+        return "Combined corpus"
+    if run_id and not runs.empty:
+        match = runs[runs["analysis_run_id"].astype(str) == str(run_id)]
+        if not match.empty:
+            return build_run_display_label(match.iloc[0].to_dict(), source_lookup)
+    return str(run_id or "No scope selected")
+
+
+def dashboard_validation_status_lookup(signal_review_df: pd.DataFrame) -> dict[str, str]:
+    if signal_review_df.empty or "ticker" not in signal_review_df.columns:
+        return {}
+    working = signal_review_df.copy()
+    working["ticker"] = working["ticker"].fillna("").astype(str).str.upper()
+    if "user_label" not in working.columns:
+        working["user_label"] = ""
+    lookup: dict[str, str] = {}
+    for ticker, group in working.groupby("ticker", dropna=False):
+        if not ticker:
+            continue
+        labels = group["user_label"].fillna("").astype(str).str.strip()
+        lookup[str(ticker)] = "Needs validation" if labels.eq("").any() else "Validated"
+    return lookup
+
+
+def dashboard_signal_rows(summary_df: pd.DataFrame, *, limit: int = 8) -> list[dict[str, Any]]:
+    if summary_df.empty:
+        return []
+    working = summary_df.copy()
+    for column in (
+        "total_mentions",
+        "average_alpha_signal_score",
+        "average_hype_score",
+        "acceleration_score",
+        "emerging_ticker_score",
+    ):
+        if column not in working.columns:
+            working[column] = 0.0
+        working[column] = pd.to_numeric(working[column], errors="coerce").fillna(0.0)
+    if "company_name" not in working.columns:
+        working["company_name"] = ""
+    for column in ("low_mentions_high_signal", "new_ticker_detected"):
+        if column not in working.columns:
+            working[column] = False
+        working[column] = working[column].fillna(False).astype(bool)
+    return (
+        working.sort_values(["emerging_ticker_score", "average_alpha_signal_score"], ascending=[False, False])
+        .head(limit)
+        .to_dict(orient="records")
+    )
+
+
+def dashboard_flagged_signal_count(summary_df: pd.DataFrame) -> int:
+    if summary_df.empty:
+        return 0
+    flagged = pd.Series(False, index=summary_df.index)
+    for column in ("low_mentions_high_signal", "new_ticker_detected"):
+        if column in summary_df.columns:
+            flagged = flagged | summary_df[column].fillna(False).astype(bool)
+    return int(flagged.sum())
+
+
+def dashboard_ticker_history_frame(
+    db_path: Path,
+    ticker: str,
+    *,
+    metric_name: str,
+    limit: int = 12,
+) -> pd.DataFrame:
+    normalized = normalize_ticker(ticker)
+    if not normalized:
+        return pd.DataFrame()
+    history = load_ticker_history(db_path, normalized, data_mode="live")
+    if history.empty or metric_name not in history.columns:
+        return pd.DataFrame()
+    working = history.copy()
+    if "completed_at" in working.columns:
+        time_values = working["completed_at"]
+    else:
+        time_values = pd.Series([""] * len(working), index=working.index)
+    if "started_at" in working.columns:
+        time_values = time_values.fillna(working["started_at"])
+        time_values = time_values.mask(time_values.astype(str).str.strip() == "", working["started_at"])
+    working["run_time"] = pd.to_datetime(time_values, errors="coerce", utc=True)
+    working[metric_name] = pd.to_numeric(working[metric_name], errors="coerce")
+    working = working.dropna(subset=["run_time", metric_name]).sort_values("run_time").tail(limit)
+    if working.empty:
+        return working
+    working["run_label"] = working["run_time"].dt.strftime("%Y-%m-%d %H:%M")
+    return working[["run_time", "run_label", metric_name]]
+
+
+def render_dashboard_micro_chart(db_path: Path, ticker: str, *, metric_name: str = "emerging_ticker_score") -> None:
+    chart_df = dashboard_ticker_history_frame(db_path, ticker, metric_name=metric_name)
+    if chart_df.empty:
+        st.caption("No history")
+        return
+    color = "#2f80ed" if metric_name == "emerging_ticker_score" else "#0f9f8f"
+    metric_title = "Emerging" if metric_name == "emerging_ticker_score" else "Acceleration"
+    line = (
+        alt.Chart(chart_df)
+        .mark_line(color=color, strokeWidth=2)
+        .encode(
+            x=alt.X("run_time:T", axis=None),
+            y=alt.Y(f"{metric_name}:Q", axis=None, scale=alt.Scale(zero=False)),
+            tooltip=[
+                alt.Tooltip("run_label:N", title="Run"),
+                alt.Tooltip(f"{metric_name}:Q", title=metric_title, format=".1f"),
+            ],
+        )
+    )
+    points = (
+        alt.Chart(chart_df)
+        .mark_point(color=color, filled=True, size=24)
+        .encode(
+            x=alt.X("run_time:T", axis=None),
+            y=alt.Y(f"{metric_name}:Q", axis=None, scale=alt.Scale(zero=False)),
+            tooltip=[
+                alt.Tooltip("run_label:N", title="Run"),
+                alt.Tooltip(f"{metric_name}:Q", title=metric_title, format=".1f"),
+            ],
+        )
+    )
+    st.altair_chart((line + points).properties(height=46), use_container_width=True)
+
+
+def render_dashboard_kpis(
+    db_path: Path,
+    *,
+    active_run: dict[str, Any] | None,
+    latest_run: dict[str, Any] | None,
+    latest_summary: dict[str, Any],
+    latest_coverage: dict[str, Any],
+    summary_df: pd.DataFrame,
+    signal_review_df: pd.DataFrame,
+    scope_id: str | None,
+) -> None:
+    validation_lookup = dashboard_validation_status_lookup(signal_review_df)
+    pending_validation = sum(1 for status in validation_lookup.values() if status == "Needs validation")
+    flagged_count = dashboard_flagged_signal_count(summary_df)
+    top_rows = dashboard_signal_rows(summary_df, limit=3)
+    top_accel: dict[str, Any] = {}
+    if not summary_df.empty:
+        accel_frame = summary_df.copy()
+        for column in ("acceleration_score", "emerging_ticker_score"):
+            if column not in accel_frame.columns:
+                accel_frame[column] = 0.0
+            accel_frame[column] = pd.to_numeric(accel_frame[column], errors="coerce").fillna(0.0)
+        if "company_name" not in accel_frame.columns:
+            accel_frame["company_name"] = ""
+        top_accel_rows = (
+            accel_frame.sort_values(["acceleration_score", "emerging_ticker_score"], ascending=[False, False])
+            .head(1)
+            .to_dict(orient="records")
+        )
+        top_accel = top_accel_rows[0] if top_accel_rows else {}
+    top_metric_name = "acceleration_score"
+    top_metric_label = "Top acceleration"
+    top_metric_note = "acceleration score"
+    if top_accel and coerce_float(top_accel.get("acceleration_score")) <= 0 and top_rows:
+        top_accel = top_rows[0]
+        top_metric_name = "emerging_ticker_score"
+        top_metric_label = "Top signal"
+        top_metric_note = "emerging score"
+    run_status = str(active_run.get("status", "Running")).title() if active_run else "Idle"
+    run_note = run_elapsed_label(active_run) if active_run else (
+        f"{int(latest_summary.get('items_analyzed', 0) or 0)} analysed items" if latest_run else "No completed run"
+    )
+    coverage_label = str(latest_coverage.get("reliability_label", "") or "Coverage n/a")
+
+    kpi_cols = st.columns([1, 1])
+    with kpi_cols[0].container(border=True):
+        st.markdown('<div class="dashboard-kpi-label">Emerging tickers</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="dashboard-kpi-value">{flagged_count}</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="dashboard-kpi-note">{pending_validation} need validation · {run_status} · {escape(run_note)}</div>',
+            unsafe_allow_html=True,
+        )
+        if top_rows:
+            render_status_chips([str(row.get("ticker", "")) for row in top_rows if row.get("ticker")])
+        else:
+            render_status_chips([coverage_label])
+        action_cols = st.columns(2)
+        if action_cols[0].button("Review", key="dashboard_kpi_review", use_container_width=True):
+            navigate_to_page("Review", run_id=scope_id)
+        if action_cols[1].button("Validate", key="dashboard_kpi_validate", use_container_width=True):
+            navigate_to_page("Validate", run_id=scope_id)
+
+    with kpi_cols[1].container(border=True):
+        st.markdown(f'<div class="dashboard-kpi-label">{escape(top_metric_label)}</div>', unsafe_allow_html=True)
+        if top_accel:
+            ticker = str(top_accel.get("ticker", ""))
+            company = str(top_accel.get("company_name", "") or "Unknown")
+            st.markdown(
+                f'<div class="dashboard-kpi-ticker">{escape(ticker)}</div>'
+                f'<div class="dashboard-kpi-note">{escape(company[:64])}</div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f'<div class="dashboard-kpi-value">{coerce_float(top_accel.get(top_metric_name)):.1f}</div>'
+                f'<div class="dashboard-kpi-note">{escape(top_metric_note)}</div>',
+                unsafe_allow_html=True,
+            )
+            render_dashboard_micro_chart(db_path, ticker, metric_name=top_metric_name)
+        else:
+            st.markdown('<div class="dashboard-kpi-value">None</div>', unsafe_allow_html=True)
+            st.markdown('<div class="dashboard-kpi-note">No ticker summary yet</div>', unsafe_allow_html=True)
+            st.caption(coverage_label)
+
+
+def render_dashboard_top_signals(
+    db_path: Path,
+    summary_df: pd.DataFrame,
+    *,
+    signal_review_df: pd.DataFrame,
+    run_id: str | None,
+    limit: int = 8,
+) -> None:
+    st.markdown('<div class="dashboard-panel-title">Top Signals</div>', unsafe_allow_html=True)
+    st.markdown('<div class="dashboard-panel-note">Ranked by emerging score in the current scope.</div>', unsafe_allow_html=True)
+    rows = dashboard_signal_rows(summary_df, limit=limit)
+    if not rows:
+        with st.container(border=True):
+            st.markdown("No ticker summary is available for the current scope yet.")
+            if st.button("Start collection", type="primary", key="dashboard_empty_collect"):
+                st.session_state["page"] = "Collect"
+                st.session_state["pending_collect_view"] = "New Run"
+                st.rerun()
+        return
+
+    validation_lookup = dashboard_validation_status_lookup(signal_review_df)
+    header_cols = st.columns([2.2, 0.75, 0.9, 1.25, 1.45, 1.25])
+    for column, label in zip(header_cols, ["Signal", "Mentions", "Score", "Status", "Trend", "Actions"]):
+        column.markdown(f'<div class="dashboard-table-head">{escape(label)}</div>', unsafe_allow_html=True)
+
+    for index, row in enumerate(rows, start=1):
+        ticker = str(row.get("ticker", ""))
+        company = str(row.get("company_name", "") or "Unknown")
+        status = validation_lookup.get(ticker.upper())
+        if not status:
+            status = "Needs review" if row.get("low_mentions_high_signal") or row.get("new_ticker_detected") else "Review"
+        with st.container(border=True):
+            cols = st.columns([2.2, 0.75, 0.9, 1.25, 1.45, 1.25])
+            cols[0].markdown(
+                f'<div class="dashboard-ticker">{escape(ticker)}</div>'
+                f'<div class="dashboard-company">{escape(company[:82])}</div>',
+                unsafe_allow_html=True,
+            )
+            cols[1].markdown(
+                f'<div class="dashboard-number">{int(coerce_float(row.get("total_mentions")))}</div>'
+                '<div class="dashboard-number-note">mentions</div>',
+                unsafe_allow_html=True,
+            )
+            cols[2].markdown(
+                f'<div class="dashboard-number">{coerce_float(row.get("emerging_ticker_score")):.1f}</div>'
+                f'<div class="dashboard-number-note">{coerce_float(row.get("acceleration_score")):.1f} accel</div>',
+                unsafe_allow_html=True,
+            )
+            with cols[3]:
+                labels = [status]
+                labels.extend(ticker_status_labels(row)[:1])
+                render_status_chips(labels)
+            with cols[4]:
+                render_dashboard_micro_chart(db_path, ticker, metric_name="emerging_ticker_score")
+            action_cols = cols[5].columns(2)
+            if action_cols[0].button("Review", key=f"dashboard_review_{run_id}_{ticker}_{index}", use_container_width=True):
+                navigate_to_page("Review", run_id=run_id, ticker=ticker)
+            if action_cols[1].button("Validate", key=f"dashboard_validate_{run_id}_{ticker}_{index}", use_container_width=True):
                 navigate_to_page("Validate", run_id=run_id, ticker=ticker)
 
 
@@ -3921,7 +4288,47 @@ def build_sidebar_state(db_path: Path) -> tuple[str, str | None, pd.DataFrame, p
     } if not sources.empty else {}
 
     with st.sidebar:
-        st.subheader("Analysis scope")
+        st.markdown(
+            """
+            <div class="sidebar-brand">
+                <div class="sidebar-brand-title">Signal from the Slop</div>
+                <div class="sidebar-brand-subtitle">Reddit stock signal triage</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown('<div class="sidebar-section-label">Navigate</div>', unsafe_allow_html=True)
+        sidebar_pages = [
+            ("Today", "Dashboard"),
+            ("Collect", "Collect"),
+            ("Review", "Review"),
+            ("Tom's Correlation", "Tom's Correlation"),
+            ("Validate", "Validate"),
+        ]
+        for nav_page, nav_label in sidebar_pages:
+            if st.button(
+                nav_label,
+                key=f"sidebar_nav_{nav_page}",
+                use_container_width=True,
+                type="primary" if page == nav_page else "secondary",
+            ):
+                if page != nav_page:
+                    st.session_state["page"] = nav_page
+                    st.rerun()
+
+        with st.expander("More", expanded=page in {"Library", "Settings"}):
+            for nav_page, nav_label in [("Library", "Library"), ("Settings", "Settings")]:
+                if st.button(
+                    nav_label,
+                    key=f"sidebar_nav_{nav_page}",
+                    use_container_width=True,
+                    type="primary" if page == nav_page else "secondary",
+                ):
+                    if page != nav_page:
+                        st.session_state["page"] = nav_page
+                        st.rerun()
+
+        st.markdown('<div class="sidebar-section-label">Analysis scope</div>', unsafe_allow_html=True)
         auto_cleared_runs = int(st.session_state.pop("auto_cleared_orphaned_runs", 0) or 0)
         if auto_cleared_runs:
             st.warning(f"Cleared {auto_cleared_runs} old active run(s) with no heartbeat.")
@@ -6635,119 +7042,58 @@ def render_ticker_trends_page(db_path: Path, run_id: str | None, *, embedded: bo
 
 
 def render_today_page(db_path: Path, run_id: str | None, source_lookup: dict[int, str]) -> None:
-    render_page_header(
-        "Today",
-        "Current state, strongest leads, reliability notes, and the next useful action.",
-    )
     runs = load_analysis_runs(db_path)
     if not runs.empty:
         runs = runs[runs["data_mode"] == "live"].copy()
-    sources = load_sources(db_path)
     active_run = latest_active_run(runs) if not runs.empty else None
     latest_run = latest_completed_run(runs)
-    watchlist = get_watchlist()
     signal_review_df = load_signal_review_frame(db_path, CORPUS_SCOPE_ID)
-
-    active_source_count = int(sources["active"].sum()) if not sources.empty and "active" in sources.columns else 0
-    labelled_count = (
-        int(signal_review_df["user_label"].fillna("").astype(str).str.len().gt(0).sum())
-        if not signal_review_df.empty and "user_label" in signal_review_df.columns
-        else 0
-    )
-    unlabelled_count = max(len(signal_review_df) - labelled_count, 0) if not signal_review_df.empty else 0
     latest_summary = latest_run.get("summary_json", {}) if latest_run else {}
     latest_coverage = (
         latest_summary.get("coverage", {})
         if latest_run and isinstance(latest_summary.get("coverage", {}), dict)
         else {}
     )
-    render_insight_cards(
-        [
-            {
-                "label": "Current run",
-                "value": str(active_run.get("status", "Running")).title() if active_run else "Idle",
-                "note": run_elapsed_label(active_run) if active_run else "No live scrape is active",
-            },
-            {
-                "label": "Latest completed",
-                "value": run_completed_label(latest_run) if latest_run else "None",
-                "note": f"{int(latest_summary.get('items_analyzed', 0) or 0)} analysed items" if latest_run else "Start in Collect",
-            },
-            {
-                "label": "Scrape coverage",
-                "value": str(latest_coverage.get("reliability_label", "n/a") or "n/a"),
-                "note": f"{int(latest_coverage.get('posts_returned', 0) or 0)} posts returned",
-            },
-            {
-                "label": "Needs labels",
-                "value": str(unlabelled_count),
-                "note": f"{len(signal_review_df)} frozen signal(s)",
-            },
-        ]
-    )
-
-    if active_run:
-        st.subheader("Current Run")
-        render_latest_run_status(runs, source_lookup)
-    elif latest_run:
-        st.subheader("Latest Completed Run")
-        render_latest_run_status(runs, source_lookup)
-    else:
-        st.info("No completed run exists yet. Add sources and start a Measurement or Discovery run from Collect.")
 
     top_scope_id = run_id
     if not top_scope_id and latest_run:
         top_scope_id = str(latest_run.get("analysis_run_id", ""))
     summary_df = load_scope_ticker_summaries(db_path, top_scope_id) if top_scope_id else pd.DataFrame()
-    if not summary_df.empty and top_scope_id:
-        render_top_signal_cards(summary_df, run_id=str(top_scope_id), current_page="Today", limit=5)
-    else:
-        st.subheader("Top Signals")
-        st.caption("No ticker summary is available for the current scope yet.")
+    scope_label = dashboard_scope_label(top_scope_id, runs, source_lookup)
+    latest_label = run_completed_label(latest_run) if latest_run else "No completed run"
 
-    watch_cols = st.columns([1.3, 2.7])
-    with watch_cols[0]:
-        st.subheader("Watchlist")
-        if watchlist:
-            render_copyable_ticker_chips(watchlist, label="Pinned tickers", max_items=16)
-        else:
-            st.caption("No pinned tickers yet.")
-    with watch_cols[1]:
-        st.subheader("System Notes")
-        notes: list[str] = []
-        if latest_run and int(latest_summary.get("fallback_count", 0) or 0):
-            notes.append(f"{int(latest_summary.get('fallback_count', 0) or 0)} fallback classifications in the latest completed run.")
-        trend_note = str(latest_coverage.get("trend_note", "") or "")
-        if trend_note:
-            notes.append(trend_note)
-        if not notes:
-            notes.append("No current reliability warnings from the latest completed run.")
-        for note in notes:
-            st.caption(note)
+    st.markdown(
+        f"""
+        <div class="dashboard-header">
+            <div>
+                <div class="dashboard-title">Dashboard</div>
+                <div class="dashboard-subtitle">Latest signals and validation queue.</div>
+            </div>
+            <div class="dashboard-scope">
+                {escape(latest_label)}<br>{escape(scope_label[:96])}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    if sources.empty or active_source_count == 0:
-        action_label, target_page = "Add sources", "Collect"
-        action_note = "Sources are required before any run can start."
-    elif active_run:
-        action_label, target_page = "Check progress", "Collect"
-        action_note = "A run is active; watch progress before starting another."
-    elif not latest_run:
-        action_label, target_page = "Start first run", "Collect"
-        action_note = "Use Measurement for comparable trends or Discovery for broader evidence."
-    elif unlabelled_count:
-        action_label, target_page = "Review labels", "Validate"
-        action_note = "Frozen signals are waiting for human labels."
-    else:
-        action_label, target_page = "Review signals", "Review"
-        action_note = "Open the current scope and inspect the strongest evidence."
-
-    st.subheader("Recommended Next Action")
-    st.caption(action_note)
-    if st.button(action_label, type="primary", use_container_width=True):
-        st.session_state["page"] = target_page
-        if target_page == "Collect":
-            st.session_state["pending_collect_view"] = "Sources" if action_label == "Add sources" else "Run Progress" if active_run else "New Run"
-        st.rerun()
+    render_dashboard_kpis(
+        db_path,
+        active_run=active_run,
+        latest_run=latest_run,
+        latest_summary=latest_summary,
+        latest_coverage=latest_coverage,
+        summary_df=summary_df,
+        signal_review_df=signal_review_df,
+        scope_id=str(top_scope_id) if top_scope_id else None,
+    )
+    render_dashboard_top_signals(
+        db_path,
+        summary_df,
+        signal_review_df=signal_review_df,
+        run_id=str(top_scope_id) if top_scope_id else None,
+        limit=8,
+    )
 
 
 def render_collect_page(db_path: Path, artifacts_dir: Path, ticker_path: Path, source_lookup: dict[int, str]) -> None:
