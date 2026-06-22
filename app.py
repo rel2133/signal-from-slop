@@ -44,6 +44,7 @@ from signal_from_the_slop.correlation import (
     compute_lead_lag_grid,
     compute_rolling_correlation,
     dataset_diagnostics,
+    descriptive_statistics,
     outcome_column,
     outcome_label,
     refresh_correlation_price_cache,
@@ -6969,50 +6970,61 @@ def render_toms_correlation_page(db_path: Path) -> None:
         method=controls["method"],
     )
 
-    render_tom_overview_cards(matrix_results, lead_lag_results, diagnostics)
+    all_results = tom_combined_results(matrix_results, lead_lag_results)
+    selected_variables = tom_selected_descriptive_variables(dataset, signal_columns, selected_outcome_column)
+
     render_tom_data_completeness(dataset, diagnostics)
-    render_tom_save_and_history(
+
+    st.subheader("Descriptive Statistics")
+    render_tom_descriptive_statistics(dataset, selected_variables)
+
+    st.subheader("Most Interesting Relationships")
+    interesting_results = render_tom_most_interesting_relationships(all_results)
+
+    st.subheader("Correlation Pair Explorer")
+    render_tom_pair_explorer(
+        dataset=dataset,
+        results=interesting_results if not interesting_results.empty else all_results,
+        lead_lag_results=lead_lag_results,
+        method=controls["method"],
+        default_outcome=selected_outcome_column,
+    )
+
+    st.subheader("Lead/Lag Visual")
+    render_tom_lead_lag_visual(lead_lag_results)
+
+    st.subheader("Simplified Heatmap")
+    render_tom_simplified_heatmap(
+        results=all_results,
+        selected_return_window=controls["return_window"],
+        selected_method=controls["method"],
+    )
+
+    st.subheader("Full Statistical Table")
+    render_tom_full_statistical_table(
         db_path=db_path,
-        results=matrix_results,
+        results=all_results,
         controls=controls,
         diagnostics=diagnostics,
     )
 
-    st.subheader("Correlation Matrix")
-    st.caption("JASP-style values show correlation coefficient, p-value, sample size, reliability, and missing count.")
-    render_tom_correlation_matrix(matrix_results)
-    render_tom_heatmap(matrix_results, title="Correlation heatmap")
-
-    st.subheader("Lead/Lag Analysis")
-    st.caption("Reddit signals at time t are compared with outcomes at same day and future trading windows.")
-    render_tom_lag_table(lead_lag_results)
-    render_tom_heatmap(lead_lag_results, title="Lead/lag heatmap", x_field="lag_window")
-    render_tom_lead_lag_insight(lead_lag_results)
-
-    st.subheader("Abnormal Returns")
-    comparison = render_tom_abnormal_return_comparison(
-        dataset=dataset,
-        signal_columns=signal_columns,
-        method=controls["method"],
-        return_window=controls["return_window"],
-    )
-    st.info(abnormal_return_interpretation(comparison))
-
-    st.subheader("Rolling Correlation")
-    render_tom_rolling_correlation(
-        dataset=dataset,
-        signal_columns=signal_columns,
-        method=controls["method"],
-        selected_outcome=selected_outcome_column,
-    )
-
-    render_tom_regression_mode(dataset=dataset, signal_columns=signal_columns)
-    render_tom_detailed_pair_explorer(
-        dataset=dataset,
-        matrix_results=matrix_results,
-        lead_lag_results=lead_lag_results,
-        method=controls["method"],
-    )
+    with st.expander("Advanced Outputs", expanded=False):
+        st.subheader("Rolling Correlation")
+        render_tom_rolling_correlation(
+            dataset=dataset,
+            signal_columns=signal_columns,
+            method=controls["method"],
+            selected_outcome=selected_outcome_column,
+        )
+        st.subheader("Raw vs Abnormal Return Comparison")
+        comparison = render_tom_abnormal_return_comparison(
+            dataset=dataset,
+            signal_columns=signal_columns,
+            method=controls["method"],
+            return_window=controls["return_window"],
+        )
+        st.info(abnormal_return_interpretation(comparison))
+        render_tom_regression_mode(dataset=dataset, signal_columns=signal_columns)
 
 
 def render_tom_correlation_controls(
@@ -7082,6 +7094,7 @@ def render_tom_correlation_controls(
             help="Spearman is the default because Reddit data is noisy, spike-heavy, and outlier-prone.",
             key="tom_method",
         )
+        date_cols[3].caption(tom_method_explanation(method))
 
         outcome_cols = st.columns([1.2, 1.1, 1.1, 1.1])
         outcome_group = outcome_cols[0].selectbox(
@@ -7129,6 +7142,149 @@ def render_tom_correlation_controls(
     }
 
 
+def tom_method_explanation(method: str) -> str:
+    explanations = {
+        "Pearson": "Best for linear relationships between continuous variables.",
+        "Spearman": "Better for ranked, non-normal, or spiky data.",
+        "Kendall": "Useful for smaller samples or many tied values.",
+    }
+    return explanations.get(method, "")
+
+
+def tom_combined_results(matrix_results: pd.DataFrame, lead_lag_results: pd.DataFrame) -> pd.DataFrame:
+    frames = [frame for frame in [matrix_results, lead_lag_results] if not frame.empty]
+    if not frames:
+        return pd.DataFrame()
+    combined = pd.concat(frames, ignore_index=True)
+    dedupe_columns = ["signal_variable", "outcome_variable", "lag_window", "correlation_method"]
+    combined = combined.drop_duplicates(subset=[column for column in dedupe_columns if column in combined.columns])
+    return combined.reset_index(drop=True)
+
+
+def tom_selected_descriptive_variables(
+    dataset: pd.DataFrame,
+    signal_columns: list[str],
+    selected_outcome_column: str,
+) -> list[str]:
+    preferred_signals = [
+        "mentions",
+        "mention_share_of_voice",
+        "mention_acceleration",
+        "average_hype_score",
+        "average_evidence_score",
+        "bull_bear_ratio",
+    ]
+    preferred_outcomes = [
+        selected_outcome_column,
+        "raw_return_5d",
+        "abnormal_return_5d",
+        "volume_change_5d",
+        "volatility_5d",
+    ]
+    ordered = [
+        *[column for column in preferred_signals if column in signal_columns],
+        *[column for column in preferred_outcomes if column in dataset.columns],
+    ]
+    return list(dict.fromkeys(ordered))
+
+
+def render_tom_descriptive_statistics(dataset: pd.DataFrame, selected_variables: list[str]) -> None:
+    available_variables = [
+        column
+        for column in selected_variables + tom_available_outcome_columns(dataset)
+        if column in dataset.columns
+    ]
+    available_variables = list(dict.fromkeys(available_variables))
+    if not available_variables:
+        st.caption("No numeric variables are available for descriptive statistics.")
+        return
+
+    controls = st.columns([2.4, 1])
+    variables = controls[0].multiselect(
+        "Variables",
+        available_variables,
+        default=selected_variables[: min(len(selected_variables), 8)],
+        format_func=variable_label,
+        key="tom_descriptive_variables",
+    )
+    controls[1].metric("Rows in scope", len(dataset))
+    if not variables:
+        st.caption("Select at least one variable to calculate descriptive statistics.")
+        return
+
+    stats = descriptive_statistics(dataset, variables)
+    st.dataframe(tom_descriptive_display(stats), use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download descriptive statistics CSV",
+        data=tom_descriptive_display(stats).to_csv(index=False),
+        file_name="toms_correlation_descriptive_statistics.csv",
+        mime="text/csv",
+        key="tom_descriptive_csv",
+    )
+
+    visual_variable = st.selectbox(
+        "Distribution detail",
+        variables,
+        format_func=variable_label,
+        key="tom_descriptive_visual_variable",
+    )
+    render_tom_distribution_detail(dataset, visual_variable)
+
+
+def tom_descriptive_display(stats: pd.DataFrame) -> pd.DataFrame:
+    if stats.empty:
+        return stats
+    display = stats.copy()
+    return pd.DataFrame(
+        {
+            "Variable": display["variable_label"],
+            "Valid n": display["valid_n"].fillna(0).astype(int),
+            "Missing": display["missing"].fillna(0).astype(int),
+            "Mean": display["mean"].map(lambda value: tom_format_number(value, 4)),
+            "SD": display["standard_deviation"].map(lambda value: tom_format_number(value, 4)),
+            "Median": display["median"].map(lambda value: tom_format_number(value, 4)),
+            "Min": display["minimum"].map(lambda value: tom_format_number(value, 4)),
+            "Max": display["maximum"].map(lambda value: tom_format_number(value, 4)),
+            "Skewness": display["skewness"].map(lambda value: tom_format_number(value, 3)),
+            "Kurtosis": display["kurtosis"].map(lambda value: tom_format_number(value, 3)),
+        }
+    )
+
+
+def render_tom_distribution_detail(dataset: pd.DataFrame, variable: str) -> None:
+    numeric = pd.to_numeric(dataset[variable], errors="coerce") if variable in dataset.columns else pd.Series(dtype=float)
+    detail = pd.DataFrame({"value": numeric}).replace([float("inf"), float("-inf")], pd.NA)
+    detail = detail.dropna()
+    missing = int(len(dataset) - len(detail))
+    if detail.empty:
+        st.caption("No complete values are available for this distribution.")
+        return
+    chart_cols = st.columns([2, 1, 1])
+    histogram = (
+        alt.Chart(detail)
+        .mark_bar(color="#2166ac", opacity=0.78)
+        .encode(
+            x=alt.X("value:Q", bin=alt.Bin(maxbins=36), title=variable_label(variable)),
+            y=alt.Y("count():Q", title="Rows"),
+            tooltip=[alt.Tooltip("count():Q", title="Rows")],
+        )
+        .properties(height=240)
+    )
+    chart_cols[0].altair_chart(histogram, use_container_width=True)
+    box = (
+        alt.Chart(detail)
+        .mark_boxplot(color="#374151", size=50)
+        .encode(
+            y=alt.Y("value:Q", title=variable_label(variable)),
+            tooltip=[alt.Tooltip("value:Q", title=variable_label(variable), format=".4f")],
+        )
+        .properties(height=240)
+    )
+    chart_cols[1].altair_chart(box, use_container_width=True)
+    chart_cols[2].metric("Missing", missing)
+    chart_cols[2].metric("Valid n", len(detail))
+
+
 def render_tom_overview_cards(matrix_results: pd.DataFrame, lead_lag_results: pd.DataFrame, diagnostics: dict[str, Any]) -> None:
     relationships = strongest_relationships(matrix_results)
     best_lag = strongest_relationships(lead_lag_results).get("absolute")
@@ -7172,6 +7328,302 @@ def render_tom_data_completeness(dataset: pd.DataFrame, diagnostics: dict[str, A
                 use_container_width=True,
                 hide_index=True,
             )
+
+
+def render_tom_most_interesting_relationships(results: pd.DataFrame) -> pd.DataFrame:
+    ranked = tom_rank_interesting_relationships(results)
+    if ranked.empty:
+        st.caption("No complete correlation results are available for ranking.")
+        return ranked
+
+    st.caption("Ranked by effect size, p-value, sample size, missing data, future windows, abnormal returns, and reliability. Not by p-value alone.")
+    display = ranked.head(12).copy()
+    display.insert(0, "Rank", range(1, len(display) + 1))
+    st.dataframe(
+        pd.DataFrame(
+            {
+                "Rank": display["Rank"],
+                "Signal": display["signal_label"],
+                "Outcome": display["outcome_label"],
+                "Lag": display["lag_window"],
+                "r": display["correlation_value"].map(tom_format_corr),
+                "p": display["p_value"].map(tom_format_p),
+                "n": display["sample_size"].fillna(0).astype(int),
+                "Reliability": display["reliability_label"],
+                "Why it matters": display["why_it_matters"],
+            }
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+    return ranked
+
+
+def tom_rank_interesting_relationships(results: pd.DataFrame) -> pd.DataFrame:
+    if results.empty or "correlation_value" not in results:
+        return pd.DataFrame()
+    working = results.dropna(subset=["correlation_value"]).copy()
+    if working.empty:
+        return working
+    working["abs_r"] = working["correlation_value"].abs()
+    working["missing_rate"] = working["missing_count"] / (working["sample_size"] + working["missing_count"]).replace(0, 1)
+    working["future_window_bonus"] = (~working["lag_window"].astype(str).str.contains("Same day|Selected", case=False, regex=True)).astype(float) * 0.08
+    working["abnormal_bonus"] = working["outcome_variable"].astype(str).str.contains("abnormal_return").astype(float) * 0.08
+    working["significance_bonus"] = (pd.to_numeric(working["p_value"], errors="coerce") < 0.05).astype(float) * 0.12
+    working["n_bonus"] = (pd.to_numeric(working["sample_size"], errors="coerce") >= 50).astype(float) * 0.10
+    working["reliability_bonus"] = working["reliability_label"].astype(str).isin(["Moderate evidence", "Stronger evidence"]).astype(float) * 0.10
+    working["missing_penalty"] = working["missing_rate"].clip(0, 1) * 0.20
+    working["interesting_score"] = (
+        working["abs_r"].clip(0, 1) * 0.52
+        + working["significance_bonus"]
+        + working["n_bonus"]
+        + working["reliability_bonus"]
+        + working["future_window_bonus"]
+        + working["abnormal_bonus"]
+        - working["missing_penalty"]
+    )
+    working["why_it_matters"] = working.apply(tom_why_it_matters, axis=1)
+    return working.sort_values(["interesting_score", "abs_r"], ascending=False).reset_index(drop=True)
+
+
+def tom_why_it_matters(row: pd.Series) -> str:
+    interpretation = str(row.get("interpretation", "") or "").strip()
+    if interpretation:
+        return interpretation
+    value = _coerce_float(row.get("correlation_value"), float("nan"))
+    if pd.isna(value):
+        return "No complete relationship can be estimated."
+    direction = "positive" if value > 0 else "negative"
+    return f"{variable_label(str(row.get('signal_variable', '')))} has a {direction} relationship with {outcome_label(str(row.get('outcome_variable', '')))}."
+
+
+def render_tom_pair_explorer(
+    *,
+    dataset: pd.DataFrame,
+    results: pd.DataFrame,
+    lead_lag_results: pd.DataFrame,
+    method: str,
+    default_outcome: str,
+) -> None:
+    signal_options = [column for column in SIGNAL_VARIABLES.values() if column in dataset.columns]
+    outcome_options = tom_available_outcome_columns(dataset)
+    if not signal_options or not outcome_options:
+        st.caption("Pair explorer needs at least one Reddit signal and one price outcome.")
+        return
+
+    best = results.iloc[0].to_dict() if not results.empty else {}
+    default_signal = str(best.get("signal_variable") or ("mention_acceleration" if "mention_acceleration" in signal_options else signal_options[0]))
+    default_outcome = str(best.get("outcome_variable") or default_outcome)
+    if default_signal not in signal_options:
+        default_signal = signal_options[0]
+    if default_outcome not in outcome_options:
+        default_outcome = "abnormal_return_5d" if "abnormal_return_5d" in outcome_options else outcome_options[0]
+
+    selector_cols = st.columns([1.4, 1.4, 1])
+    signal = selector_cols[0].selectbox(
+        "Reddit signal",
+        signal_options,
+        format_func=variable_label,
+        index=signal_options.index(default_signal),
+        key="tom_pair_signal",
+    )
+    outcome = selector_cols[1].selectbox(
+        "Stock outcome",
+        outcome_options,
+        format_func=outcome_label,
+        index=outcome_options.index(default_outcome),
+        key="tom_pair_outcome",
+    )
+    selector_cols[2].metric("Method", method)
+
+    stats_df = compute_correlation_grid(
+        dataset,
+        signal_columns=[signal],
+        outcome_columns=[outcome],
+        method=method,
+        lag_window="Pair explorer",
+    )
+    if stats_df.empty:
+        st.caption("No pair statistics are available for this selection.")
+        return
+    stats = stats_df.iloc[0].to_dict()
+    pair = dataset[["ticker", "bucket_start", signal, outcome]].copy()
+    pair[signal] = pd.to_numeric(pair[signal], errors="coerce")
+    pair[outcome] = pd.to_numeric(pair[outcome], errors="coerce")
+    pair = pair.dropna(subset=[signal, outcome]).copy()
+
+    explorer_cols = st.columns([2.1, 1])
+    with explorer_cols[0]:
+        if pair.empty:
+            st.caption("This pair has no complete observations.")
+        else:
+            scatter = (
+                alt.Chart(pair)
+                .mark_circle(size=62, opacity=0.72)
+                .encode(
+                    x=alt.X(f"{signal}:Q", title=variable_label(signal)),
+                    y=alt.Y(f"{outcome}:Q", title=outcome_label(outcome)),
+                    color=alt.Color("ticker:N", legend=None),
+                    tooltip=[
+                        alt.Tooltip("ticker:N", title="Ticker"),
+                        alt.Tooltip("bucket_start:N", title="Date"),
+                        alt.Tooltip(f"{signal}:Q", title=variable_label(signal), format=".4f"),
+                        alt.Tooltip(f"{outcome}:Q", title=outcome_label(outcome), format=".5f"),
+                    ],
+                )
+            )
+            trend = (
+                alt.Chart(pair)
+                .transform_regression(signal, outcome)
+                .mark_line(color="#111827", strokeWidth=2)
+                .encode(x=f"{signal}:Q", y=f"{outcome}:Q")
+            )
+            st.altair_chart((scatter + trend).properties(height=390), use_container_width=True)
+    with explorer_cols[1]:
+        render_tom_pair_summary_card(stats, method)
+
+    export_cols = st.columns(3)
+    export_cols[0].download_button(
+        "Download pair data CSV",
+        data=pair.to_csv(index=False),
+        file_name="toms_correlation_pair_data.csv",
+        mime="text/csv",
+        key="tom_pair_csv",
+        disabled=pair.empty,
+    )
+    export_cols[1].download_button(
+        "Download pair summary MD",
+        data=tom_pair_markdown_summary(stats),
+        file_name="toms_correlation_pair_summary.md",
+        mime="text/markdown",
+        key="tom_pair_md",
+    )
+    export_cols[2].caption("Use the chart toolbar for image export where Streamlit enables it.")
+
+    detail_tabs = st.tabs(["Distributions", "Lag chart", "Time overlay"])
+    with detail_tabs[0]:
+        render_tom_pair_distributions(pair, signal, outcome)
+    with detail_tabs[1]:
+        render_tom_pair_lag_chart(lead_lag_results, signal)
+    with detail_tabs[2]:
+        render_tom_pair_time_overlay(pair, signal, outcome)
+
+
+def render_tom_pair_summary_card(stats: dict[str, Any], method: str) -> None:
+    coefficient_name = {"Spearman": "rho", "Pearson": "r", "Kendall": "tau"}.get(method, "r")
+    st.markdown(
+        f"""
+        <div class="consensus-card">
+            <h3>Statistical Summary</h3>
+            <p><strong>{escape(method)} {escape(coefficient_name)}</strong>: {escape(tom_format_corr(stats.get("correlation_value")))}</p>
+            <p><strong>p</strong>: {escape(tom_format_p(stats.get("p_value")))}</p>
+            <p><strong>n</strong>: {int(stats.get("sample_size", 0) or 0)}</p>
+            <p><strong>Missing</strong>: {int(stats.get("missing_count", 0) or 0)}</p>
+            <p><strong>CI</strong>: {escape(tom_format_corr(stats.get("confidence_interval_low")))} to {escape(tom_format_corr(stats.get("confidence_interval_high")))}</p>
+            <p><strong>Reliability</strong>: {escape(str(stats.get("reliability_label", "")))}</p>
+            <p><strong>Interpretation</strong>: {escape(str(stats.get("interpretation", "")))}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    render_status_chips(list_cell_values(stats.get("warning_flags"), limit=4))
+
+
+def tom_pair_markdown_summary(stats: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "# Tom's Correlation Pair Summary",
+            "",
+            f"- Signal: {variable_label(str(stats.get('signal_variable', '')))}",
+            f"- Outcome: {outcome_label(str(stats.get('outcome_variable', '')))}",
+            f"- Method: {stats.get('correlation_method', '')}",
+            f"- r: {tom_format_corr(stats.get('correlation_value'))}",
+            f"- p: {tom_format_p(stats.get('p_value'))}",
+            f"- n: {int(stats.get('sample_size', 0) or 0)}",
+            f"- Missing: {int(stats.get('missing_count', 0) or 0)}",
+            f"- Reliability: {stats.get('reliability_label', '')}",
+            "",
+            str(stats.get("interpretation", "")),
+            "",
+        ]
+    )
+
+
+def render_tom_pair_distributions(pair: pd.DataFrame, signal: str, outcome: str) -> None:
+    if pair.empty:
+        st.caption("No complete pair values are available for distributions.")
+        return
+    hist_source = pair[[signal, outcome]].rename(columns={signal: variable_label(signal), outcome: outcome_label(outcome)})
+    folded = hist_source.melt(var_name="Variable", value_name="Value")
+    hist = (
+        alt.Chart(folded)
+        .mark_bar(opacity=0.74)
+        .encode(
+            x=alt.X("Value:Q", bin=alt.Bin(maxbins=32), title=None),
+            y=alt.Y("count():Q", title="Rows"),
+            color=alt.Color("Variable:N", title=None),
+            column=alt.Column("Variable:N", title=None),
+            tooltip=[alt.Tooltip("count():Q", title="Rows")],
+        )
+        .properties(height=220)
+    )
+    st.altair_chart(hist, use_container_width=True)
+
+
+def render_tom_pair_lag_chart(lead_lag_results: pd.DataFrame, signal: str) -> None:
+    lag_rows = lead_lag_results[lead_lag_results["signal_variable"] == signal].copy() if not lead_lag_results.empty else pd.DataFrame()
+    if lag_rows.empty:
+        st.caption("No lag rows are available for this signal.")
+        return
+    lag_rows["lag_sort"] = lag_rows["lag_window"].map({str(window["label"]): index for index, window in enumerate(RETURN_WINDOWS)})
+    chart = (
+        alt.Chart(lag_rows.dropna(subset=["correlation_value"]))
+        .mark_bar()
+        .encode(
+            x=alt.X("lag_window:N", title="Lag window", sort=[str(window["label"]) for window in RETURN_WINDOWS]),
+            y=alt.Y("correlation_value:Q", title="Correlation", scale=alt.Scale(domain=[-1, 1])),
+            color=alt.condition(alt.datum.correlation_value >= 0, alt.value("#2166ac"), alt.value("#b2182b")),
+            tooltip=[
+                alt.Tooltip("lag_window:N", title="Lag"),
+                alt.Tooltip("correlation_value:Q", title="r", format=".3f"),
+                alt.Tooltip("p_value:Q", title="p", format=".4f"),
+                alt.Tooltip("sample_size:Q", title="n"),
+                alt.Tooltip("interpretation:N", title="Interpretation"),
+            ],
+        )
+        .properties(height=260)
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+
+def render_tom_pair_time_overlay(pair: pd.DataFrame, signal: str, outcome: str) -> None:
+    if pair.empty:
+        st.caption("No complete pair values are available for a time overlay.")
+        return
+    series = pair.copy()
+    series["bucket_dt"] = pd.to_datetime(series["bucket_start"], errors="coerce", utc=True)
+    series = series.dropna(subset=["bucket_dt"]).copy()
+    if series.empty:
+        st.caption("No valid dates are available for a time overlay.")
+        return
+    series["date"] = series["bucket_dt"].dt.date
+    daily = series.groupby("date", as_index=False)[[signal, outcome]].mean()
+    daily["date"] = pd.to_datetime(daily["date"])
+    daily[variable_label(signal)] = tom_z_score(daily[signal])
+    daily[outcome_label(outcome)] = tom_z_score(daily[outcome])
+    folded = daily[["date", variable_label(signal), outcome_label(outcome)]].melt("date", var_name="Series", value_name="Z-score")
+    chart = (
+        alt.Chart(folded)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("date:T", title="Date"),
+            y=alt.Y("Z-score:Q", title="Normalized value"),
+            color=alt.Color("Series:N", title=None),
+            tooltip=["date:T", "Series:N", alt.Tooltip("Z-score:Q", format=".3f")],
+        )
+        .properties(height=260)
+    )
+    st.altair_chart(chart, use_container_width=True)
 
 
 def render_tom_save_and_history(
@@ -7220,6 +7672,317 @@ def render_tom_save_and_history(
                     use_container_width=True,
                     hide_index=True,
                 )
+
+
+def render_tom_lead_lag_visual(results: pd.DataFrame) -> None:
+    if results.empty:
+        st.caption("No lead/lag rows are available for the current filters.")
+        return
+    best = strongest_relationships(results).get("absolute")
+    if best:
+        st.info(tom_why_it_matters(pd.Series(best)))
+    visual = results.dropna(subset=["correlation_value"]).copy()
+    if visual.empty:
+        st.caption("Lead/lag visual needs complete price outcomes.")
+        return
+    visual["lag_window_short"] = visual["lag_window"].map(tom_compact_lag_label)
+    visual["signal_short"] = visual["signal_label"].map(lambda value: tom_compact_label(str(value), 26))
+    chart = (
+        alt.Chart(visual)
+        .mark_rect(cornerRadius=2)
+        .encode(
+            x=alt.X(
+                "lag_window_short:N",
+                title="Future window",
+                sort=[tom_compact_lag_label(str(window["label"])) for window in RETURN_WINDOWS],
+                axis=alt.Axis(labelAngle=0),
+            ),
+            y=alt.Y("signal_short:N", title=None, sort=None, axis=alt.Axis(labelLimit=260)),
+            color=alt.Color(
+                "correlation_value:Q",
+                title="r",
+                scale=alt.Scale(domain=[-0.6, 0, 0.6], range=["#b2182b", "#f7f7f7", "#2166ac"], clamp=True),
+            ),
+            tooltip=[
+                alt.Tooltip("signal_label:N", title="Signal"),
+                alt.Tooltip("outcome_label:N", title="Outcome"),
+                alt.Tooltip("lag_window:N", title="Lag"),
+                alt.Tooltip("correlation_value:Q", title="r", format=".3f"),
+                alt.Tooltip("p_value:Q", title="p", format=".4f"),
+                alt.Tooltip("sample_size:Q", title="n"),
+                alt.Tooltip("missing_count:Q", title="Missing"),
+                alt.Tooltip("reliability_label:N", title="Reliability"),
+                alt.Tooltip("interpretation:N", title="Interpretation"),
+            ],
+        )
+        .properties(height=max(320, 26 * int(visual["signal_short"].nunique())))
+    )
+    text = (
+        alt.Chart(visual)
+        .mark_text(fontSize=11, color="#111827")
+        .encode(
+            x=alt.X("lag_window_short:N", sort=[tom_compact_lag_label(str(window["label"])) for window in RETURN_WINDOWS]),
+            y=alt.Y("signal_short:N", sort=None),
+            text=alt.Text("correlation_value:Q", format=".2f"),
+        )
+    )
+    st.altair_chart(chart + text, use_container_width=True)
+
+
+def render_tom_simplified_heatmap(
+    *,
+    results: pd.DataFrame,
+    selected_return_window: str,
+    selected_method: str,
+) -> None:
+    if results.empty:
+        st.caption("No correlation results are available for the heatmap.")
+        return
+    controls = st.columns([1.2, 1.1, 1.1, 1.1, 1.1])
+    mode = controls[0].selectbox(
+        "Heatmap mode",
+        [
+            "Show all",
+            "Show only significant results",
+            "Show only reliable results",
+            "Show strongest positive",
+            "Show strongest negative",
+            "Show by selected return window",
+            "Show by selected signal group",
+        ],
+        index=2,
+        key="tom_heatmap_mode",
+    )
+    min_abs_r = controls[1].number_input("Minimum |r|", min_value=0.0, max_value=1.0, value=0.05, step=0.01)
+    max_p = controls[2].number_input("Maximum p", min_value=0.0, max_value=1.0, value=1.0, step=0.01)
+    min_n = int(controls[3].number_input("Minimum n", min_value=1, max_value=10000, value=30, step=1))
+    return_filter = controls[4].selectbox(
+        "Return window",
+        ["Any", *[str(window["label"]) for window in RETURN_WINDOWS]],
+        index=0,
+        key="tom_heatmap_return_window",
+    )
+    type_cols = st.columns([1.2, 1.2, 1.6])
+    return_type = type_cols[0].selectbox("Return type", ["Any", "Abnormal only", "Raw only", "Volume/volatility only"], key="tom_heatmap_return_type")
+    signal_group = type_cols[1].selectbox("Signal group", ["Any", "Attention", "Quality", "Sentiment", "Spread"], key="tom_heatmap_signal_group")
+    type_cols[2].caption(f"Method: {selected_method}. Cells show only r; hover for p, n, missing, reliability, and interpretation.")
+
+    heat = tom_filter_heatmap_results(
+        results,
+        mode=mode,
+        min_abs_r=min_abs_r,
+        max_p=max_p,
+        min_n=min_n,
+        return_filter=selected_return_window if mode == "Show by selected return window" else return_filter,
+        return_type=return_type,
+        signal_group=signal_group if mode == "Show by selected signal group" else "Any",
+    )
+    if heat.empty:
+        st.caption("No results match the current heatmap filters.")
+        return
+    heat = heat.copy()
+    heat["signal_short"] = heat["signal_label"].map(lambda value: tom_compact_label(str(value), 24))
+    heat["outcome_short"] = heat.apply(lambda row: tom_compact_heatmap_column(row), axis=1)
+    heat["r_label"] = heat["correlation_value"].map(lambda value: tom_format_number(value, 2))
+    row_count = max(1, int(heat["signal_short"].nunique()))
+    col_count = max(1, int(heat["outcome_short"].nunique()))
+    rect = (
+        alt.Chart(heat)
+        .mark_rect(cornerRadius=2)
+        .encode(
+            x=alt.X("outcome_short:N", title=None, sort=None, axis=alt.Axis(labelAngle=-25, labelLimit=180)),
+            y=alt.Y("signal_short:N", title=None, sort=None, axis=alt.Axis(labelLimit=260)),
+            color=alt.Color(
+                "correlation_value:Q",
+                title="r",
+                scale=alt.Scale(domain=[-0.6, 0, 0.6], range=["#b2182b", "#f7f7f7", "#2166ac"], clamp=True),
+            ),
+            tooltip=[
+                alt.Tooltip("signal_label:N", title="Signal"),
+                alt.Tooltip("outcome_label:N", title="Outcome"),
+                alt.Tooltip("lag_window:N", title="Lag"),
+                alt.Tooltip("correlation_method:N", title="Method"),
+                alt.Tooltip("correlation_value:Q", title="r", format=".3f"),
+                alt.Tooltip("p_value:Q", title="p", format=".4f"),
+                alt.Tooltip("sample_size:Q", title="n"),
+                alt.Tooltip("missing_count:Q", title="Missing"),
+                alt.Tooltip("reliability_label:N", title="Reliability"),
+                alt.Tooltip("interpretation:N", title="Interpretation"),
+            ],
+        )
+        .properties(height=max(280, row_count * 28), width=max(650, col_count * 82))
+    )
+    labels = (
+        alt.Chart(heat)
+        .mark_text(fontSize=11, color="#111827")
+        .encode(
+            x=alt.X("outcome_short:N", sort=None),
+            y=alt.Y("signal_short:N", sort=None),
+            text="r_label:N",
+        )
+    )
+    st.altair_chart(rect + labels, use_container_width=True)
+    st.download_button(
+        "Download heatmap data CSV",
+        data=tom_results_display(heat).to_csv(index=False),
+        file_name="toms_correlation_heatmap_data.csv",
+        mime="text/csv",
+        key="tom_heatmap_csv",
+    )
+
+
+def tom_filter_heatmap_results(
+    results: pd.DataFrame,
+    *,
+    mode: str,
+    min_abs_r: float,
+    max_p: float,
+    min_n: int,
+    return_filter: str,
+    return_type: str,
+    signal_group: str,
+) -> pd.DataFrame:
+    heat = results.dropna(subset=["correlation_value"]).copy()
+    if heat.empty:
+        return heat
+    heat = heat[
+        (heat["correlation_value"].abs() >= min_abs_r)
+        & (pd.to_numeric(heat["p_value"], errors="coerce").fillna(1.0) <= max_p)
+        & (pd.to_numeric(heat["sample_size"], errors="coerce").fillna(0) >= min_n)
+    ].copy()
+    if mode == "Show only significant results":
+        heat = heat[pd.to_numeric(heat["p_value"], errors="coerce") < 0.05].copy()
+    elif mode == "Show only reliable results":
+        heat = heat[heat["reliability_label"].astype(str).isin(["Moderate evidence", "Stronger evidence"])].copy()
+    elif mode == "Show strongest positive":
+        heat = heat.sort_values("correlation_value", ascending=False).head(20).copy()
+    elif mode == "Show strongest negative":
+        heat = heat.sort_values("correlation_value", ascending=True).head(20).copy()
+    if return_filter != "Any":
+        heat = heat[heat["lag_window"].astype(str).eq(return_filter) | heat["outcome_label"].astype(str).str.contains(return_filter, regex=False)].copy()
+    if return_type == "Abnormal only":
+        heat = heat[heat["outcome_variable"].astype(str).str.contains("abnormal_return")].copy()
+    elif return_type == "Raw only":
+        heat = heat[heat["outcome_variable"].astype(str).str.contains("raw_return")].copy()
+    elif return_type == "Volume/volatility only":
+        heat = heat[heat["outcome_variable"].astype(str).str.contains("volume|volatility", regex=True)].copy()
+    if signal_group != "Any":
+        allowed = {
+            "Attention": {"mentions", "mention_share_of_voice", "mention_acceleration", "percentage_mention_acceleration", "post_count", "comment_count"},
+            "Quality": {"average_hype_score", "average_evidence_score", "average_specificity_score", "low_mentions_high_signal_flag"},
+            "Sentiment": {"average_sentiment_score", "bullish_mention_count", "bearish_mention_count", "bull_bear_ratio", "narrative_shift_score"},
+            "Spread": {"unique_subreddit_count", "unique_author_count", "unique_thread_count"},
+        }.get(signal_group, set())
+        heat = heat[heat["signal_variable"].isin(allowed)].copy()
+    return heat
+
+
+def render_tom_full_statistical_table(
+    *,
+    db_path: Path,
+    results: pd.DataFrame,
+    controls: dict[str, Any],
+    diagnostics: dict[str, Any],
+) -> None:
+    if results.empty:
+        st.caption("No full statistical table is available.")
+        return
+    full_table = tom_results_display(results)
+    st.dataframe(full_table, use_container_width=True, hide_index=True)
+    export_cols = st.columns([1, 1, 1, 2])
+    export_cols[0].download_button(
+        "Download correlations CSV",
+        data=full_table.to_csv(index=False),
+        file_name="toms_correlation_table.csv",
+        mime="text/csv",
+        key="tom_full_table_csv",
+    )
+    export_cols[1].download_button(
+        "Download summary MD",
+        data=tom_markdown_summary(results, controls, diagnostics),
+        file_name="toms_correlation_summary.md",
+        mime="text/markdown",
+        key="tom_full_table_md",
+    )
+    if export_cols[2].button("Save run", key="tom_save_correlation_run_new", use_container_width=True):
+        created_at = datetime.now(UTC).isoformat()
+        correlation_run_id = create_correlation_run(
+            db_path,
+            {
+                "run_name": f"Reddit Attention vs Future Returns {created_at[:10]}",
+                "created_at": created_at,
+                "ticker_scope": controls["ticker_scope"],
+                "date_start": controls["date_start"].isoformat(),
+                "date_end": controls["date_end"].isoformat(),
+                "bucket_type": controls["bucket_type"],
+                "correlation_method": controls["method"],
+                "return_type": controls["outcome_group"],
+                "benchmark": controls["benchmark"],
+                "min_sample_size": 30,
+            },
+        )
+        replace_correlation_results(db_path, correlation_run_id, results.to_dict(orient="records"))
+        st.success(f"Saved correlation run #{correlation_run_id}.")
+    export_cols[3].caption("CSV and Markdown exports are generated here. Altair chart toolbars provide image export when available.")
+    with st.expander("Saved Correlation Runs", expanded=False):
+        saved_runs = load_correlation_runs(db_path, limit=12)
+        if saved_runs.empty:
+            st.caption("No saved correlation runs yet.")
+        else:
+            st.dataframe(saved_runs, use_container_width=True, hide_index=True)
+
+
+def tom_markdown_summary(results: pd.DataFrame, controls: dict[str, Any], diagnostics: dict[str, Any]) -> str:
+    ranked = tom_rank_interesting_relationships(results).head(8)
+    lines = [
+        "# Tom's Correlation Summary",
+        "",
+        f"- Method: {controls.get('method', '')}",
+        f"- Bucket: {controls.get('bucket_type', '')}",
+        f"- Date range: {controls.get('date_start', '')} to {controls.get('date_end', '')}",
+        f"- Benchmark: {controls.get('benchmark', '')}",
+        f"- Rows: {diagnostics.get('bucket_rows', 0)}",
+        f"- Price completeness: {float(diagnostics.get('data_completeness', 0)) * 100:.0f}%",
+        "",
+        "## Most Interesting Relationships",
+        "",
+    ]
+    if ranked.empty:
+        lines.append("No complete relationships were available.")
+    else:
+        for index, row in enumerate(ranked.to_dict(orient="records"), start=1):
+            lines.append(
+                f"{index}. **{row.get('signal_label')} vs {row.get('outcome_label')}** "
+                f"({row.get('lag_window')}): r={tom_format_corr(row.get('correlation_value'))}, "
+                f"p={tom_format_p(row.get('p_value'))}, n={int(row.get('sample_size', 0) or 0)}. "
+                f"{row.get('interpretation', '')}"
+            )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def tom_compact_label(value: str, limit: int = 28) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: max(limit - 1, 1)].rstrip() + "…"
+
+
+def tom_compact_lag_label(value: str) -> str:
+    return (
+        str(value)
+        .replace(" trading days", "D")
+        .replace(" trading day", "D")
+        .replace("Same day", "Same day")
+        .replace("+1 month", "+1M")
+    )
+
+
+def tom_compact_heatmap_column(row: pd.Series) -> str:
+    lag = tom_compact_lag_label(str(row.get("lag_window", "")))
+    outcome = str(row.get("outcome_label", ""))
+    if lag and lag not in {"Selected", "Pair explorer"}:
+        return tom_compact_label(lag, 12)
+    return tom_compact_label(outcome, 24)
 
 
 def render_tom_correlation_matrix(results: pd.DataFrame) -> None:
@@ -7795,16 +8558,18 @@ def tom_results_display(results: pd.DataFrame) -> pd.DataFrame:
     display = display.sort_values("abs_corr", ascending=False, na_position="last")
     return pd.DataFrame(
         {
-            "Signal": display["signal_label"] if "signal_label" in display else display["signal_variable"].map(variable_label),
-            "Outcome": display["outcome_label"] if "outcome_label" in display else display["outcome_variable"].map(outcome_label),
+            "Signal Variable": display["signal_label"] if "signal_label" in display else display["signal_variable"].map(variable_label),
+            "Outcome Variable": display["outcome_label"] if "outcome_label" in display else display["outcome_variable"].map(outcome_label),
             "Lag": display.get("lag_window", ""),
+            "Method": display.get("correlation_method", ""),
             "r": display["correlation_value"].map(tom_format_corr),
             "p": display["p_value"].map(tom_format_p),
             "n": display["sample_size"].fillna(0).astype(int),
-            "CI low": display["confidence_interval_low"].map(tom_format_corr),
-            "CI high": display["confidence_interval_high"].map(tom_format_corr),
             "Missing": display["missing_count"].fillna(0).astype(int),
             "Reliability": display["reliability_label"],
+            "Interpretation": display.get("interpretation", pd.Series([""] * len(display))).fillna(""),
+            "CI low": display["confidence_interval_low"].map(tom_format_corr),
+            "CI high": display["confidence_interval_high"].map(tom_format_corr),
             "Warnings": display["warning_flags"].map(lambda value: ", ".join(list_cell_values(value, limit=3))),
         }
     )

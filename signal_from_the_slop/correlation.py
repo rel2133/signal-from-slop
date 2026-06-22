@@ -349,6 +349,49 @@ def refresh_price_cache_for_run(
     return refresh_correlation_price_cache(db_path=db_path, buckets=prepared, benchmark=benchmark)
 
 
+def descriptive_statistics(frame: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    total_rows = len(frame)
+    for column in columns:
+        if column not in frame.columns:
+            continue
+        numeric = pd.to_numeric(frame[column], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        valid = numeric.dropna()
+        if valid.empty:
+            rows.append(
+                {
+                    "variable": column,
+                    "variable_label": variable_label(column),
+                    "valid_n": 0,
+                    "missing": total_rows,
+                    "mean": np.nan,
+                    "standard_deviation": np.nan,
+                    "median": np.nan,
+                    "minimum": np.nan,
+                    "maximum": np.nan,
+                    "skewness": np.nan,
+                    "kurtosis": np.nan,
+                }
+            )
+            continue
+        rows.append(
+            {
+                "variable": column,
+                "variable_label": variable_label(column),
+                "valid_n": int(valid.count()),
+                "missing": int(total_rows - valid.count()),
+                "mean": float(valid.mean()),
+                "standard_deviation": float(valid.std()) if len(valid) > 1 else np.nan,
+                "median": float(valid.median()),
+                "minimum": float(valid.min()),
+                "maximum": float(valid.max()),
+                "skewness": float(valid.skew()) if len(valid) > 2 else np.nan,
+                "kurtosis": float(valid.kurt()) if len(valid) > 3 else np.nan,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def compute_correlation_grid(
     frame: pd.DataFrame,
     *,
@@ -373,6 +416,7 @@ def compute_correlation_grid(
                     "outcome_label": outcome_label(outcome),
                     "lag_window": lag_window,
                     "correlation_method": method,
+                    "interpretation": interpret_correlation_result(stats),
                     **stats,
                 }
             )
@@ -407,6 +451,7 @@ def compute_lead_lag_grid(
                     "outcome_label": outcome_label(outcome),
                     "lag_window": str(window["label"]),
                     "correlation_method": method,
+                    "interpretation": interpret_correlation_result(stats),
                     **stats,
                 }
             )
@@ -577,6 +622,78 @@ def reliability_label(sample_size: int) -> str:
     if sample_size < 100:
         return "Moderate evidence"
     return "Stronger evidence"
+
+
+def effect_size_label(correlation_value: Any) -> str:
+    value = _coerce_float(correlation_value, np.nan)
+    if pd.isna(value):
+        return "no complete relationship"
+    magnitude = abs(value)
+    if magnitude < 0.10:
+        return "negligible"
+    if magnitude < 0.30:
+        return "weak"
+    if magnitude < 0.50:
+        return "moderate"
+    return "strong"
+
+
+def statistical_evidence_label(p_value: Any) -> str:
+    value = _coerce_float(p_value, np.nan)
+    if pd.isna(value):
+        return "not enough complete observations for a p-value"
+    if value < 0.001:
+        return "very strong statistical evidence"
+    if value < 0.01:
+        return "strong statistical evidence"
+    if value < 0.05:
+        return "statistically significant"
+    return "not statistically significant"
+
+
+def interpret_correlation_result(stats: dict[str, Any]) -> str:
+    correlation_value = _coerce_float(stats.get("correlation_value"), np.nan)
+    p_value = _coerce_float(stats.get("p_value"), np.nan)
+    sample_size = int(stats.get("sample_size", 0) or 0)
+    if pd.isna(correlation_value) or sample_size < 2:
+        return "No complete relationship can be estimated from the current data."
+
+    magnitude = abs(correlation_value)
+    if magnitude < 0.10:
+        return "No meaningful relationship detected."
+
+    direction = "positive" if correlation_value > 0 else "negative"
+    effect = effect_size_label(correlation_value)
+    evidence = statistical_evidence_label(p_value)
+    sample_support = sample_support_phrase(sample_size)
+    if sample_size < 20:
+        return (
+            f"{effect.title()} {direction} relationship, but {evidence} and sample size is too small. "
+            "Treat as interesting but unreliable."
+        )
+    if p_value >= 0.05 or pd.isna(p_value):
+        return (
+            f"{effect.title()} {direction} relationship, but it is {evidence}. "
+            f"Sample support is {sample_support}."
+        )
+    if magnitude < 0.30:
+        return (
+            f"Weak {direction} relationship. {evidence.capitalize()}, with {sample_support}. "
+            "Worth watching, but the effect size is small."
+        )
+    return (
+        f"{effect.title()} {direction} relationship. {evidence.capitalize()}, with {sample_support}."
+    )
+
+
+def sample_support_phrase(sample_size: int) -> str:
+    if sample_size < 20:
+        return "too little sample support"
+    if sample_size < 50:
+        return "weak sample support"
+    if sample_size < 100:
+        return "moderate sample support"
+    return "stronger sample support"
 
 
 def warning_flags(
