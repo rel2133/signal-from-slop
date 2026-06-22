@@ -656,7 +656,7 @@ st.markdown(
             text-transform: uppercase;
         }
         .dashboard-kpi-value {
-            font-size: 1.72rem;
+            font-size: 2.15rem;
             font-weight: 800;
             line-height: 1.08;
             margin: 0.2rem 0 0.1rem;
@@ -666,13 +666,19 @@ st.markdown(
             opacity: 0.76;
         }
         .dashboard-kpi-ticker {
-            font-size: 1.25rem;
+            font-size: 1.78rem;
             font-weight: 800;
             line-height: 1.15;
             margin-top: 0.1rem;
         }
+        .dashboard-title-row {
+            align-items: center;
+            display: flex;
+            gap: 0.5rem;
+            justify-content: space-between;
+        }
         .dashboard-panel-title {
-            font-size: 1rem;
+            font-size: 1.12rem;
             font-weight: 780;
             line-height: 1.2;
             margin: 1.05rem 0 0.25rem;
@@ -709,6 +715,15 @@ st.markdown(
         .dashboard-number-note {
             font-size: 0.76rem;
             opacity: 0.68;
+        }
+        .dashboard-row-menu {
+            align-items: center;
+            display: flex;
+            justify-content: end;
+            min-height: 2.3rem;
+        }
+        [data-testid="stPopover"] button[data-testid="stPopoverButton"] > div > div[aria-hidden="true"] {
+            display: none;
         }
         .ticker-hero {
             border: 1px solid rgba(128, 128, 128, 0.22);
@@ -3451,7 +3466,6 @@ def render_dashboard_kpis(
         top_metric_name = "emerging_ticker_score"
         top_metric_label = "Top signal"
         top_metric_note = "emerging score"
-    run_status = str(active_run.get("status", "Running")).title() if active_run else "Idle"
     run_note = run_elapsed_label(active_run) if active_run else (
         f"{int(latest_summary.get('items_analyzed', 0) or 0)} analysed items" if latest_run else "No completed run"
     )
@@ -3459,26 +3473,41 @@ def render_dashboard_kpis(
 
     kpi_cols = st.columns([1, 1])
     with kpi_cols[0].container(border=True):
-        st.markdown('<div class="dashboard-kpi-label">Emerging tickers</div>', unsafe_allow_html=True)
+        card_head = st.columns([5, 0.6])
+        card_head[0].markdown('<div class="dashboard-kpi-label">Emerging tickers</div>', unsafe_allow_html=True)
+        if card_head[1].button(
+            " ",
+            key="dashboard_kpi_emerging_open",
+            help="Open emerging tickers",
+            icon=":material/chevron_right:",
+            use_container_width=True,
+        ):
+            navigate_to_page("Review", run_id=scope_id)
         st.markdown(f'<div class="dashboard-kpi-value">{flagged_count}</div>', unsafe_allow_html=True)
         st.markdown(
-            f'<div class="dashboard-kpi-note">{pending_validation} need validation · {run_status} · {escape(run_note)}</div>',
+            f'<div class="dashboard-kpi-note">{pending_validation} validate · {escape(run_note)}</div>',
             unsafe_allow_html=True,
         )
         if top_rows:
             render_status_chips([str(row.get("ticker", "")) for row in top_rows if row.get("ticker")])
         else:
             render_status_chips([coverage_label])
-        action_cols = st.columns(2)
-        if action_cols[0].button("Review", key="dashboard_kpi_review", use_container_width=True):
-            navigate_to_page("Review", run_id=scope_id)
-        if action_cols[1].button("Validate", key="dashboard_kpi_validate", use_container_width=True):
-            navigate_to_page("Validate", run_id=scope_id)
 
     with kpi_cols[1].container(border=True):
-        st.markdown(f'<div class="dashboard-kpi-label">{escape(top_metric_label)}</div>', unsafe_allow_html=True)
+        top_ticker = str(top_accel.get("ticker", "")) if top_accel else ""
+        card_head = st.columns([5, 0.6])
+        card_head[0].markdown(f'<div class="dashboard-kpi-label">{escape(top_metric_label)}</div>', unsafe_allow_html=True)
+        if card_head[1].button(
+            " ",
+            key="dashboard_kpi_top_signal_open",
+            help="Open top signals",
+            icon=":material/chevron_right:",
+            use_container_width=True,
+            disabled=not bool(top_ticker),
+        ):
+            navigate_to_page("Review", run_id=scope_id)
         if top_accel:
-            ticker = str(top_accel.get("ticker", ""))
+            ticker = top_ticker
             company = str(top_accel.get("company_name", "") or "Unknown")
             st.markdown(
                 f'<div class="dashboard-kpi-ticker">{escape(ticker)}</div>'
@@ -3505,8 +3534,16 @@ def render_dashboard_top_signals(
     run_id: str | None,
     limit: int = 8,
 ) -> None:
-    st.markdown('<div class="dashboard-panel-title">Top Signals</div>', unsafe_allow_html=True)
-    st.markdown('<div class="dashboard-panel-note">Ranked by emerging score in the current scope.</div>', unsafe_allow_html=True)
+    title_cols = st.columns([8, 0.55])
+    title_cols[0].markdown('<div class="dashboard-panel-title">Top Signals</div>', unsafe_allow_html=True)
+    if title_cols[1].button(
+        " ",
+        key="dashboard_top_signals_open",
+        help="Open top signals",
+        icon=":material/chevron_right:",
+        use_container_width=True,
+    ):
+        navigate_to_page("Review", run_id=run_id)
     rows = dashboard_signal_rows(summary_df, limit=limit)
     if not rows:
         with st.container(border=True):
@@ -3517,19 +3554,15 @@ def render_dashboard_top_signals(
                 st.rerun()
         return
 
-    validation_lookup = dashboard_validation_status_lookup(signal_review_df)
-    header_cols = st.columns([2.2, 0.75, 0.9, 1.25, 1.45, 1.25])
-    for column, label in zip(header_cols, ["Signal", "Mentions", "Score", "Status", "Trend", "Actions"]):
-        column.markdown(f'<div class="dashboard-table-head">{escape(label)}</div>', unsafe_allow_html=True)
-
     for index, row in enumerate(rows, start=1):
         ticker = str(row.get("ticker", ""))
         company = str(row.get("company_name", "") or "Unknown")
-        status = validation_lookup.get(ticker.upper())
-        if not status:
-            status = "Needs review" if row.get("low_mentions_high_signal") or row.get("new_ticker_detected") else "Review"
+        accel_score = coerce_float(row.get("acceleration_score"))
+        emerging_score = coerce_float(row.get("emerging_ticker_score"))
+        display_score = accel_score if accel_score > 0 else emerging_score
+        score_label = "accel" if accel_score > 0 else "emerging"
         with st.container(border=True):
-            cols = st.columns([2.2, 0.75, 0.9, 1.25, 1.45, 1.25])
+            cols = st.columns([2.6, 1.0, 1.05, 1.6, 0.42])
             cols[0].markdown(
                 f'<div class="dashboard-ticker">{escape(ticker)}</div>'
                 f'<div class="dashboard-company">{escape(company[:82])}</div>',
@@ -3541,21 +3574,24 @@ def render_dashboard_top_signals(
                 unsafe_allow_html=True,
             )
             cols[2].markdown(
-                f'<div class="dashboard-number">{coerce_float(row.get("emerging_ticker_score")):.1f}</div>'
-                f'<div class="dashboard-number-note">{coerce_float(row.get("acceleration_score")):.1f} accel</div>',
+                f'<div class="dashboard-number">{display_score:.1f}</div>'
+                f'<div class="dashboard-number-note">{escape(score_label)}</div>',
                 unsafe_allow_html=True,
             )
             with cols[3]:
-                labels = [status]
-                labels.extend(ticker_status_labels(row)[:1])
-                render_status_chips(labels)
-            with cols[4]:
                 render_dashboard_micro_chart(db_path, ticker, metric_name="emerging_ticker_score")
-            action_cols = cols[5].columns(2)
-            if action_cols[0].button("Review", key=f"dashboard_review_{run_id}_{ticker}_{index}", use_container_width=True):
-                navigate_to_page("Review", run_id=run_id, ticker=ticker)
-            if action_cols[1].button("Validate", key=f"dashboard_validate_{run_id}_{ticker}_{index}", use_container_width=True):
-                navigate_to_page("Validate", run_id=run_id, ticker=ticker)
+            with cols[4]:
+                with st.popover(
+                    " ",
+                    key=f"dashboard_menu_{run_id}_{ticker}_{index}",
+                    help=f"{ticker} actions",
+                    icon=":material/more_vert:",
+                    use_container_width=True,
+                ):
+                    if st.button("Review", key=f"dashboard_review_{run_id}_{ticker}_{index}", use_container_width=True):
+                        navigate_to_page("Review", run_id=run_id, ticker=ticker)
+                    if st.button("Validate", key=f"dashboard_validate_{run_id}_{ticker}_{index}", use_container_width=True):
+                        navigate_to_page("Validate", run_id=run_id, ticker=ticker)
 
 
 def seed_sources_from_file(db_path: Path, sources_path: Path) -> int:
@@ -4316,17 +4352,16 @@ def build_sidebar_state(db_path: Path) -> tuple[str, str | None, pd.DataFrame, p
                     st.session_state["page"] = nav_page
                     st.rerun()
 
-        with st.expander("More", expanded=page in {"Library", "Settings"}):
-            for nav_page, nav_label in [("Library", "Library"), ("Settings", "Settings")]:
-                if st.button(
-                    nav_label,
-                    key=f"sidebar_nav_{nav_page}",
-                    use_container_width=True,
-                    type="primary" if page == nav_page else "secondary",
-                ):
-                    if page != nav_page:
-                        st.session_state["page"] = nav_page
-                        st.rerun()
+        if st.button(
+            "Settings",
+            key="sidebar_nav_Settings",
+            icon=":material/settings:",
+            use_container_width=True,
+            type="primary" if page == "Settings" else "secondary",
+        ):
+            if page != "Settings":
+                st.session_state["page"] = "Settings"
+                st.rerun()
 
         st.markdown('<div class="sidebar-section-label">Analysis scope</div>', unsafe_allow_html=True)
         auto_cleared_runs = int(st.session_state.pop("auto_cleared_orphaned_runs", 0) or 0)
@@ -4335,26 +4370,6 @@ def build_sidebar_state(db_path: Path) -> tuple[str, str | None, pd.DataFrame, p
 
         show_all_runs = False
         run_search = ""
-        with st.expander("Run browser", expanded=False):
-            if not runs.empty:
-                overview_cols = st.columns(2)
-                overview_cols[0].metric("Completed", len(completed_runs))
-                overview_cols[1].metric("All runs", len(runs))
-                render_latest_run_status(runs, source_lookup)
-                render_recent_run_statuses(runs, source_lookup)
-            show_all_runs = st.toggle(
-                "Show all runs",
-                value=False,
-                key="sidebar_show_all_runs",
-                help="Includes running, failed, and zero-item runs that are hidden from the default results picker.",
-                disabled=runs.empty,
-            )
-            run_search = st.text_input(
-                "Find run",
-                placeholder="Search ID, date, or source",
-                key="sidebar_run_search",
-                disabled=runs.empty,
-            ).strip()
 
         selectable_runs = runs if show_all_runs else (completed_runs if not completed_runs.empty else runs)
         run_label_lookup = {
@@ -9131,11 +9146,22 @@ def render_ticker_catalog(ticker_path: Path) -> None:
             st.caption("No duplicate alias tokens were found.")
 
 
-def render_library_page(db_path: Path, ticker_path: Path, artifacts_dir: Path, run_id: str | None, source_lookup: dict[int, str]) -> None:
-    render_page_header(
-        "Library",
-        "Runs, artifacts, exports, watchlist, and the ticker catalog.",
-    )
+def render_library_page(
+    db_path: Path,
+    ticker_path: Path,
+    artifacts_dir: Path,
+    run_id: str | None,
+    source_lookup: dict[int, str],
+    *,
+    embedded: bool = False,
+) -> None:
+    if embedded:
+        st.subheader("Library")
+    else:
+        render_page_header(
+            "Library",
+            "Runs, artifacts, exports, watchlist, and the ticker catalog.",
+        )
     library_sections = ["Runs", "Artifacts", "Exports", "Watchlist", "Ticker Catalog"]
     pending_library_view = st.session_state.pop("pending_library_view", None)
     if pending_library_view in library_sections:
@@ -9606,16 +9632,22 @@ def render_settings_page(db_path: Path, ticker_path: Path, artifacts_dir: Path) 
         "Technical configuration, diagnostics, maintenance, and metric definitions.",
     )
     overview = db_overview(db_path)
-    overview_cols = st.columns(6)
+    settings_runs = load_analysis_runs(db_path)
+    if not settings_runs.empty:
+        settings_runs = settings_runs[settings_runs["data_mode"] == "live"].copy()
+    settings_status_counts = settings_runs["status"].value_counts().to_dict() if not settings_runs.empty else {}
+    overview_cols = st.columns(8)
     overview_cols[0].metric("Sources", overview["sources"])
-    overview_cols[1].metric("Analysis runs", overview["analysis_runs"])
-    overview_cols[2].metric("Reddit items", overview["reddit_items"])
-    overview_cols[3].metric("Mention rows", overview["item_ticker_mentions"])
-    overview_cols[4].metric("Signal events", overview.get("ticker_signal_events", 0))
-    overview_cols[5].metric("Market rows", overview.get("ticker_market_prices", 0))
+    overview_cols[1].metric("Runs", overview["analysis_runs"])
+    overview_cols[2].metric("Completed", int(settings_status_counts.get("completed", 0)))
+    overview_cols[3].metric("Failed", int(settings_status_counts.get("failed", 0)))
+    overview_cols[4].metric("Reddit items", overview["reddit_items"])
+    overview_cols[5].metric("Mention rows", overview["item_ticker_mentions"])
+    overview_cols[6].metric("Signal events", overview.get("ticker_signal_events", 0))
+    overview_cols[7].metric("Market rows", overview.get("ticker_market_prices", 0))
 
-    storage_tab, model_tab, reddit_tab, diagnostics_tab, maintenance_tab, guide_tab = st.tabs(
-        ["Storage", "Model", "Reddit Collector", "Diagnostics", "Maintenance", "Metric Guide"]
+    storage_tab, model_tab, reddit_tab, diagnostics_tab, maintenance_tab, library_tab, guide_tab = st.tabs(
+        ["Storage", "Model", "Reddit Collector", "Diagnostics", "Maintenance", "Library", "Metric Guide"]
     )
 
     with storage_tab:
@@ -9773,6 +9805,21 @@ def render_settings_page(db_path: Path, ticker_path: Path, artifacts_dir: Path) 
                     "error_message": st.column_config.TextColumn("Error", width="large"),
                 },
             )
+
+    with library_tab:
+        library_sources = load_sources(db_path)
+        library_source_lookup = {
+            int(row["source_id"]): str(row["display_name"])
+            for row in library_sources.to_dict(orient="records")
+        } if not library_sources.empty else {}
+        render_library_page(
+            db_path,
+            ticker_path,
+            artifacts_dir,
+            st.session_state.get("selected_run_id"),
+            library_source_lookup,
+            embedded=True,
+        )
 
     with guide_tab:
         st.subheader("Scoring and table glossary")
